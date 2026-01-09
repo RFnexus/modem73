@@ -3,10 +3,13 @@
 #include <cstdint>
 #include <vector>
 #include <queue>
+#include <map>
 #include <mutex>
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <string>
+#include <sstream>
 #include <iomanip>
 #include <iostream>
 
@@ -83,9 +86,12 @@ struct TNCConfig {
     
     // CSMA settings
     bool csma_enabled = true;
-    float carrier_threshold_db = -30.0f;  // Carrier sense threshold
-    int carrier_sense_ms = 100;           // How long to listen
-    int max_backoff_slots = 10;           // Maximum backoff
+    float carrier_threshold_db = -30.0f;
+    int carrier_sense_ms = 100;
+    int max_backoff_slots = 10;
+    
+    // Fragmentation settings
+    bool fragmentation_enabled = false;
     
     // Settings file path
     std::string config_file = "";
@@ -129,7 +135,6 @@ private:
     void process_byte(uint8_t byte) {
         if (byte == KISS::FEND) {
             if (in_frame_ && buffer_.size() > 0) {
-                // frame complete
                 uint8_t cmd_byte = buffer_[0];
                 uint8_t port = (cmd_byte >> 4) & 0x0F;
                 uint8_t cmd = cmd_byte & 0x0F;
@@ -206,7 +211,6 @@ inline void hex_dump(const char* prefix, const uint8_t* data, size_t len) {
     for (size_t i = 0; i < len; i += 16) {
         std::cerr << "  " << std::hex << std::setfill('0') << std::setw(4) << i << ": ";
         
-        // Hex
         for (size_t j = 0; j < 16 && i + j < len; ++j) {
             std::cerr << std::setw(2) << (int)data[i + j] << " ";
         }
@@ -214,7 +218,6 @@ inline void hex_dump(const char* prefix, const uint8_t* data, size_t len) {
             std::cerr << "   ";
         }
         
-        // ASCII
         std::cerr << " |";
         for (size_t j = 0; j < 16 && i + j < len; ++j) {
             char c = data[i + j];
@@ -223,6 +226,135 @@ inline void hex_dump(const char* prefix, const uint8_t* data, size_t len) {
         std::cerr << "|" << std::endl;
     }
     std::cerr << std::dec;
+}
+
+inline std::string packet_visualize(const uint8_t* data, size_t len, bool is_tx, bool frag_enabled) {
+    std::ostringstream oss;
+    
+    if (len == 0) {
+        oss << "  [EMPTY PACKET]";
+        return oss.str();
+    }
+    
+    oss << "\n  ┌─────────────────────────────────────────────────────────────┐\n";
+    oss << "  │ " << (is_tx ? "TX" : "RX") << " PACKET: " << len << " bytes";
+    oss << std::string(47 - std::to_string(len).length(), ' ') << "│\n";
+    oss << "  ├─────────────────────────────────────────────────────────────┤\n";
+    
+    size_t offset = 0;
+    
+    // Check for fragment by magic byte
+    if (frag_enabled && len >= 5 && data[0] == 0xF3) {
+        uint16_t pkt_id = (data[1] << 8) | data[2];
+        uint8_t seq = data[3];
+        uint8_t flags = data[4];
+        
+        oss << "  │ FRAG HDR [5 bytes]  Magic: 0xF3                             │\n";
+        oss << "  │   Packet ID: " << std::setw(5) << pkt_id;
+        oss << "   Seq: " << std::setw(3) << (int)seq;
+        oss << "   Flags: ";
+        
+        std::string flag_str;
+        if (flags & 0x02) flag_str += "FIRST ";
+        if (flags & 0x01) flag_str += "MORE";
+        if (flag_str.empty()) flag_str = "LAST";
+        oss << std::left << std::setw(12) << flag_str << std::right << "   │\n";
+        
+        offset = 5;
+        oss << "  ├─────────────────────────────────────────────────────────────┤\n";
+    }
+    
+    size_t payload_len = len - offset;
+    oss << "  │ PAYLOAD [" << payload_len << " bytes]";
+    oss << std::string(49 - std::to_string(payload_len).length(), ' ') << "│\n";
+    
+    size_t preview_len = std::min(payload_len, (size_t)32);
+    if (preview_len > 0) {
+        oss << "  │   ";
+        for (size_t i = 0; i < preview_len; i++) {
+            oss << std::hex << std::setfill('0') << std::setw(2) << (int)data[offset + i];
+            if (i < preview_len - 1) oss << " ";
+        }
+        if (payload_len > 32) oss << "...";
+        size_t used = preview_len * 3 - 1 + (payload_len > 32 ? 3 : 0);
+        if (used < 57) oss << std::string(57 - used, ' ');
+        oss << std::dec << " │\n";
+        
+        oss << "  │   ";
+        for (size_t i = 0; i < preview_len; i++) {
+            char c = data[offset + i];
+            oss << (c >= 32 && c < 127 ? c : '.');
+        }
+        if (payload_len > 32) oss << "...";
+        size_t ascii_used = preview_len + (payload_len > 32 ? 3 : 0);
+        if (ascii_used < 57) oss << std::string(57 - ascii_used, ' ');
+        oss << " │\n";
+    }
+    
+    oss << "  └─────────────────────────────────────────────────────────────┘";
+    
+    return oss.str();
+}
+
+inline std::string kiss_frame_visualize(const uint8_t* data, size_t len) {
+    std::ostringstream oss;
+    
+    if (len == 0) {
+        oss << "  [EMPTY KISS FRAME]";
+        return oss.str();
+    }
+    
+    oss << "\n  ┌─────────────────────────────────────────────────────────────┐\n";
+    oss << "  │ KISS FRAME: " << len << " bytes";
+    oss << std::string(45 - std::to_string(len).length(), ' ') << "│\n";
+    oss << "  ├─────────────────────────────────────────────────────────────┤\n";
+    
+    if (len >= 1) {
+        uint8_t cmd_byte = data[0];
+        uint8_t port = (cmd_byte >> 4) & 0x0F;
+        uint8_t cmd = cmd_byte & 0x0F;
+        
+        oss << "  │ CMD BYTE: 0x" << std::hex << std::setfill('0') << std::setw(2) << (int)cmd_byte << std::dec;
+        oss << "  Port: " << (int)port << "  Cmd: ";
+        
+        std::string cmd_name;
+        switch (cmd) {
+            case 0x00: cmd_name = "DATA"; break;
+            case 0x01: cmd_name = "TXDELAY"; break;
+            case 0x02: cmd_name = "P"; break;
+            case 0x03: cmd_name = "SLOTTIME"; break;
+            case 0x04: cmd_name = "TXTAIL"; break;
+            case 0x05: cmd_name = "FULLDUPLEX"; break;
+            case 0x06: cmd_name = "SETHW"; break;
+            case 0x0F: cmd_name = "RETURN"; break;
+            default: cmd_name = "UNKNOWN"; break;
+        }
+        oss << std::left << std::setw(10) << cmd_name << std::right;
+        oss << "              │\n";
+    }
+    
+    if (len > 1) {
+        oss << "  ├─────────────────────────────────────────────────────────────┤\n";
+        size_t payload_len = len - 1;
+        oss << "  │ PAYLOAD [" << payload_len << " bytes]";
+        oss << std::string(49 - std::to_string(payload_len).length(), ' ') << "│\n";
+        
+        size_t preview_len = std::min(payload_len, (size_t)24);
+        oss << "  │   ";
+        for (size_t i = 0; i < preview_len; i++) {
+            oss << std::hex << std::setfill('0') << std::setw(2) << (int)data[1 + i];
+            if (i < preview_len - 1) oss << " ";
+        }
+        if (payload_len > 24) oss << " ...";
+        oss << std::dec;
+        size_t used = preview_len * 3 - 1 + (payload_len > 24 ? 4 : 0);
+        if (used < 57) oss << std::string(57 - used, ' ');
+        oss << " │\n";
+    }
+    
+    oss << "  └─────────────────────────────────────────────────────────────┘";
+    
+    return oss.str();
 }
 
 // Length-prefix framing 
@@ -246,3 +378,171 @@ inline std::vector<uint8_t> unframe_length(const uint8_t* data, size_t total_len
     }
     return std::vector<uint8_t>(data + 2, data + 2 + payload_len);
 }
+
+namespace Frag {
+    constexpr uint8_t MAGIC = 0xF3;
+    constexpr size_t HEADER_SIZE = 5;
+    constexpr uint8_t FLAG_MORE_FRAGMENTS = 0x01;
+    constexpr uint8_t FLAG_FIRST_FRAGMENT = 0x02;
+    constexpr int REASSEMBLY_TIMEOUT_MS = 30000;
+    constexpr size_t MAX_PENDING_PACKETS = 64;
+}
+
+class Fragmenter {
+public:
+    Fragmenter() : next_packet_id_(0) {}
+    
+    std::vector<std::vector<uint8_t>> fragment(const std::vector<uint8_t>& data, size_t max_payload) {
+        std::vector<std::vector<uint8_t>> fragments;
+        
+        if (max_payload <= Frag::HEADER_SIZE) {
+            return fragments;
+        }
+        
+        size_t data_per_frag = max_payload - Frag::HEADER_SIZE;
+        size_t num_frags = (data.size() + data_per_frag - 1) / data_per_frag;
+        if (num_frags > 255) {
+            num_frags = 255;
+        }
+        
+        uint16_t packet_id = next_packet_id_++;
+        
+        for (size_t i = 0; i < num_frags; i++) {
+            size_t offset = i * data_per_frag;
+            size_t chunk_size = std::min(data_per_frag, data.size() - offset);
+            
+            std::vector<uint8_t> frag;
+            frag.reserve(Frag::HEADER_SIZE + chunk_size);
+            
+            frag.push_back(Frag::MAGIC);
+            frag.push_back((packet_id >> 8) & 0xFF);
+            frag.push_back(packet_id & 0xFF);
+            frag.push_back(static_cast<uint8_t>(i));
+            
+            uint8_t flags = 0;
+            if (i == 0) flags |= Frag::FLAG_FIRST_FRAGMENT;
+            if (i < num_frags - 1) flags |= Frag::FLAG_MORE_FRAGMENTS;
+            frag.push_back(flags);
+            
+            frag.insert(frag.end(), data.begin() + offset, data.begin() + offset + chunk_size);
+            fragments.push_back(std::move(frag));
+        }
+        
+        return fragments;
+    }
+    
+    bool needs_fragmentation(size_t data_size, size_t max_payload) const {
+        return data_size > (max_payload - Frag::HEADER_SIZE);
+    }
+    
+private:
+    std::atomic<uint16_t> next_packet_id_;
+};
+
+class Reassembler {
+public:
+    Reassembler() = default;
+    
+    std::vector<uint8_t> process(const std::vector<uint8_t>& fragment) {
+        if (fragment.size() < Frag::HEADER_SIZE) {
+            return {};
+        }
+        
+        if (fragment[0] != Frag::MAGIC) {
+            return {};
+        }
+        
+        uint16_t packet_id = (fragment[1] << 8) | fragment[2];
+        uint8_t seq = fragment[3];
+        uint8_t flags = fragment[4];
+        
+        std::vector<uint8_t> payload(fragment.begin() + Frag::HEADER_SIZE, fragment.end());
+        
+        std::lock_guard<std::mutex> lock(mutex_);
+        
+        cleanup_stale();
+        
+        auto& pkt = pending_[packet_id];
+        if (pkt.fragments.empty()) {
+            pkt.first_seen = std::chrono::steady_clock::now();
+        }
+        
+        pkt.fragments[seq] = std::move(payload);
+        
+        if (flags & Frag::FLAG_FIRST_FRAGMENT) {
+            pkt.has_first = true;
+        }
+        
+        if (!(flags & Frag::FLAG_MORE_FRAGMENTS)) {
+            pkt.last_seq = seq;
+            pkt.has_last = true;
+        }
+        
+        if (pkt.has_first && pkt.has_last) {
+            bool complete = true;
+            for (uint8_t i = 0; i <= pkt.last_seq; i++) {
+                if (pkt.fragments.find(i) == pkt.fragments.end()) {
+                    complete = false;
+                    break;
+                }
+            }
+            
+            if (complete) {
+                std::vector<uint8_t> reassembled;
+                for (uint8_t i = 0; i <= pkt.last_seq; i++) {
+                    auto& frag_data = pkt.fragments[i];
+                    reassembled.insert(reassembled.end(), frag_data.begin(), frag_data.end());
+                }
+                pending_.erase(packet_id);
+                return reassembled;
+            }
+        }
+        
+        return {};
+    }
+    
+    bool is_fragment(const std::vector<uint8_t>& data) const {
+        if (data.size() < Frag::HEADER_SIZE) return false;
+        return data[0] == Frag::MAGIC;
+    }
+    
+    void reset() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        pending_.clear();
+    }
+    
+private:
+    struct PendingPacket {
+        std::map<uint8_t, std::vector<uint8_t>> fragments;
+        std::chrono::steady_clock::time_point first_seen;
+        uint8_t last_seq = 0;
+        bool has_first = false;
+        bool has_last = false;
+    };
+    
+    void cleanup_stale() {
+        auto now = std::chrono::steady_clock::now();
+        for (auto it = pending_.begin(); it != pending_.end();) {
+            auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - it->second.first_seen).count();
+            if (age > Frag::REASSEMBLY_TIMEOUT_MS) {
+                it = pending_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        
+        while (pending_.size() > Frag::MAX_PENDING_PACKETS) {
+            auto oldest = pending_.begin();
+            for (auto it = pending_.begin(); it != pending_.end(); ++it) {
+                if (it->second.first_seen < oldest->second.first_seen) {
+                    oldest = it;
+                }
+            }
+            pending_.erase(oldest);
+        }
+    }
+    
+    std::map<uint16_t, PendingPacket> pending_;
+    mutable std::mutex mutex_;
+};

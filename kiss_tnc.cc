@@ -67,6 +67,27 @@ inline void ui_log(const std::string& msg) {
     }
 }
 
+bool check_port_available(const std::string& bind_address, int port) {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        return false;
+    }
+    
+    int opt = 1;
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = inet_addr(bind_address.c_str());
+    addr.sin_port = htons(port);
+    
+    int result = bind(sock, (struct sockaddr*)&addr, sizeof(addr));
+    close(sock);
+    
+    return result == 0;
+}
+
 
 
 
@@ -208,6 +229,8 @@ public:
             std::cerr << "CSMA: disabled" << std::endl;
         }
         
+        std::cerr << "Fragmentation: " << (config_.fragmentation_enabled ? "enabled" : "disabled") << std::endl;
+        
         // Show PTT status
         switch (config_.ptt_type) {
             case PTTType::NONE:
@@ -321,47 +344,83 @@ private:
     void handle_kiss_frame(uint8_t /*port*/, uint8_t cmd, const std::vector<uint8_t>& data) {
         if (cmd == KISS::CMD_DATA) {
             if (g_verbose) {
-                hex_dump("TX Queue", data.data(), data.size());
+                std::cerr << kiss_frame_visualize(data.data(), data.size()) << std::endl;
             }
             
-            // Check size
-            if (data.size() > (size_t)payload_size_) {
-                std::cerr << "Warning: Frame too large (" << data.size() 
-                          << " > " << payload_size_ << "), truncating" << std::endl;
-            }
+            size_t max_payload = payload_size_ - 2;
             
-            tx_queue_.push(data);
+            if (config_.fragmentation_enabled && fragmenter_.needs_fragmentation(data.size(), max_payload)) {
+                auto fragments = fragmenter_.fragment(data, max_payload);
+                ui_log("TX: Fragmenting " + std::to_string(data.size()) + " bytes into " + 
+                       std::to_string(fragments.size()) + " fragments");
+                for (auto& frag : fragments) {
+                    if (g_verbose) {
+                        std::cerr << packet_visualize(frag.data(), frag.size(), true, true) << std::endl;
+                    }
+                    tx_queue_.push(std::move(frag));
+                }
 #ifdef WITH_UI
-            if (g_ui_state) {
-                g_ui_state->tx_queue_size = tx_queue_.size();
-            }
+                if (g_ui_state) {
+                    g_ui_state->tx_queue_size = tx_queue_.size();
+                }
 #endif
+            } else {
+                std::vector<uint8_t> frame_data = data;
+                if (frame_data.size() > max_payload) {
+                    std::cerr << "Warning: Frame too large (" << frame_data.size() 
+                              << " > " << max_payload << "), truncating" << std::endl;
+                    frame_data.resize(max_payload);
+                }
+                if (g_verbose) {
+                    std::cerr << packet_visualize(frame_data.data(), frame_data.size(), true, config_.fragmentation_enabled) << std::endl;
+                }
+                tx_queue_.push(frame_data);
+#ifdef WITH_UI
+                if (g_ui_state) {
+                    g_ui_state->tx_queue_size = tx_queue_.size();
+                }
+#endif
+            }
         } else {
-            // Handle KISS control commands
             switch (cmd) {
             case KISS::CMD_TXDELAY:
                 if (!data.empty()) {
                     config_.tx_delay_ms = data[0] * 10;
-                    std::cerr << "TXDelay set to " << config_.tx_delay_ms << " ms" << std::endl;
+                    ui_log("TXDelay set to " + std::to_string(config_.tx_delay_ms) + " ms");
                 }
                 break;
             case KISS::CMD_P:
                 if (!data.empty()) {
                     config_.p_persistence = data[0];
+                    ui_log("P-persistence set to " + std::to_string(config_.p_persistence));
                 }
                 break;
             case KISS::CMD_SLOTTIME:
                 if (!data.empty()) {
                     config_.slot_time_ms = data[0] * 10;
+                    ui_log("Slot time set to " + std::to_string(config_.slot_time_ms) + " ms");
+                }
+                break;
+            case KISS::CMD_TXTAIL:
+                if (!data.empty()) {
+                    config_.ptt_tail_ms = data[0] * 10;
+                    ui_log("TXTail set to " + std::to_string(config_.ptt_tail_ms) + " ms");
                 }
                 break;
             case KISS::CMD_FULLDUPLEX:
                 if (!data.empty()) {
                     config_.full_duplex = data[0] != 0;
+                    ui_log(std::string("Full duplex ") + (config_.full_duplex ? "enabled" : "disabled"));
                 }
                 break;
+            case KISS::CMD_SETHW:
+                break;
+            case KISS::CMD_RETURN:
+                break;
             default:
-                std::cerr << "Unknown KISS command: " << (int)cmd << std::endl;
+                if (g_verbose) {
+                    std::cerr << "Unknown KISS command: 0x" << std::hex << (int)cmd << std::dec << std::endl;
+                }
             }
         }
     }
@@ -444,7 +503,7 @@ private:
     void transmit(const std::vector<uint8_t>& data) {
         ui_log("TX: " + std::to_string(data.size()) + " bytes");
         if (g_verbose) {
-            hex_dump("TX", data.data(), data.size());
+            std::cerr << packet_visualize(data.data(), data.size(), true, config_.fragmentation_enabled) << std::endl;
         }
         
 #ifdef WITH_UI
@@ -593,9 +652,30 @@ private:
         
         std::vector<float> buffer(1024);
         int level_update_counter = 0;
-        const int LEVEL_UPDATE_INTERVAL = 5;  // Update level every N reads 
+        const int LEVEL_UPDATE_INTERVAL = 5;
         
-        auto frame_callback = [this](const uint8_t* data, size_t len) {
+        auto deliver_to_clients = [this](const std::vector<uint8_t>& payload, float snr, bool was_reassembled) {
+            ui_log("RX: " + std::to_string(payload.size()) + " bytes, SNR=" + 
+                   std::to_string((int)snr) + "dB" + (was_reassembled ? " (reassembled)" : ""));
+            if (g_verbose) {
+                std::cerr << packet_visualize(payload.data(), payload.size(), false, false) << std::endl;
+            }
+            
+#ifdef WITH_UI
+            if (g_ui_state) {
+                g_ui_state->add_packet(false, payload.size(), snr);
+            }
+#endif
+            
+            auto kiss_frame = KISSParser::wrap(payload);
+            
+            std::lock_guard<std::mutex> lock(clients_mutex_);
+            for (auto& client : clients_) {
+                client->send(kiss_frame);
+            }
+        };
+        
+        auto frame_callback = [this, &deliver_to_clients](const uint8_t* data, size_t len) {
             set_tx_lockout(RX_LOCKOUT_SECONDS);
             
             float snr = decoder_->get_last_snr();
@@ -608,7 +688,6 @@ private:
             }
 #endif
             
-            // Strip length prefix framing
             auto payload = unframe_length(data, len);
             
             if (payload.empty()) {
@@ -619,25 +698,18 @@ private:
                 return;
             }
             
-            ui_log("RX: " + std::to_string(payload.size()) + " bytes, SNR=" + 
-                   std::to_string((int)snr) + "dB");
-            if (g_verbose) {
-                hex_dump("RX", payload.data(), payload.size());
-            }
-            
-#ifdef WITH_UI
-            // Track packet for UI display
-            if (g_ui_state) {
-                g_ui_state->add_packet(false, payload.size(), snr);
-            }
-#endif
-            
-            // Send to all clients
-            auto kiss_frame = KISSParser::wrap(payload);
-            
-            std::lock_guard<std::mutex> lock(clients_mutex_);
-            for (auto& client : clients_) {
-                client->send(kiss_frame);
+            if (config_.fragmentation_enabled && reassembler_.is_fragment(payload)) {
+                if (g_verbose) {
+                    std::cerr << packet_visualize(payload.data(), payload.size(), false, true) << std::endl;
+                }
+                
+                auto reassembled = reassembler_.process(payload);
+                if (!reassembled.empty()) {
+                    ui_log("RX: Reassembled " + std::to_string(reassembled.size()) + " bytes from fragments");
+                    deliver_to_clients(reassembled, snr, true);
+                }
+            } else {
+                deliver_to_clients(payload, snr, false);
             }
         };
         
@@ -737,10 +809,13 @@ private:
     std::atomic<bool> tx_running_{false};
     std::atomic<bool> rx_running_{false};
     
+    Fragmenter fragmenter_;
+    Reassembler reassembler_;
+    
     // TX lockout - prevents TX while receiving
     std::mutex lockout_mutex_;
     std::chrono::steady_clock::time_point tx_lockout_until_;
-    static constexpr float RX_LOCKOUT_SECONDS = 0.5f;  // Post-RX settling time
+    static constexpr float RX_LOCKOUT_SECONDS = 0.5f;
     
 public:
     // Update config at runtime (called from UI)
@@ -810,10 +885,19 @@ public:
         return false;
     }
     
-    // Queue data for transmission 
     void queue_data(const std::vector<uint8_t>& data) {
-        auto framed = frame_with_length(data);
-        tx_queue_.push(framed);
+        size_t max_payload = payload_size_ - 2;
+        
+        if (config_.fragmentation_enabled && fragmenter_.needs_fragmentation(data.size(), max_payload)) {
+            auto fragments = fragmenter_.fragment(data, max_payload);
+            ui_log("TX: Fragmenting " + std::to_string(data.size()) + " bytes into " + 
+                   std::to_string(fragments.size()) + " fragments");
+            for (auto& frag : fragments) {
+                tx_queue_.push(std::move(frag));
+            }
+        } else {
+            tx_queue_.push(data);
+        }
 #ifdef WITH_UI
         if (g_ui_state) {
             g_ui_state->tx_queue_size = tx_queue_.size();
@@ -850,6 +934,9 @@ void print_help(const char* prog) {
               << "  --csma-threshold DB     Carrier sense threshold (default: -30)\n"
               << "  --csma-slot MS          Slot time in ms (default: 500)\n"
               << "  --csma-persist N        P-persistence 0-255 (default: 128 = 50%)\n"
+              << "\nFragmentation:\n"
+              << "  --frag                  Enable packet fragmentation/reassembly\n"
+              << "  --no-frag               Disable fragmentation (default)\n"
               << "\n"
 #ifdef WITH_UI
               << "  -h, --headless          Run without TUI\n"
@@ -948,6 +1035,10 @@ int main(int argc, char** argv) {
             config.slot_time_ms = std::atoi(argv[++i]);
         } else if (arg == "--csma-persist" && i + 1 < argc) {
             config.p_persistence = std::atoi(argv[++i]);
+        } else if (arg == "--frag") {
+            config.fragmentation_enabled = true;
+        } else if (arg == "--no-frag") {
+            config.fragmentation_enabled = false;
         } else {
             std::cerr << "Unknown option: " << arg << std::endl;
             print_help(argv[0]);
@@ -1005,6 +1096,7 @@ int main(int argc, char** argv) {
                 config.carrier_threshold_db = ui_state.carrier_threshold_db;
                 config.slot_time_ms = ui_state.slot_time_ms;
                 config.p_persistence = ui_state.p_persistence;
+                config.fragmentation_enabled = ui_state.fragmentation_enabled;
                 // Audio devices
                 config.audio_input_device = ui_state.audio_input_device;
                 config.audio_output_device = ui_state.audio_output_device;
@@ -1048,6 +1140,7 @@ int main(int argc, char** argv) {
                 ui_state.slot_time_ms = config.slot_time_ms;
                 ui_state.p_persistence = config.p_persistence;
                 ui_state.short_frame = config.short_frame;
+                ui_state.fragmentation_enabled = config.fragmentation_enabled;
                 // Audio devices
                 ui_state.audio_input_device = config.audio_input_device;
                 ui_state.audio_output_device = config.audio_output_device;
@@ -1099,8 +1192,8 @@ int main(int argc, char** argv) {
 
         ui_state.load_presets();
         
-
-
+        // Sync fragmentation setting from command line to UI
+        ui_state.fragmentation_enabled = config.fragmentation_enabled;
 
         ui_state.update_modem_info();
         
@@ -1110,6 +1203,40 @@ int main(int argc, char** argv) {
         };
     }
 #endif
+    
+    while (!check_port_available(config.bind_address, config.port)) {
+        std::cerr << "Error: Port " << config.port << " is already in use or cannot be bound" << std::endl;
+        std::cerr << "Another instance of modem73 may be running, or another application is using this port." << std::endl;
+        
+        if (!g_use_ui) {
+            std::cerr << "Use --port to specify a different port." << std::endl;
+            return 1;
+        }
+        
+        std::cerr << "\nEnter a different port number (or 'q' to quit): ";
+        std::string input;
+        if (!std::getline(std::cin, input) || input.empty() || input == "q" || input == "Q") {
+            std::cerr << "Exiting." << std::endl;
+            return 1;
+        }
+        
+        try {
+            int new_port = std::stoi(input);
+            if (new_port < 1 || new_port > 65535) {
+                std::cerr << "Invalid port number. Must be between 1 and 65535." << std::endl;
+                continue;
+            }
+            config.port = new_port;
+#ifdef WITH_UI
+            if (g_use_ui) {
+                ui_state.port = new_port;
+            }
+#endif
+            std::cerr << "Trying port " << config.port << "..." << std::endl;
+        } catch (const std::exception&) {
+            std::cerr << "Invalid input. Please enter a number." << std::endl;
+        }
+    }
     
     try {
         KISSTNC tnc(config);
@@ -1127,6 +1254,7 @@ int main(int argc, char** argv) {
                 new_config.carrier_threshold_db = state.carrier_threshold_db;
                 new_config.p_persistence = state.p_persistence;
                 new_config.slot_time_ms = state.slot_time_ms;
+                new_config.fragmentation_enabled = state.fragmentation_enabled;
                 // Audio devices 
                 new_config.audio_input_device = state.audio_input_device;
                 new_config.audio_output_device = state.audio_output_device;

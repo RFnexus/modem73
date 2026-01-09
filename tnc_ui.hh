@@ -91,6 +91,8 @@ struct TNCUIState {
     int mtu_bytes = 0;
     int bitrate_bps = 0;
     float airtime_seconds = 0.0f;
+    int random_data_size = 0;
+    bool fragmentation_enabled = false;
     
     // stats
     std::atomic<float> total_tx_time{0.0f};  
@@ -269,6 +271,13 @@ struct TNCUIState {
             bitrate_bps = bitrate_normal[mod][rate];
             airtime_seconds = duration_normal[mod] / 1000.0f;
         }
+        
+        // Initialize random_data_size if not set, clamp to MTU only if fragmentation disabled
+        if (random_data_size == 0) {
+            random_data_size = mtu_bytes;
+        } else if (!fragmentation_enabled && random_data_size > mtu_bytes) {
+            random_data_size = mtu_bytes;
+        }
     }
     
     void update_level(float db) {
@@ -345,6 +354,7 @@ struct TNCUIState {
         fprintf(f, "carrier_threshold_db=%.1f\n", carrier_threshold_db);
         fprintf(f, "slot_time_ms=%d\n", slot_time_ms);
         fprintf(f, "p_persistence=%d\n", p_persistence);
+        fprintf(f, "fragmentation_enabled=%d\n", fragmentation_enabled ? 1 : 0);
         fprintf(f, "# Audio/PTT\n");
         fprintf(f, "audio_input=%s\n", audio_input_device.c_str());
         fprintf(f, "audio_output=%s\n", audio_output_device.c_str());
@@ -359,6 +369,8 @@ struct TNCUIState {
         fprintf(f, "com_invert_rts=%d\n", com_invert_rts ? 1 : 0);
         fprintf(f, "# Network\n");
         fprintf(f, "port=%d\n", port);
+        fprintf(f, "# Utils\n");
+        fprintf(f, "random_data_size=%d\n", random_data_size);
         
         fclose(f);
         return true;
@@ -386,6 +398,7 @@ struct TNCUIState {
                 else if (strcmp(key, "carrier_threshold_db") == 0) carrier_threshold_db = atof(value);
                 else if (strcmp(key, "slot_time_ms") == 0) slot_time_ms = atoi(value);
                 else if (strcmp(key, "p_persistence") == 0) p_persistence = atoi(value);
+                else if (strcmp(key, "fragmentation_enabled") == 0) fragmentation_enabled = atoi(value) != 0;
                 else if (strcmp(key, "audio_input") == 0) audio_input_device = value;
                 else if (strcmp(key, "audio_output") == 0) audio_output_device = value;
                 else if (strcmp(key, "audio_device") == 0) {
@@ -401,6 +414,7 @@ struct TNCUIState {
                 else if (strcmp(key, "com_invert_dtr") == 0) com_invert_dtr = atoi(value) != 0;
                 else if (strcmp(key, "com_invert_rts") == 0) com_invert_rts = atoi(value) != 0;
                 else if (strcmp(key, "port") == 0) port = atoi(value);
+                else if (strcmp(key, "random_data_size") == 0) random_data_size = atoi(value);
             }
         }
         
@@ -657,7 +671,8 @@ private:
         FIELD_FREQ,
         FIELD_CSMA,
         FIELD_THRESHOLD,
-        FIELD_PERSISTENCE,  
+        FIELD_PERSISTENCE,
+        FIELD_FRAGMENTATION,
         FIELD_AUDIO_INPUT,
         FIELD_AUDIO_OUTPUT,
         FIELD_PTT_TYPE,
@@ -747,6 +762,11 @@ private:
                     } else if (current_field_ >= FIELD_MODULATION && current_field_ != FIELD_PRESET) {
                         adjust_field(-1);
                     }
+                } else if (current_tab_ == 3 && (utils_selection_ == 0 || utils_selection_ == 1)) {
+                    int step = 1;
+                    if (state_.random_data_size >= 1000) step = 100;
+                    else if (state_.random_data_size >= 100) step = 10;
+                    state_.random_data_size = std::max(1, state_.random_data_size - step);
                 }
                 break;
                 
@@ -763,6 +783,12 @@ private:
                     } else if (current_field_ >= FIELD_MODULATION && current_field_ != FIELD_PRESET) {
                         adjust_field(1);
                     }
+                } else if (current_tab_ == 3 && (utils_selection_ == 0 || utils_selection_ == 1)) {
+                    int step = 1;
+                    if (state_.random_data_size >= 1000) step = 100;
+                    else if (state_.random_data_size >= 100) step = 10;
+                    int max_size = state_.fragmentation_enabled ? 65535 : state_.mtu_bytes;
+                    state_.random_data_size = std::min(max_size, state_.random_data_size + step);
                 }
                 break;
                 
@@ -1111,6 +1137,11 @@ private:
             case FIELD_PERSISTENCE:
                 state_.p_persistence += delta * 8;
                 state_.p_persistence = std::max(0, std::min(255, state_.p_persistence));
+                break;
+            case FIELD_FRAGMENTATION:
+                state_.fragmentation_enabled = !state_.fragmentation_enabled;
+                state_.update_modem_info();  // Update random_data_size limits
+                state_.add_log("(!) Fragmentation changed, restart required");
                 break;
             case FIELD_AUDIO_INPUT:
                 break;
@@ -2115,6 +2146,20 @@ private:
         }
         row += 2;
         
+        // Fragmentation section
+        dy = visible_y(row);
+        if (dy >= 0) {
+            attron(A_DIM);
+            mvaddstr(dy, c1, "FRAGMENTATION");
+            mvaddstr(dy, c1 + 14, "(restart)");
+            attroff(A_DIM);
+        }
+        row++;
+        
+        dy = visible_y(row);
+        if (dy >= 0) draw_toggle_field(dy, c1, c2, "Enabled", FIELD_FRAGMENTATION, state_.fragmentation_enabled);
+        row += 2;
+        
         // Audio / ptt
 
         dy = visible_y(row);
@@ -2625,28 +2670,56 @@ private:
         
         y++;
         
-        // Test info
         attron(COLOR_PAIR(4) | A_BOLD);
         mvaddstr(y, c1, "[ TEST INFO ]");
         attroff(COLOR_PAIR(4) | A_BOLD);
         y++;
         
         attron(A_DIM);
-        mvaddstr(y, c1, "Payload");
+        mvaddstr(y, c1, "MTU");
         attroff(A_DIM);
-        mvprintw(y, c1 + 12, "%d bytes", state_.mtu_bytes);
+        mvprintw(y, c1 + 14, "%d bytes", state_.mtu_bytes);
+        if (state_.fragmentation_enabled) {
+            attron(COLOR_PAIR(4));
+            printw(" [FRAG]");
+            attroff(COLOR_PAIR(4));
+        }
+        y++;
+        
+        bool size_selected = (utils_selection_ == 0 || utils_selection_ == 1);
+        if (size_selected) {
+            attron(A_BOLD | COLOR_PAIR(4));
+        } else {
+            attron(A_DIM);
+        }
+        mvaddstr(y, c1, "Test Size");
+        if (size_selected) {
+            attroff(A_BOLD | COLOR_PAIR(4));
+            mvprintw(y, c1 + 14, "< %d bytes >", state_.random_data_size);
+        } else {
+            attroff(A_DIM);
+            mvprintw(y, c1 + 14, "%d bytes", state_.random_data_size);
+        }
+        
+        if (state_.fragmentation_enabled && state_.random_data_size > state_.mtu_bytes) {
+            int data_per_frag = state_.mtu_bytes - 5;  // 5-byte fragment header
+            int num_frags = (state_.random_data_size + data_per_frag - 1) / data_per_frag;
+            attron(COLOR_PAIR(3));
+            printw(" (%d frags)", num_frags);
+            attroff(COLOR_PAIR(3));
+        }
         y++;
         
         attron(A_DIM);
         mvaddstr(y, c1, "Pattern");
         attroff(A_DIM);
-        mvaddstr(y, c1 + 12, "0x55 (alternating)");
+        mvaddstr(y, c1 + 14, "0x55 (alternating)");
         y++;
         
         attron(A_DIM);
         mvaddstr(y, c1, "Frames Sent");
         attroff(A_DIM);
-        mvprintw(y, c1 + 12, "%d", state_.tx_frame_count.load());
+        mvprintw(y, c1 + 14, "%d", state_.tx_frame_count.load());
         y++;
         
         int ry = 4;
@@ -2704,29 +2777,26 @@ private:
     void handle_utils_action() {
         switch (utils_selection_) {
             case 0: {
-                // Send test pattern 
                 if (state_.on_send_data) {
-                    std::vector<uint8_t> data(state_.mtu_bytes, 0x55);
+                    std::vector<uint8_t> data(state_.random_data_size, 0x55);
                     state_.on_send_data(data);
-                    state_.add_log("Sent test pattern (" + std::to_string(state_.mtu_bytes) + " bytes)");
+                    state_.add_log("Sent test pattern (" + std::to_string(state_.random_data_size) + " bytes)");
                 }
                 break;
             }
             case 1: {
-                // Send random data
                 if (state_.on_send_data) {
-                    std::vector<uint8_t> data(state_.mtu_bytes);
+                    std::vector<uint8_t> data(state_.random_data_size);
                     std::random_device rd;
                     std::mt19937 gen(rd());
                     std::uniform_int_distribution<> dis(0, 255);
                     for (auto& b : data) b = dis(gen);
                     state_.on_send_data(data);
-                    state_.add_log("Sent random data (" + std::to_string(state_.mtu_bytes) + " bytes)");
+                    state_.add_log("Sent random data (" + std::to_string(state_.random_data_size) + " bytes)");
                 }
                 break;
             }
             case 2: {
-                // Send ping 
                 if (state_.on_send_data) {
                     std::string ping = "PING:" + state_.callsign;
                     std::vector<uint8_t> data(ping.begin(), ping.end());
