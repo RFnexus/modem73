@@ -917,7 +917,7 @@ void print_help(const char* prog) {
               << "  --list-audio            List available audio devices and exit\n"
               << "  -c, --callsign CALL     Callsign (default: N0CALL)\n"
               << "  -m, --modulation MOD    BPSK/QPSK/8PSK/QAM16/QAM64/QAM256 (default: QPSK)\n"
-              << "  -r, --rate RATE         Code rate: 1/2, 2/3, 3/4, 5/6 (default: 1/2)\n"
+              << "  -r, --rate RATE         Code rate: 1/2, 2/3, 3/4, 5/6, 1/4 (default: 1/2)\n"
               << "  -f, --freq FREQ         Center frequency in Hz (default: 1500)\n"
               << "  --short                 Use short frames\n"
               << "  --normal                Use normal frames (default)\n"

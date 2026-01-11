@@ -7,7 +7,7 @@
 #include <atomic>
 
 
-#include "common.hh"
+#include "phy/common.hh"
 #include "schmidl_cox.hh"
 #include "bip_buffer.hh"
 #include "theil_sen.hh"
@@ -81,7 +81,7 @@ struct ModemConfig {
         return acc;
     }
     
-    static int encode_mode(const char* modulation, const char* code_rate, bool short_frame) {
+  static int encode_mode(const char* modulation, const char* code_rate, bool short_frame) {
         int mode = 0;
         
         if (!strcmp(modulation, "BPSK"))
@@ -111,6 +111,8 @@ struct ModemConfig {
             mode |= 2 << 1;
         else if (!strcmp(code_rate, "5/6"))
             mode |= 3 << 1;
+        else if (!strcmp(code_rate, "1/4"))
+            mode |= 4 << 1;
         else
             return -1;
         
