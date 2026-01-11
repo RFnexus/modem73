@@ -30,7 +30,9 @@ const std::vector<std::string> MODULATION_OPTIONS = {
     "BPSK", "QPSK", "8PSK", "QAM16", "QAM64", "QAM256", "QAM1024", "QAM4096"
 };
 
-const std::vector<std::string> CODE_RATE_OPTIONS = {"1/2", "2/3", "3/4", "5/6", "1/4"};
+const std::vector<std::string> CODE_RATE_OPTIONS = {
+    "1/2", "2/3", "3/4", "5/6", "1/4"
+};
 
 const std::vector<std::string> PTT_TYPE_OPTIONS = {
     "NONE", "RIGCTL", "VOX", "COM"
@@ -205,50 +207,51 @@ struct TNCUIState {
     // TEMP modem tables
     void update_modem_info() {
         // Modulations: BPSK=0, QPSK=1, 8PSK=2, QAM16=3, QAM64=4, QAM256=5, QAM1024=6, QAM4096=7
-        // Code rates: 1/2=0, 2/3=1, 3/4=2, 5/6=3
-        static const int payload_short[8][4] = {
-            {128, 171, 192, 213},     // BPSK
-            {128, 171, 192, 213},     // QPSK
-            {512, 684, 768, 852},     // 8PSK
-            {256, 342, 384, 426},     // QAM16
-            {1024, 1368, 1536, 1704}, // QAM64
-            {1024, 1368, 1536, 1704}, // QAM256
-            {2048, 2736, 3072, 3408}, // QAM1024
-            {2048, 2736, 3072, 3408}, // QAM4096
+        // Code rates: 1/2=0, 2/3=1, 3/4=2, 5/6=3, 1/4=4
+        // Columns: [1/2, 2/3, 3/4, 5/6, 1/4]
+        static const int payload_short[8][5] = {
+            {128, 171, 192, 213, 64},      // BPSK
+            {128, 171, 192, 213, 64},      // QPSK
+            {512, 684, 768, 852, 256},     // 8PSK
+            {256, 342, 384, 426, 128},     // QAM16
+            {1024, 1368, 1536, 1704, 512}, // QAM64
+            {1024, 1368, 1536, 1704, 512}, // QAM256
+            {2048, 2736, 3072, 3408, 1024}, // QAM1024
+            {2048, 2736, 3072, 3408, 1024}, // QAM4096
         };
         
-        static const int payload_normal[8][4] = {
-            {256, 342, 384, 426},     // BPSK
-            {512, 684, 768, 852},     // QPSK
-            {1024, 1368, 1536, 1704}, // 8PSK
-            {1024, 1368, 1536, 1704}, // QAM16
-            {2048, 2736, 3072, 3408}, // QAM64
-            {2048, 2736, 3072, 3408}, // QAM256
-            {4096, 5472, 6144, 6816}, // QAM1024
-            {4096, 5472, 6144, 6816}, // QAM4096
+        static const int payload_normal[8][5] = {
+            {256, 342, 384, 426, 128},      // BPSK
+            {512, 684, 768, 852, 256},      // QPSK
+            {1024, 1368, 1536, 1704, 512},  // 8PSK
+            {1024, 1368, 1536, 1704, 512},  // QAM16
+            {2048, 2736, 3072, 3408, 1024}, // QAM64
+            {2048, 2736, 3072, 3408, 1024}, // QAM256
+            {4096, 5472, 6144, 6816, 2048}, // QAM1024
+            {4096, 5472, 6144, 6816, 2048}, // QAM4096
         };
         
-        // Bitrate tables in bps 
-        static const int bitrate_short[8][4] = {
-            {700, 900, 1000, 1100},      // BPSK
-            {1100, 1400, 1600, 1800},    // QPSK
-            {2100, 2900, 3200, 3600},    // 8PSK
-            {2100, 2900, 3200, 3600},    // QAM16
-            {4300, 5700, 6400, 7100},    // QAM64
-            {5400, 7300, 8200, 9100},    // QAM256
-            {7500, 10000, 11200, 12500}, // QAM1024
-            {8600, 11400, 12800, 14200}, // QAM4096
+        // Bitrate tables in bps (columns: 1/2, 2/3, 3/4, 5/6, 1/4)
+        static const int bitrate_short[8][5] = {
+            {700, 900, 1000, 1100, 300},      // BPSK
+            {1100, 1400, 1600, 1800, 500},    // QPSK
+            {2100, 2900, 3200, 3600, 1100},   // 8PSK
+            {2100, 2900, 3200, 3600, 1000},   // QAM16
+            {4300, 5700, 6400, 7100, 2200},   // QAM64
+            {5400, 7300, 8200, 9100, 2700},   // QAM256
+            {7500, 10000, 11200, 12500, 3700}, // QAM1024
+            {8600, 11400, 12800, 14200, 4300}, // QAM4096
         };
         
-        static const int bitrate_normal[8][4] = {
-            {800, 1100, 1200, 1300},     // BPSK
-            {1600, 2100, 2400, 2600},    // QPSK
-            {2400, 3200, 3600, 4000},    // 8PSK
-            {3200, 4200, 4700, 5200},    // QAM16
-            {4800, 6400, 7200, 8000},    // QAM64
-            {6300, 8400, 9500, 10500},   // QAM256
-            {8300, 11000, 12400, 13800}, // QAM1024
-            {9600, 12800, 14400, 16000}, // QAM4096
+        static const int bitrate_normal[8][5] = {
+            {800, 1100, 1200, 1300, 400},     // BPSK
+            {1600, 2100, 2400, 2600, 800},    // QPSK
+            {2400, 3200, 3600, 4000, 1200},   // 8PSK
+            {3200, 4200, 4700, 5200, 1600},   // QAM16
+            {4800, 6400, 7200, 8000, 2400},   // QAM64
+            {6300, 8400, 9500, 10500, 3200},  // QAM256
+            {8300, 11000, 12400, 13800, 4100}, // QAM1024
+            {9600, 12800, 14400, 16000, 4800}, // QAM4096
         };
         
         static const int duration_short[8] = {1500, 1000, 1900, 1000, 1900, 1500, 2200, 1900};
@@ -258,7 +261,7 @@ struct TNCUIState {
         int rate = code_rate_index;
         
         if (mod < 0 || mod > 7) mod = 1;  
-        if (rate < 0 || rate > 3) rate = 0;  
+        if (rate < 0 || rate > 4) rate = 0;  
         
         if (short_frame) {
             mtu_bytes = payload_short[mod][rate] - 2; 
@@ -1120,7 +1123,7 @@ private:
                 state_.modulation_index = (state_.modulation_index + delta + 8) % 8;
                 break;
             case FIELD_CODERATE:
-                state_.code_rate_index = (state_.code_rate_index + delta + 4) % 4;
+                state_.code_rate_index = (state_.code_rate_index + delta + 5) % 5;
                 break;
             case FIELD_FRAMESIZE:
                 state_.short_frame = !state_.short_frame;
