@@ -36,7 +36,8 @@ enum class PTTType {
     NONE = 0,
     RIGCTL = 1,
     VOX = 2,
-    COM = 3
+    COM = 3,
+    CM108 = 4
 };
 
 struct TNCConfig {
@@ -73,6 +74,9 @@ struct TNCConfig {
     int com_ptt_line = 1;        // 0=DTR, 1=RTS, 2=BOTH
     bool com_invert_dtr = false;
     bool com_invert_rts = false;
+
+    // CM108 PTT settings
+    int cm108_gpio = 3;
     
     // PTT timing 
     int ptt_delay_ms = 50;       // Delay after PTT before TX

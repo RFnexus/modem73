@@ -1,7 +1,7 @@
 CXX = g++
 CC = gcc
 CXXFLAGS = -std=c++17 -O3 -march=native -Wall -Wextra
-LDFLAGS = -lpthread  -ltinfo -lncurses -ldl -lm
+LDFLAGS = -lpthread  -ltinfo -lncurses -ldl -lm -lhidapi-hidraw
 
 # dependencies
 AICODIX_DSP ?= ../dsp
@@ -34,6 +34,7 @@ clean:
 
 install: $(TARGET)
 	install -m 755 $(TARGET) /usr/local/bin/
+    $(shell cp 50-cm108-ptt.rules /etc/udev/rules.d/)
 
 # Debug build
 debug: CXXFLAGS = -std=c++17 -g -O0 -Wall -Wextra -DDEBUG
