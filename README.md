@@ -22,6 +22,17 @@ MODEM73 is a [KISS](https://en.wikipedia.org/wiki/KISS_(amateur_radio_protocol))
 sudo apt install git build-essential libncurses-dev g++  
 ```
 
+#### Optional Addons
+
+
+##### CM108 USB PTT Support
+
+CM108-based USB audio interfaces have GPIO pins that can be used for PTT control. To enable CM108 support, install libhidapi-dev before building. The Makefile will auto-detect it and enable the feature.
+```
+# Debian/Ubuntu/Pi - install before building 
+sudo apt install libhidapi-dev
+```
+----
 2. Clone aiocdix DSP libraries and build.
 
 
@@ -64,6 +75,7 @@ There are currently four PTT options:
 - Rigctl
 - VOX
 - Serial
+- CM108
 
 
 ```
@@ -95,6 +107,11 @@ while running `rigctld`
 
 ```
 ./modem73 --ptt com --com-port /dev/ttyUSB0 --com-line rts
+```
+
+```
+# CM108 USB audio interface PTT (GPIO3 is default)
+./modem73 --ptt cm108 --cm108-gpio 3
 ```
 
 

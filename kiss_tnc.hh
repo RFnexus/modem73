@@ -36,7 +36,10 @@ enum class PTTType {
     NONE = 0,
     RIGCTL = 1,
     VOX = 2,
-    COM = 3
+    COM = 3,
+#ifdef WITH_CM108
+    CM108 = 4
+#endif
 };
 
 struct TNCConfig {
@@ -73,6 +76,11 @@ struct TNCConfig {
     int com_ptt_line = 1;        // 0=DTR, 1=RTS, 2=BOTH
     bool com_invert_dtr = false;
     bool com_invert_rts = false;
+
+#ifdef WITH_CM108
+    // CM108 PTT settings
+    int cm108_gpio = 3;
+#endif
     
     // PTT timing 
     int ptt_delay_ms = 50;       // Delay after PTT before TX
@@ -250,44 +258,32 @@ inline std::string packet_visualize(const uint8_t* data, size_t len, bool is_tx,
         uint8_t flags = data[4];
         
         oss << "  │ FRAG HDR [5 bytes]  Magic: 0xF3                             │\n";
-        oss << "  │   Packet ID: " << std::setw(5) << pkt_id;
-        oss << "   Seq: " << std::setw(3) << (int)seq;
-        oss << "   Flags: ";
-        
-        std::string flag_str;
-        if (flags & 0x02) flag_str += "FIRST ";
-        if (flags & 0x01) flag_str += "MORE";
-        if (flag_str.empty()) flag_str = "LAST";
-        oss << std::left << std::setw(12) << flag_str << std::right << "   │\n";
-        
+        oss << "  │   Packet ID: 0x" << std::hex << std::setfill('0') << std::setw(4) << pkt_id << std::dec;
+        oss << "  Seq: " << std::setw(3) << (int)seq;
+        oss << "  Flags: ";
+        if (flags & 0x02) oss << "FIRST ";
+        if (flags & 0x01) oss << "MORE";
+        if (!(flags & 0x03)) oss << "LAST";
+        oss << std::string(20, ' ') << "│\n";
         offset = 5;
-        oss << "  ├─────────────────────────────────────────────────────────────┤\n";
     }
     
-    size_t payload_len = len - offset;
-    oss << "  │ PAYLOAD [" << payload_len << " bytes]";
-    oss << std::string(49 - std::to_string(payload_len).length(), ' ') << "│\n";
-    
-    size_t preview_len = std::min(payload_len, (size_t)32);
-    if (preview_len > 0) {
+    if (offset < len) {
+        oss << "  ├─────────────────────────────────────────────────────────────┤\n";
+        size_t payload_len = len - offset;
+        oss << "  │ PAYLOAD [" << payload_len << " bytes]";
+        oss << std::string(49 - std::to_string(payload_len).length(), ' ') << "│\n";
+        
+        size_t preview_len = std::min(payload_len, (size_t)24);
         oss << "  │   ";
         for (size_t i = 0; i < preview_len; i++) {
             oss << std::hex << std::setfill('0') << std::setw(2) << (int)data[offset + i];
             if (i < preview_len - 1) oss << " ";
         }
-        if (payload_len > 32) oss << "...";
-        size_t used = preview_len * 3 - 1 + (payload_len > 32 ? 3 : 0);
+        if (payload_len > 24) oss << " ...";
+        oss << std::dec;
+        size_t used = preview_len * 3 - 1 + (payload_len > 24 ? 4 : 0);
         if (used < 57) oss << std::string(57 - used, ' ');
-        oss << std::dec << " │\n";
-        
-        oss << "  │   ";
-        for (size_t i = 0; i < preview_len; i++) {
-            char c = data[offset + i];
-            oss << (c >= 32 && c < 127 ? c : '.');
-        }
-        if (payload_len > 32) oss << "...";
-        size_t ascii_used = preview_len + (payload_len > 32 ? 3 : 0);
-        if (ascii_used < 57) oss << std::string(57 - ascii_used, ' ');
         oss << " │\n";
     }
     

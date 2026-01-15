@@ -30,6 +30,9 @@
 #include "miniaudio_audio.hh"
 #include "rigctl_ptt.hh"
 #include "serial_ptt.hh"
+#ifdef WITH_CM108
+#include "cm108_ptt.hh"
+#endif
 #include "modem.hh"
 
 #ifdef WITH_UI
@@ -184,6 +187,11 @@ public:
                                    config_.com_invert_rts)) {
                 std::cerr << "Could not open COM port: " << serial_ptt_->last_error() << std::endl;
             }
+#ifdef WITH_CM108
+        } else if (config_.ptt_type == PTTType::CM108) {
+            cm108_ptt_ = std::make_unique<CM108PTT>();
+            cm108_ptt_->open(config_.cm108_gpio);
+#endif
         } else {
             dummy_ptt_ = std::make_unique<DummyPTT>();
             dummy_ptt_->connect();
@@ -246,6 +254,11 @@ public:
                 std::cerr << "PTT: COM " << config_.com_port 
                           << " (" << PTT_LINE_OPTIONS[config_.com_ptt_line] << ")" << std::endl;
                 break;
+#ifdef WITH_CM108
+            case PTTType::CM108:
+                std::cerr << "PTT: CM108 (GPIO" << config_.cm108_gpio << ")" << std::endl;
+                break;
+#endif
         }
         
         // Start threads
@@ -592,7 +605,11 @@ private:
                    std::to_string(duration) + " seconds");
             
             // PTT on (for RIGCTL or COM mode)
-            if (config_.ptt_type == PTTType::RIGCTL || config_.ptt_type == PTTType::COM) {
+            if (config_.ptt_type == PTTType::RIGCTL || config_.ptt_type == PTTType::COM
+#ifdef WITH_CM108
+                || config_.ptt_type == PTTType::CM108
+#endif
+            ) {
                 set_ptt(true);
                 std::this_thread::sleep_for(std::chrono::milliseconds(config_.ptt_delay_ms));
             }
@@ -612,7 +629,11 @@ private:
             audio_->drain_playback();
             
             // PTT off
-            if (config_.ptt_type == PTTType::RIGCTL || config_.ptt_type == PTTType::COM) {
+            if (config_.ptt_type == PTTType::RIGCTL || config_.ptt_type == PTTType::COM
+#ifdef WITH_CM108
+                || config_.ptt_type == PTTType::CM108
+#endif
+            ) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(config_.ptt_tail_ms));
                 set_ptt(false);
             }
@@ -746,6 +767,10 @@ private:
             } else {
                 serial_ptt_->ptt_off();
             }
+#ifdef WITH_CM108
+        } else if (cm108_ptt_) {
+            cm108_ptt_->set_ptt(on);
+#endif
         } else if (dummy_ptt_) {
             dummy_ptt_->set_ptt(on);
         }
@@ -799,6 +824,9 @@ private:
     std::unique_ptr<MiniAudio> audio_;
     std::unique_ptr<RigctlPTT> rigctl_;
     std::unique_ptr<SerialPTT> serial_ptt_;
+#ifdef WITH_CM108
+    std::unique_ptr<CM108PTT> cm108_ptt_;
+#endif
     std::unique_ptr<DummyPTT> dummy_ptt_;
     
     int server_fd_ = -1;
@@ -922,11 +950,20 @@ void print_help(const char* prog) {
               << "  --short                 Use short frames\n"
               << "  --normal                Use normal frames (default)\n"
               << "\nPTT options:\n"
-              << "  --ptt TYPE              PTT type: none, rigctl, vox (default: rigctl)\n"
+              << "  --ptt TYPE              PTT type: none, rigctl, vox, com"
+#ifdef WITH_CM108
+              << ", cm108"
+#endif
+              << " (default: rigctl)\n"
               << "  --rigctl HOST:PORT      Rigctl address (default: localhost:4532)\n"
+              << "  --com-port PORT         Serial port for COM PTT (default: /dev/ttyUSB0)\n"
+              << "  --com-line LINE         COM PTT line: dtr, rts, both (default: rts)\n"
               << "  --vox-freq HZ           VOX tone frequency (default: 1200)\n"
               << "  --vox-lead MS           VOX lead time in ms (default: 150)\n"
               << "  --vox-tail MS           VOX tail time in ms (default: 100)\n"
+#ifdef WITH_CM108
+              << "  --cm108-gpio N          CM108 GPIO pin for PTT (default: 3)\n"
+#endif
               << "  --ptt-delay MS          PTT delay before TX (default: 50)\n"
               << "  --ptt-tail MS           PTT tail after TX (default: 50)\n"
               << "\nCSMA options:\n"
@@ -1006,13 +1043,32 @@ int main(int argc, char** argv) {
             } else {
                 config.rigctl_host = hostport;
             }
+        } else if (arg == "--com-port" && i + 1 < argc) {
+            config.com_port = argv[++i];
+        } else if (arg == "--com-line" && i + 1 < argc) {
+            std::string line = argv[++i];
+            if (line == "dtr") config.com_ptt_line = 0;
+            else if (line == "rts") config.com_ptt_line = 1;
+            else if (line == "both") config.com_ptt_line = 2;
+            else {
+                std::cerr << "Unknown COM PTT line: " << line << " (use dtr, rts, or both)\n";
+                return 1;
+            }
         } else if (arg == "--ptt" && i + 1 < argc) {
             std::string ptt_type = argv[++i];
             if (ptt_type == "none") config.ptt_type = PTTType::NONE;
             else if (ptt_type == "rigctl") config.ptt_type = PTTType::RIGCTL;
             else if (ptt_type == "vox") config.ptt_type = PTTType::VOX;
+            else if (ptt_type == "com") config.ptt_type = PTTType::COM;
+#ifdef WITH_CM108
+            else if (ptt_type == "cm108") config.ptt_type = PTTType::CM108;
+#endif
             else {
-                std::cerr << "Unknown PTT type: " << ptt_type << " (use none, rigctl, or vox)\n";
+                std::cerr << "Unknown PTT type: " << ptt_type << " (use none, rigctl, vox, com"
+#ifdef WITH_CM108
+                          << ", cm108"
+#endif
+                          << ")\n";
                 return 1;
             }
         } else if (arg == "--vox-freq" && i + 1 < argc) {
@@ -1021,6 +1077,10 @@ int main(int argc, char** argv) {
             config.vox_lead_ms = std::atoi(argv[++i]);
         } else if (arg == "--vox-tail" && i + 1 < argc) {
             config.vox_tail_ms = std::atoi(argv[++i]);
+#ifdef WITH_CM108
+        } else if (arg == "--cm108-gpio" && i + 1 < argc) {
+            config.cm108_gpio = std::atoi(argv[++i]);
+#endif
         } else if (arg == "--ptt-delay" && i + 1 < argc) {
             config.ptt_delay_ms = std::atoi(argv[++i]);
         } else if (arg == "--ptt-tail" && i + 1 < argc) {
