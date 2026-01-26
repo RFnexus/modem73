@@ -70,7 +70,7 @@ By default, MODEM73 will listen on port 8001
 
 All of the modes provided by the OFDM modem require a bandwidth of 2400 Hz and work over both FM and SSB. 
 
-There are currently four PTT options:
+There are currently five PTT options:
 - NONE (speaker/mic over the air)
 - Rigctl
 - VOX
@@ -110,7 +110,7 @@ while running `rigctld`
 ```
 
 ```
-# CM108 USB audio interface PTT (GPIO3 is default)
+# CM108 USB audio interface PTT (GPIO3 is the default)
 ./modem73 --ptt cm108 --cm108-gpio 3
 ```
 
