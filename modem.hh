@@ -414,6 +414,10 @@ public:
     
     using FrameCallback = std::function<void(const uint8_t*, size_t)>;
     
+    // Constellation callback - called after each symbol is demodulated
+    // Parameters: pointer to demodulated symbols, count, modulation bits
+    std::function<void(const cmplx*, int, int)> constellation_callback;
+    
     ModemDecoder() {
         // init fdom_mls before correlator uses it
         init_mls0_seq();
@@ -444,6 +448,9 @@ public:
     
     // Get average SNR from last successful decode
     value get_last_snr() const { return last_avg_snr_; }
+    
+    // Get current modulation bits
+    int get_mod_bits() const { return mod_bits; }
     
 private:
     enum class State {
@@ -869,6 +876,11 @@ private:
             for (int i = 0; i < tone_count; ++i)
                 if (i % block_length != seed_off)
                     demod[i] *= nrz(seq());
+        }
+        
+        // Notify constellation callback with fully-corrected demodulated symbols
+        if (constellation_callback) {
+            constellation_callback(demod, tone_count, mod_bits);
         }
         
         // SNR estimation and soft demapping

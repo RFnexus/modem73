@@ -138,6 +138,20 @@ public:
         decoder_ = std::make_unique<Decoder48k>();
         std::cerr << "  Encoder/decoder created" << std::endl;
         
+        // Set up constellation callback for UI display
+#ifdef WITH_UI
+        decoder_->constellation_callback = [](const DSP::Complex<float>* symbols, int count, int mod_bits) {
+            if (g_ui_state) {
+                // DSP::Complex<float> is layout-compatible with std::complex<float>
+                g_ui_state->update_constellation(
+                    reinterpret_cast<const std::complex<float>*>(symbols),
+                    count,
+                    mod_bits
+                );
+            }
+        };
+#endif
+        
         // Init modem configuration
         modem_config_.sample_rate = config.sample_rate;
         modem_config_.center_freq = config.center_freq;
