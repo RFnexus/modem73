@@ -176,23 +176,33 @@ struct TNCUIState {
     std::atomic<bool> constellation_valid{false};
     std::atomic<int64_t> constellation_update_time{0};
     
-    void update_constellation(const std::complex<float>* points, int count, int mod_bits) {
+    void update_constellation(const std::complex<float>* points, int count, int mod_bits, int seed_off = -1) {
         std::lock_guard<std::mutex> lock(constellation_mutex);
         
-        // Copy points
-        int n = std::min(count, CONSTELLATION_SIZE);
-        for (int i = 0; i < n; ++i) {
-            constellation_points[i] = points[i];
+        // copy data tones only
+        static const int BLOCK_LEN = 5;  // from Common::block_length
+        int n = 0;
+        for (int i = 0; i < count && n < CONSTELLATION_SIZE; ++i) {
+            if (seed_off >= 0 && (i % BLOCK_LEN) == seed_off) continue;
+            constellation_points[n++] = points[i];
         }
         
         // Build density map
         constellation_density.fill(0);
         
-        // Scale factor based on modulation (higher order = larger spread)
-        float scale = 1.5f;
-        if (mod_bits >= 4) scale = 2.0f;   // QAM16+
-        if (mod_bits >= 6) scale = 2.5f;   // QAM64+
-        if (mod_bits >= 8) scale = 3.0f;   // QAM256+
+        // Scale factor matched to actual constellation extents + headroom for noise
+        float scale;
+        switch (mod_bits) {
+            case 1:  scale = 1.5f; break;  // BPSK  (extent 1.00)
+            case 2:  scale = 1.3f; break;  // QPSK  (extent 0.71)
+            case 3:  scale = 1.5f; break;  // 8PSK  (extent 0.92)
+            case 4:  scale = 1.7f; break;  // QAM16 (extent 0.95)
+            case 6:  scale = 2.0f; break;  // QAM64 (extent 1.08)
+            case 8:  scale = 2.3f; break;  // QAM256 (extent 1.15)
+            case 10: scale = 2.5f; break;  // QAM1024 (extent 1.19)
+            case 12: scale = 2.5f; break;  // QAM4096 (extent 1.21)
+            default: scale = 1.5f; break;
+        }
         
         int half = CONSTELLATION_GRID / 2;
         for (int i = 0; i < n; ++i) {
@@ -2880,18 +2890,17 @@ private:
                 int gx = (int)(dx * scale_x);
                 int gy = (int)(dy * scale_y);
                 
-                // Accumulate density (handles downscaling)
+                // Ensure at least 1 grid cell per display cell (prevents striping)
+                int gx_end = std::max(gx + 1, std::min((int)((dx + 1) * scale_x), grid_size));
+                int gy_end = std::max(gy + 1, std::min((int)((dy + 1) * scale_y), grid_size));
+                
                 int density = 0;
-                int samples = 0;
-                int gx_end = std::min((int)((dx + 1) * scale_x), grid_size);
-                int gy_end = std::min((int)((dy + 1) * scale_y), grid_size);
                 for (int sy = gy; sy < gy_end; ++sy) {
                     for (int sx = gx; sx < gx_end; ++sx) {
-                        density += state_.constellation_density[sy * grid_size + sx];
-                        samples++;
+                        int d = state_.constellation_density[sy * grid_size + sx];
+                        if (d > density) density = d;
                     }
                 }
-                if (samples > 0) density /= samples;
                 
                 // Map density to character
                 int char_idx = (density * (num_chars - 1)) / peak;
@@ -2915,12 +2924,18 @@ private:
             }
         }
         
-        // Draw center crosshair
+        // Draw center crosshair (only if cell is empty)
         int mid_y = height / 2;
         int mid_x = width / 2;
-        attron(A_DIM);
-        mvaddch(y + 1 + mid_y, x + 1 + mid_x, '+');
-        attroff(A_DIM);
+        int mid_gx = (int)(mid_x * scale_x);
+        int mid_gy = (int)(mid_y * scale_y);
+        bool center_empty = (mid_gx < grid_size && mid_gy < grid_size &&
+                            state_.constellation_density[mid_gy * grid_size + mid_gx] == 0);
+        if (center_empty) {
+            attron(A_DIM);
+            mvaddch(y + 1 + mid_y, x + 1 + mid_x, '+');
+            attroff(A_DIM);
+        }
         
         // Show modulation name in top-right of box
         const char* mod_name = "";
@@ -2935,8 +2950,9 @@ private:
             case 12: mod_name = "QAM4096"; break;
         }
         if (mod_name[0]) {
+            int name_len = strlen(mod_name);
             attron(A_DIM);
-            mvaddstr(y, x + width - 6, mod_name);
+            mvaddstr(y, x + width + 1 - name_len, mod_name);
             attroff(A_DIM);
         }
     }

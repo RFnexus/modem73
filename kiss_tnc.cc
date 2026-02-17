@@ -140,13 +140,14 @@ public:
         
         // Set up constellation callback for UI display
 #ifdef WITH_UI
-        decoder_->constellation_callback = [](const DSP::Complex<float>* symbols, int count, int mod_bits) {
+        decoder_->constellation_callback = [this](const DSP::Complex<float>* symbols, int count, int mod_bits) {
             if (g_ui_state) {
                 // DSP::Complex<float> is layout-compatible with std::complex<float>
                 g_ui_state->update_constellation(
                     reinterpret_cast<const std::complex<float>*>(symbols),
                     count,
-                    mod_bits
+                    mod_bits,
+                    decoder_->seed_off
                 );
             }
         };
@@ -890,8 +891,7 @@ public:
         config_.carrier_threshold_db = new_config.carrier_threshold_db;
         config_.p_persistence = new_config.p_persistence;
         config_.slot_time_ms = new_config.slot_time_ms;
-
-
+        
         // TX blanking 
         config_.tx_blanking_enabled = new_config.tx_blanking_enabled;
         
