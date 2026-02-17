@@ -15,6 +15,8 @@
 #include <cstring>
 #include <cctype>
 #include <cmath>
+#include <complex>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
@@ -162,6 +164,56 @@ struct TNCUIState {
     float snr_history[SNR_HISTORY_SIZE];
     int snr_history_pos = 0;
     int snr_history_count = 0;  
+
+    static constexpr int CONSTELLATION_SIZE = 320;  // tone_count from modem
+    static constexpr int CONSTELLATION_GRID = 51;   // density grid size 
+    
+    std::mutex constellation_mutex;
+    std::array<std::complex<float>, CONSTELLATION_SIZE> constellation_points;
+    std::array<int, CONSTELLATION_GRID * CONSTELLATION_GRID> constellation_density;
+    int constellation_mod_bits = 2;  // Current modulation bits
+    std::atomic<bool> constellation_valid{false};
+    std::atomic<int64_t> constellation_update_time{0};
+    
+    void update_constellation(const std::complex<float>* points, int count, int mod_bits) {
+        std::lock_guard<std::mutex> lock(constellation_mutex);
+        
+        // Copy points
+        int n = std::min(count, CONSTELLATION_SIZE);
+        for (int i = 0; i < n; ++i) {
+            constellation_points[i] = points[i];
+        }
+        
+        // Build density map
+        constellation_density.fill(0);
+        
+        // Scale factor based on modulation (higher order = larger spread)
+        float scale = 1.5f;
+        if (mod_bits >= 4) scale = 2.0f;   // QAM16+
+        if (mod_bits >= 6) scale = 2.5f;   // QAM64+
+        if (mod_bits >= 8) scale = 3.0f;   // QAM256+
+        
+        int half = CONSTELLATION_GRID / 2;
+        for (int i = 0; i < n; ++i) {
+            float re = constellation_points[i].real();
+            float im = constellation_points[i].imag();
+            
+            // Map to grid coordinates
+            int gx = half + (int)(re * half / scale);
+            int gy = half - (int)(im * half / scale);  // Flip Y for display
+            
+            // Clamp to grid bounds
+            gx = std::max(0, std::min(CONSTELLATION_GRID - 1, gx));
+            gy = std::max(0, std::min(CONSTELLATION_GRID - 1, gy));
+            
+            constellation_density[gy * CONSTELLATION_GRID + gx]++;
+        }
+        
+        constellation_mod_bits = mod_bits;
+        constellation_valid = true;
+        constellation_update_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
 
 
     struct PacketInfo {
@@ -734,11 +786,11 @@ private:
                 break;
                 
             case '\t':
-                current_tab_ = (current_tab_ + 1) % 4;
+                current_tab_ = (current_tab_ + 1) % 5;
                 break;
                 
             case KEY_BTAB:  // shift tab prev
-                current_tab_ = (current_tab_ + 3) % 4;
+                current_tab_ = (current_tab_ + 4) % 5;
                 break;
                 
             case KEY_UP:
@@ -1581,10 +1633,10 @@ private:
         
 
         // Tabs
-        const char* tabs[] = {"STATUS", "CONFIG", "LOG", "UTILS"};
-        int tab_width = (cols - 4) / 4;
+        const char* tabs[] = {"STATUS", "CONFIG", "LOG", "UTILS", "SCOPE"};
+        int tab_width = (cols - 4) / 5;
         
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < 5; i++) {
             int tx = 2 + i * tab_width;
             
             if (i == current_tab_) {
@@ -1614,8 +1666,10 @@ private:
             draw_config(content_y, content_h, cols);
         } else if (current_tab_ == 2) {
             draw_log(content_y, content_h, cols);
-        } else {
+        } else if (current_tab_ == 3) {
             draw_utils(content_y, content_h, cols);
+        } else {
+            draw_scope(content_y, content_h, cols);
         }
         
         // Footer
@@ -1628,6 +1682,8 @@ private:
             mvaddstr(rows - 1, 2, " ^/v scroll  PgUp/Dn page  F1 help  Q quit ");
         } else if (current_tab_ == 3) {
             mvaddstr(rows - 1, 2, " 1-6 select  Enter run  F1 help  Q quit ");
+        } else if (current_tab_ == 4) {
+            mvaddstr(rows - 1, 2, " Tab switch  F1 help  Q quit ");
         } else {
             mvaddstr(rows - 1, 2, " Tab switch  F1 help  Q quit ");
         }
@@ -2693,6 +2749,255 @@ private:
                 }
             }
         }
+    }
+    
+    void draw_constellation(int y, int x, int height, int width) {
+        // Height and width are separate to account for terminal character aspect ratio
+        if (height < 5) height = 5;
+        if (width < 9) width = 9;
+        
+        // Draw border using ACS characters
+        attron(A_DIM);
+        mvaddch(y, x, ACS_ULCORNER);
+        mvaddch(y, x + width + 1, ACS_URCORNER);
+        mvaddch(y + height + 1, x, ACS_LLCORNER);
+        mvaddch(y + height + 1, x + width + 1, ACS_LRCORNER);
+        for (int i = 1; i <= width; ++i) {
+            mvaddch(y, x + i, ACS_HLINE);
+            mvaddch(y + height + 1, x + i, ACS_HLINE);
+        }
+        for (int i = 1; i <= height; ++i) {
+            mvaddch(y + i, x, ACS_VLINE);
+            mvaddch(y + i, x + width + 1, ACS_VLINE);
+        }
+        
+        // Axis labels
+        mvaddstr(y - 1, x + width/2 - 1, "+Im");  // Top center (positive imaginary)
+        mvaddstr(y + height + 2, x + width/2 - 1, "-Im");  // Bottom center (negative imaginary)
+        mvaddstr(y + height/2, x - 4, "-Re");  // Left (negative real)
+        mvaddstr(y + height/2, x + width + 3, "+Re");  // Right (positive real)
+        attroff(A_DIM);
+        
+        // Draw key to the right of constellation
+        int key_x = x + width + 8;
+        int key_y = y + 1;
+        
+        attron(A_DIM);
+        mvaddstr(key_y, key_x, "DENSITY");
+        attroff(A_DIM);
+        key_y += 1;
+        
+        // Show density scale with colors
+        attron(COLOR_PAIR(1) | A_BOLD);
+        mvaddstr(key_y++, key_x, "@ # * High");
+        attroff(COLOR_PAIR(1) | A_BOLD);
+        
+        attron(COLOR_PAIR(3));
+        mvaddstr(key_y++, key_x, "+ = - Med");
+        attroff(COLOR_PAIR(3));
+        
+        attron(A_DIM);
+        mvaddstr(key_y++, key_x, ": .   Low");
+        attroff(A_DIM);
+        
+        key_y++;
+        attron(A_DIM);
+        mvaddstr(key_y++, key_x, "AXES");
+        attroff(A_DIM);
+        mvaddstr(key_y++, key_x, "Re: In-phase");
+        mvaddstr(key_y++, key_x, "Im: Quadrature");
+        
+        // Check for stale data (10 second timeout)
+        auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        bool stale = (now - state_.constellation_update_time.load()) > 10000;
+        
+        if (!state_.constellation_valid.load() || stale) {
+            // No data - show placeholder
+            attron(A_DIM);
+            int mid_y = height / 2;
+            int mid_x = (width - 9) / 2;  // "No signal" is 9 chars
+            mvaddstr(y + 1 + mid_y, x + 1 + mid_x, "No signal");
+            attroff(A_DIM);
+            return;
+        }
+        
+        // Density characters (space to full block)
+        const char* density_chars = " .:-=+*#@";
+        const int num_chars = 9;
+        
+        std::lock_guard<std::mutex> lock(state_.constellation_mutex);
+        
+        // Find peak density for normalization
+        int peak = 1;
+        for (size_t i = 0; i < state_.constellation_density.size(); ++i) {
+            if (state_.constellation_density[i] > peak) {
+                peak = state_.constellation_density[i];
+            }
+        }
+        
+        // Scale factors to map grid to display (separate for x and y)
+        int grid_size = TNCUIState::CONSTELLATION_GRID;
+        float scale_y = (float)grid_size / height;
+        float scale_x = (float)grid_size / width;
+        
+        // Draw constellation points
+        for (int dy = 0; dy < height; ++dy) {
+            for (int dx = 0; dx < width; ++dx) {
+                // Map display coords to grid coords
+                int gx = (int)(dx * scale_x);
+                int gy = (int)(dy * scale_y);
+                
+                // Accumulate density (handles downscaling)
+                int density = 0;
+                int samples = 0;
+                int gx_end = std::min((int)((dx + 1) * scale_x), grid_size);
+                int gy_end = std::min((int)((dy + 1) * scale_y), grid_size);
+                for (int sy = gy; sy < gy_end; ++sy) {
+                    for (int sx = gx; sx < gx_end; ++sx) {
+                        density += state_.constellation_density[sy * grid_size + sx];
+                        samples++;
+                    }
+                }
+                if (samples > 0) density /= samples;
+                
+                // Map density to character
+                int char_idx = (density * (num_chars - 1)) / peak;
+                if (density > 0 && char_idx == 0) char_idx = 1;
+                char_idx = std::min(char_idx, num_chars - 1);
+                
+                // Apply color based on density
+                if (char_idx >= 6) {
+                    attron(COLOR_PAIR(1) | A_BOLD);  // Green = high density (good)
+                } else if (char_idx >= 3) {
+                    attron(COLOR_PAIR(3));           // Yellow = medium
+                } else if (char_idx >= 1) {
+                    attron(A_DIM);                   // Dim = low density
+                }
+                
+                mvaddch(y + 1 + dy, x + 1 + dx, density_chars[char_idx]);
+                
+                attroff(COLOR_PAIR(1) | A_BOLD);
+                attroff(COLOR_PAIR(3));
+                attroff(A_DIM);
+            }
+        }
+        
+        // Draw center crosshair
+        int mid_y = height / 2;
+        int mid_x = width / 2;
+        attron(A_DIM);
+        mvaddch(y + 1 + mid_y, x + 1 + mid_x, '+');
+        attroff(A_DIM);
+        
+        // Show modulation name in top-right of box
+        const char* mod_name = "";
+        switch (state_.constellation_mod_bits) {
+            case 1: mod_name = "BPSK"; break;
+            case 2: mod_name = "QPSK"; break;
+            case 3: mod_name = "8PSK"; break;
+            case 4: mod_name = "QAM16"; break;
+            case 6: mod_name = "QAM64"; break;
+            case 8: mod_name = "QAM256"; break;
+            case 10: mod_name = "QAM1024"; break;
+            case 12: mod_name = "QAM4096"; break;
+        }
+        if (mod_name[0]) {
+            attron(A_DIM);
+            mvaddstr(y, x + width - 6, mod_name);
+            attroff(A_DIM);
+        }
+    }
+    
+    void draw_scope(int y, int h, int cols) {
+        int c1 = 3;
+        
+        attron(COLOR_PAIR(4) | A_BOLD);
+        mvaddstr(y, c1, "[ CONSTELLATION ]");
+        attroff(COLOR_PAIR(4) | A_BOLD);
+        y += 2;
+        
+        // Reserve space for signal info (4 lines at bottom) and margins
+        int available_h = h - 10;  // Extra for axis labels
+        int available_w = cols - 28;  // Space for key on right + axis labels
+        
+        // Terminal chars are ~2:1 aspect ratio (taller than wide)
+        // For visually square display: width should be ~2x height
+        int const_height = available_h;
+        int const_width = const_height * 2;  // 2:1 aspect ratio compensation
+        
+        // Clamp to available width
+        if (const_width > available_w) {
+            const_width = available_w;
+            const_height = const_width / 2;
+        }
+        
+        // Minimum sizes
+        if (const_height < 9) const_height = 9;
+        if (const_width < 17) const_width = 17;
+        
+        if (const_height >= 9) {
+            // Offset to leave room for left axis label
+            int x_offset = 6;
+            draw_constellation(y + 1, x_offset, const_height, const_width);  // +1 for top axis label
+            y += const_height + 5;  // Extra for axis labels
+        } else {
+            y += 2;
+        }
+        
+        // Show signal info below constellation
+        attron(A_DIM);
+        mvaddstr(y, c1, "SIGNAL INFO");
+        attroff(A_DIM);
+        y++;
+        
+        // Last SNR
+        mvaddstr(y, c1, "Last SNR:");
+        float snr = state_.last_rx_snr.load();
+        if (snr > 10.0f) {
+            attron(COLOR_PAIR(1) | A_BOLD);
+        } else if (snr > 5.0f) {
+            attron(COLOR_PAIR(3) | A_BOLD);
+        }
+        mvprintw(y, c1 + 12, "%6.1f dB", snr);
+        attroff(COLOR_PAIR(1) | A_BOLD);
+        attroff(COLOR_PAIR(3) | A_BOLD);
+        
+        // Modulation
+        const char* mod_name = "";
+        switch (state_.constellation_mod_bits) {
+            case 1: mod_name = "BPSK"; break;
+            case 2: mod_name = "QPSK"; break;
+            case 3: mod_name = "8PSK"; break;
+            case 4: mod_name = "QAM16"; break;
+            case 6: mod_name = "QAM64"; break;
+            case 8: mod_name = "QAM256"; break;
+            case 10: mod_name = "QAM1024"; break;
+            case 12: mod_name = "QAM4096"; break;
+        }
+        mvaddstr(y, c1 + 28, "Modulation:");
+        mvaddstr(y, c1 + 42, mod_name[0] ? mod_name : "---");
+        y++;
+        
+        // Carrier level
+        mvaddstr(y, c1, "Carrier:");
+        float lvl = state_.carrier_level_db.load();
+        bool busy = lvl > state_.carrier_threshold_db;
+        if (busy) {
+            attron(COLOR_PAIR(4) | A_BOLD);
+        }
+        mvprintw(y, c1 + 12, "%6.1f dB", lvl);
+        attroff(COLOR_PAIR(4) | A_BOLD);
+        
+        // RX/TX counts
+        mvaddstr(y, c1 + 28, "RX:");
+        attron(COLOR_PAIR(1));
+        printw(" %d", state_.rx_frame_count.load());
+        attroff(COLOR_PAIR(1));
+        addstr("  TX:");
+        attron(COLOR_PAIR(2));
+        printw(" %d", state_.tx_frame_count.load());
+        attroff(COLOR_PAIR(2));
     }
     
     void draw_utils(int y, int h, int cols) {
