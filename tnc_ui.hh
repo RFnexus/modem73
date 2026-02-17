@@ -1028,15 +1028,17 @@ private:
         if (event.bstate & BUTTON1_CLICKED || event.bstate & BUTTON1_PRESSED) {
             // Tab clicks 
             if (event.y == 2) {
-                int tab_width = (cols - 4) / 4;
+                int tab_width = (cols - 4) / 5;
                 if (event.x >= 2 && event.x < 2 + tab_width) {
                     current_tab_ = 0;
                 } else if (event.x >= 2 + tab_width && event.x < 2 + tab_width * 2) {
                     current_tab_ = 1;
                 } else if (event.x >= 2 + tab_width * 2 && event.x < 2 + tab_width * 3) {
                     current_tab_ = 2;
-                } else if (event.x >= 2 + tab_width * 3) {
+                } else if (event.x >= 2 + tab_width * 3 && event.x < 2 + tab_width * 4) {
                     current_tab_ = 3;
+                } else if (event.x >= 2 + tab_width * 4) {
+                    current_tab_ = 4;
                 }
             }
             
@@ -2268,6 +2270,14 @@ private:
         row++;
         
         dy = visible_y(row);
+        if (dy >= 0) {
+            attron(A_DIM);
+            mvaddstr(dy, c1, "Both sides must have frag enabled");
+            attroff(A_DIM);
+        }
+        row++;
+        
+        dy = visible_y(row);
         if (dy >= 0) draw_toggle_field(dy, c1, c2, "Enabled", FIELD_FRAGMENTATION, state_.fragmentation_enabled);
         row += 2;
         
@@ -3239,18 +3249,16 @@ private:
     }
     
     void draw_help(int rows, int cols) {
-        int help_w = 40;
-        int help_h = 7;
+        int help_w = 48;
+        int help_h = 19;
         int start_x = (cols - help_w) / 2;
         int start_y = (rows - help_h) / 2;
         
-
         attron(COLOR_PAIR(4));
         for (int y = start_y; y < start_y + help_h && y < rows; y++) {
             mvhline(y, start_x, ' ', help_w);
         }
         
-
         mvhline(start_y, start_x, ACS_HLINE, help_w);
         mvhline(start_y + help_h - 1, start_x, ACS_HLINE, help_w);
         mvvline(start_y, start_x, ACS_VLINE, help_h);
@@ -3260,15 +3268,53 @@ private:
         mvaddch(start_y + help_h - 1, start_x, ACS_LLCORNER);
         mvaddch(start_y + help_h - 1, start_x + help_w - 1, ACS_LRCORNER);
         
-
         attron(A_BOLD);
         mvaddstr(start_y, start_x + 3, " MODEM73 HELP ");
         attroff(A_BOLD);
         attroff(COLOR_PAIR(4));
         
-        mvaddstr(start_y + 2, start_x + (help_w - 11) / 2, "---");
+        int y = start_y + 2;
+        int lx = start_x + 2;
+        int rx = start_x + 22;
         
-
+        attron(A_BOLD);
+        mvaddstr(y, lx, "Navigation");
+        attroff(A_BOLD);
+        y++;
+        mvaddstr(y, lx, "Tab / Shift-Tab");
+        mvaddstr(y, rx, "Switch tabs");
+        y++;
+        mvaddstr(y, lx, "Up / Down");
+        mvaddstr(y, rx, "Navigate fields");
+        y++;
+        mvaddstr(y, lx, "Left / Right");
+        mvaddstr(y, rx, "Adjust values");
+        y++;
+        mvaddstr(y, lx, "Enter");
+        mvaddstr(y, rx, "Edit / activate");
+        y += 2;
+        
+        attron(A_BOLD);
+        mvaddstr(y, lx, "Config");
+        attroff(A_BOLD);
+        y++;
+        mvaddstr(y, lx, "s");
+        mvaddstr(y, rx, "Save preset");
+        y++;
+        mvaddstr(y, lx, "x");
+        mvaddstr(y, rx, "Delete preset");
+        y += 2;
+        
+        attron(A_BOLD);
+        mvaddstr(y, lx, "General");
+        attroff(A_BOLD);
+        y++;
+        mvaddstr(y, lx, "F1");
+        mvaddstr(y, rx, "Toggle this help");
+        y++;
+        mvaddstr(y, lx, "Q");
+        mvaddstr(y, rx, "Quit");
+        
         attron(A_DIM);
         mvaddstr(start_y + help_h - 2, start_x + (help_w - 24) / 2, "Press any key to close");
         attroff(A_DIM);
