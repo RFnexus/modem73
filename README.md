@@ -15,6 +15,12 @@ MODEM73 is a [KISS](https://en.wikipedia.org/wiki/KISS_(amateur_radio_protocol))
 ## Building
 
 
+### Windows?
+Windows fork by SP5LOT https://github.com/SP5LOT/modem73
+
+
+
+
 1. Install dependencies
 
 ```
