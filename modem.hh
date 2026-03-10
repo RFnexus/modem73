@@ -448,12 +448,23 @@ public:
     
     // Get average SNR from last successful decode
     value get_last_snr() const { return last_avg_snr_; }
-    
+
     // Get current modulation bits
     int get_mod_bits() const { return mod_bits; }
-    
+
+    // Get last per-frame BER
+    value get_last_ber() const { return last_ber_; }
+
+    // Get smoothed BER via EMA
+    value get_ber_ema() const { return ber_ema_; }
+
+    void reset_ber() {
+        last_ber_ = -1;
+        ber_ema_ = -1;
+    }
+
     // decode statistics
-    int stats_sync_count = 0;      // corelator   
+    int stats_sync_count = 0;      // corelator
     int stats_preamble_errors = 0; // preamble decoding failed
     int stats_symbol_errors = 0;   // seed damage
     int stats_crc_errors = 0;      // polar CRC failed
@@ -475,16 +486,23 @@ private:
     SchmidlCox<value, cmplx, search_pos, symbol_len, guard_len>* correlator_ptr = nullptr;
     CODE::HadamardDecoder<7> hadamard_decoder;
     CODE::PolarListDecoder<mesg_type, code_max> polar_decoder;
+    CODE::PolarEncoder<int8_t> ber_encoder;
+    int8_t ber_mesg[bits_max], ber_code[bits_max];
     DSP::Phasor<cmplx> osc;
     
     mesg_type mesg[bits_max];
     code_type code[bits_max], perm[bits_max];
     cmplx demod[tone_count], chan[tone_count], tone[tone_count];
+    cmplx saved_demod[symbols_max * tone_count];
+    int saved_seed_off[symbols_max];
+    int fwd_perm_table[bits_max];
     value index[tone_count], phase[tone_count];
     value snr[symbols_max];
     value cfo_rad;
     int symbol_pos;
-    value last_avg_snr_ = 0;  
+    value last_avg_snr_ = 0;
+    value last_ber_ = -1;
+    value ber_ema_ = -1;
     
     State state_ = State::SEARCHING;
     size_t sample_count_ = 0;
@@ -833,6 +851,30 @@ private:
         return true;
     }
     
+    void build_fwd_perm(int* table, int order) {
+        int len = 1 << order;
+        table[0] = 0;
+        if (order == 11) {
+            CODE::XorShiftMask<int, 11, 1, 3, 4, 1> seq;
+            for (int i = 1; i < len; ++i) table[i] = seq();
+        } else if (order == 12) {
+            CODE::XorShiftMask<int, 12, 1, 1, 4, 1> seq;
+            for (int i = 1; i < len; ++i) table[i] = seq();
+        } else if (order == 13) {
+            CODE::XorShiftMask<int, 13, 1, 1, 9, 1> seq;
+            for (int i = 1; i < len; ++i) table[i] = seq();
+        } else if (order == 14) {
+            CODE::XorShiftMask<int, 14, 1, 5, 10, 1> seq;
+            for (int i = 1; i < len; ++i) table[i] = seq();
+        } else if (order == 15) {
+            CODE::XorShiftMask<int, 15, 1, 1, 3, 1> seq;
+            for (int i = 1; i < len; ++i) table[i] = seq();
+        } else if (order == 16) {
+            CODE::XorShiftMask<int, 16, 1, 1, 14, 1> seq;
+            for (int i = 1; i < len; ++i) table[i] = seq();
+        }
+    }
+
     bool process_symbol(int j) {
         seed_off = (block_skew * j + first_seed) % block_length;
         auto clamp = [](int v) { return v < -127 ? -127 : v > 127 ? 127 : v; };
@@ -887,15 +929,18 @@ private:
                     demod[i] *= nrz(seq());
         }
         
+        // Save demod for post-decode corrected SNR
+        std::memcpy(&saved_demod[j * tone_count], demod, tone_count * sizeof(cmplx));
+        saved_seed_off[j] = seed_off;
+
         // Notify constellation callback with fully-corrected demodulated symbols
         if (constellation_callback) {
             constellation_callback(demod, tone_count, mod_bits);
         }
-        
-        // SNR estimation and soft demapping
+
+        // SNR estimation from data tones only excluding seed/pilot tones
         value sp = 0, np = 0;
         for (int i = 0, l = k_; i < tone_count; ++i) {
-            cmplx hard(1, 0);
             if (i % block_length != seed_off) {
                 int bits = mod_bits;
                 if (mod_bits == 3 && l % 32 == 30) bits = 2;
@@ -903,12 +948,12 @@ private:
                 if (mod_bits == 10 && l % 128 == 120) bits = 8;
                 if (mod_bits == 12 && l % 128 == 120) bits = 8;
                 demap_hard(perm + l, demod[i], bits);
-                hard = map_bits(perm + l, bits);
+                cmplx hard = map_bits(perm + l, bits);
+                cmplx error = demod[i] - hard;
+                sp += norm(hard);
+                np += norm(error);
                 l += bits;
             }
-            cmplx error = demod[i] - hard;
-            sp += norm(hard);
-            np += norm(error);
         }
         
         value precision = sp / np;
@@ -969,10 +1014,10 @@ private:
             return;
         }
         
-        // calculate average SNR from data symbols
+        // Fallback: average per-symbol SNR 
         value total_snr = 0;
         int snr_count = 0;
-        for (int i = 1; i < symbol_index_; ++i) {  // skip symbol 0
+        for (int i = 1; i < symbol_index_; ++i) {
             if (snr[i] > 0) {
                 total_snr += snr[i];
                 snr_count++;
@@ -981,7 +1026,7 @@ private:
         if (snr_count > 0) {
             last_avg_snr_ = 10 * std::log10(total_snr / snr_count);
         }
-        
+
         // Extract data
         for (int i = 0; i < data_bits; ++i)
             CODE::set_le_bit(data, i, mesg[i].v[best] < 0);
@@ -990,9 +1035,51 @@ private:
         CODE::Xorshift32 scrambler;
         for (int i = 0; i < data_bytes; ++i)
             data[i] ^= scrambler();
-        
-        std::cerr << "Decoder: Frame decoded " << data_bytes << " bytes, SNR=" << last_avg_snr_ << " dB" << std::endl;
-        
+
+        // BER: re-encode decoded message and compare against received hard decisions
+        int code_len = 1 << code_order;
+        for (int i = 0; i < data_bits + 32; ++i)
+            ber_mesg[i] = (mesg[i].v[best] < 0) ? -1 : 1;
+        ber_encoder(ber_code, ber_mesg, frozen_bits, code_order);
+        int bit_errors = 0;
+        for (int i = 0; i < code_len; ++i) {
+            if ((code[i] < 0) != (ber_code[i] < 0))
+                bit_errors++;
+        }
+        last_ber_ = value(bit_errors) / value(code_len);
+        if (ber_ema_ < 0)
+            ber_ema_ = last_ber_;
+        else
+            ber_ema_ = value(0.3) * last_ber_ + value(0.7) * ber_ema_;
+
+        // use known-correct codeword as referenc 
+        build_fwd_perm(fwd_perm_table, code_order);
+        value corr_sp = 0, corr_np = 0;
+        int bk = 0;
+        for (int sj = 1; sj <= symbol_count; ++sj) {
+            int soff = saved_seed_off[sj];
+            for (int i = 0; i < tone_count; ++i) {
+                if (i % block_length != soff) {
+                    int bits = mod_bits;
+                    if (mod_bits == 3 && bk % 32 == 30) bits = 2;
+                    if (mod_bits == 6 && bk % 64 == 60) bits = 4;
+                    if (mod_bits == 10 && bk % 128 == 120) bits = 8;
+                    if (mod_bits == 12 && bk % 128 == 120) bits = 8;
+                    code_type ideal_bits[mod_max];
+                    for (int b = 0; b < bits; ++b)
+                        ideal_bits[b] = ber_code[fwd_perm_table[bk + b]];
+                    cmplx ideal = map_bits(ideal_bits, bits);
+                    cmplx error = saved_demod[sj * tone_count + i] - ideal;
+                    corr_sp += norm(ideal);
+                    corr_np += norm(error);
+                    bk += bits;
+                }
+            }
+        }
+        if (corr_np > 0)
+            last_avg_snr_ = 10 * std::log10(corr_sp / corr_np);
+
+        std::cerr << "Decoder: Frame decoded " << data_bytes << " bytes, SNR=" << last_avg_snr_ << " dB, BER=" << (last_ber_ * 100) << "%" << std::endl;
 
         callback(data, data_bytes);
     }

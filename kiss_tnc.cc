@@ -698,16 +698,16 @@ private:
         int level_update_counter = 0;
         const int LEVEL_UPDATE_INTERVAL = 5;
         
-        auto deliver_to_clients = [this](const std::vector<uint8_t>& payload, float snr, bool was_reassembled) {
-            ui_log("RX: " + std::to_string(payload.size()) + " bytes, SNR=" + 
+        auto deliver_to_clients = [this](const std::vector<uint8_t>& payload, float snr, float ber_pct, bool was_reassembled) {
+            ui_log("RX: " + std::to_string(payload.size()) + " bytes, SNR=" +
                    std::to_string((int)snr) + "dB" + (was_reassembled ? " (reassembled)" : ""));
             if (g_verbose) {
                 std::cerr << packet_visualize(payload.data(), payload.size(), false, false) << std::endl;
             }
-            
+
 #ifdef WITH_UI
             if (g_ui_state) {
-                g_ui_state->add_packet(false, payload.size(), snr);
+                g_ui_state->add_packet(false, payload.size(), snr, ber_pct);
             }
 #endif
             
@@ -721,19 +721,24 @@ private:
         
         auto frame_callback = [this, &deliver_to_clients](const uint8_t* data, size_t len) {
             set_tx_lockout(RX_LOCKOUT_SECONDS);
-            
+
             float snr = decoder_->get_last_snr();
-            
+            float last_ber = decoder_->get_last_ber();
+            float ber_pct = (last_ber >= 0) ? last_ber * 100.0f : -1.0f;
+            float ber_ema = decoder_->get_ber_ema();
+
 #ifdef WITH_UI
             if (g_ui_state) {
                 g_ui_state->rx_frame_count++;
                 g_ui_state->receiving = false;
                 g_ui_state->last_rx_snr = snr;
+                if (ber_ema >= 0)
+                    g_ui_state->last_rx_ber = ber_ema;
             }
 #endif
-            
+
             auto payload = unframe_length(data, len);
-            
+
             if (payload.empty()) {
                 ui_log("RX: Empty payload after unframing");
 #ifdef WITH_UI
@@ -741,19 +746,19 @@ private:
 #endif
                 return;
             }
-            
+
             if (config_.fragmentation_enabled && reassembler_.is_fragment(payload)) {
                 if (g_verbose) {
                     std::cerr << packet_visualize(payload.data(), payload.size(), false, true) << std::endl;
                 }
-                
+
                 auto reassembled = reassembler_.process(payload);
                 if (!reassembled.empty()) {
                     ui_log("RX: Reassembled " + std::to_string(reassembled.size()) + " bytes from fragments");
-                    deliver_to_clients(reassembled, snr, true);
+                    deliver_to_clients(reassembled, snr, ber_pct, true);
                 }
             } else {
-                deliver_to_clients(payload, snr, false);
+                deliver_to_clients(payload, snr, ber_pct, false);
             }
         };
         
@@ -794,6 +799,8 @@ private:
                         decoder_->stats_preamble_errors = 0;
                         decoder_->stats_symbol_errors = 0;
                         decoder_->stats_crc_errors = 0;
+                        decoder_->reset_ber();
+                        g_ui_state->last_rx_ber = -1.0f;
                     }
                     g_ui_state->sync_count = decoder_->stats_sync_count;
                     g_ui_state->preamble_errors = decoder_->stats_preamble_errors;
