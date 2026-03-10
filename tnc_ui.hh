@@ -150,6 +150,7 @@ struct TNCUIState {
     std::atomic<int> rx_frame_count{0};
     std::atomic<int> tx_frame_count{0};
     std::atomic<int> rx_error_count{0};
+    std::atomic<float> last_rx_ber{-1.0f};
     
     // Decode statistics
     std::atomic<int> sync_count{0};
@@ -237,6 +238,7 @@ struct TNCUIState {
         bool is_tx;
         int size;
         float snr;
+        float ber;  // pre-FEC BER as percentage, -1 if unavailable
         std::chrono::steady_clock::time_point timestamp;
     };
     static constexpr int MAX_RECENT_PACKETS = 8;
@@ -382,10 +384,10 @@ struct TNCUIState {
         return result;
     }
     
-    void add_packet(bool is_tx, int size, float snr = 0.0f) {
+    void add_packet(bool is_tx, int size, float snr = 0.0f, float ber = -1.0f) {
         {
             std::lock_guard<std::mutex> lock(packets_mutex);
-            recent_packets.push_back({is_tx, size, snr, std::chrono::steady_clock::now()});
+            recent_packets.push_back({is_tx, size, snr, ber, std::chrono::steady_clock::now()});
             if (recent_packets.size() > MAX_RECENT_PACKETS) {
                 recent_packets.pop_front();
             }
@@ -1771,12 +1773,34 @@ private:
         attroff(COLOR_PAIR(3) | A_BOLD);
         y++;
         
-        // SNR history 
+        // SNR history
         mvaddstr(y, c1, "SNR Hist");
         move(y, c2);
         draw_snr_chart(20);
         y += 2;
-        
+
+        mvaddstr(y, c1, "BER");
+        {
+            float ber_pct = state_.last_rx_ber.load() * 100.0f;
+            if (ber_pct < 0) {
+                attron(A_DIM);
+                mvaddstr(y, c2, "  ---");
+                attroff(A_DIM);
+            } else if (ber_pct < 1.0f) {
+                attron(COLOR_PAIR(1) | A_BOLD);
+                mvprintw(y, c2, "%5.2f%%", ber_pct);
+                attroff(COLOR_PAIR(1) | A_BOLD);
+            } else if (ber_pct < 5.0f) {
+                attron(COLOR_PAIR(3) | A_BOLD);
+                mvprintw(y, c2, "%5.2f%%", ber_pct);
+                attroff(COLOR_PAIR(3) | A_BOLD);
+            } else {
+                attron(COLOR_PAIR(2) | A_BOLD);
+                mvprintw(y, c2, "%5.2f%%", ber_pct);
+                attroff(COLOR_PAIR(2) | A_BOLD);
+            }
+        }
+        y++;
 
         attron(A_DIM);
         mvaddstr(y, c1, "CSMA");
@@ -1948,6 +1972,21 @@ private:
                 attron(COLOR_PAIR(4) | A_BOLD);
                 printw(" %.0fdB", pkt.snr);
                 attroff(COLOR_PAIR(4) | A_BOLD);
+            }
+            // BER
+            if (!pkt.is_tx && pkt.ber >= 0) {
+                float ber_pct = pkt.ber;
+                if (ber_pct < 1.0f) {
+                    attron(COLOR_PAIR(1));
+                } else if (ber_pct < 5.0f) {
+                    attron(COLOR_PAIR(3));
+                } else {
+                    attron(COLOR_PAIR(2));
+                }
+                printw(" %.1f%%", ber_pct);
+                attroff(COLOR_PAIR(1));
+                attroff(COLOR_PAIR(2));
+                attroff(COLOR_PAIR(3));
             }
         }
     }
