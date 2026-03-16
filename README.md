@@ -27,7 +27,7 @@ Windows fork by SP5LOT https://github.com/SP5LOT/modem73
 # Debian/Ubuntu/Pi
 sudo apt install git build-essential libncurses-dev g++
 ```
-Or run:
+Or if on a system with `apt` run:
 ```
 ./install.sh
 ```
