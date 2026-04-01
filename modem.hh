@@ -445,6 +445,7 @@ public:
         samples_needed_ = 0;
         k_ = 0;
     }
+
     
     // Get average SNR from last successful decode
     value get_last_snr() const { return last_avg_snr_; }
@@ -664,6 +665,7 @@ private:
                     samples_needed_ = symbol_pos + symbol_len + 2 * extended_len;
                 } else {
                     ++stats_preamble_errors;
+                    reset();
                 }
             }
             break;
@@ -678,7 +680,7 @@ private:
                 if (!process_symbol(symbol_index_)) {
                     // Error, go back to searching
                     ++stats_symbol_errors;
-                    state_ = State::SEARCHING;
+                    reset();
                     break;
                 }
                 
@@ -687,7 +689,7 @@ private:
                 if (symbol_index_ > symbol_count) {
                     // All symbols collected
                     decode_frame(callback);
-                    state_ = State::SEARCHING;
+                    reset();
                 } else {
                     samples_needed_ = extended_len;
                 }

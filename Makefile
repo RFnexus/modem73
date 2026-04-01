@@ -13,8 +13,8 @@ INCLUDES = -I$(AICODIX_DSP) -I$(AICODIX_CODE) -I$(MODEM_SRC)
 TARGET = modem73
 
 SRCS = kiss_tnc.cc
-HDRS = kiss_tnc.hh miniaudio_audio.hh rigctl_ptt.hh modem.hh tnc_ui.hh
-OBJS = miniaudio.o
+HDRS = kiss_tnc.hh miniaudio_audio.hh rigctl_ptt.hh modem.hh tnc_ui.hh control_port.hh
+OBJS = miniaudio.o cJSON.o
 
 # defualt to build with UI, headless operations through --headless
 UI_FLAGS = -DWITH_UI
@@ -40,6 +40,9 @@ all: $(TARGET)
 miniaudio.o: miniaudio.c miniaudio.h
 	$(CC) -c -O2 -o $@ miniaudio.c
 
+cJSON.o: cJSON.c cJSON.h
+	$(CC) -c -O2 -o $@ cJSON.c
+
 $(TARGET): $(SRCS) $(HDRS) $(OBJS)
 	$(CXX) $(CXXFLAGS) $(UI_FLAGS) $(CM108_FLAGS) $(INCLUDES) -o $@ $(SRCS) $(OBJS) $(LDFLAGS)
 ifneq ($(HIDAPI_LIBS),)
@@ -50,7 +53,7 @@ ifneq ($(HIDAPI_LIBS),)
 endif
 
 clean:
-	rm -f $(TARGET) $(OBJS)
+	rm -f $(TARGET) $(OBJS) cJSON.o
 
 install: $(TARGET)
 	install -m 755 $(TARGET) /usr/local/bin/

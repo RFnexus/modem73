@@ -34,6 +34,7 @@
 #include "cm108_ptt.hh"
 #endif
 #include "modem.hh"
+#include "control_port.hh"
 
 #ifdef WITH_UI
 #include "tnc_ui.hh"
@@ -386,7 +387,7 @@ private:
                     if (g_verbose) {
                         std::cerr << packet_visualize(frag.data(), frag.size(), true, true) << std::endl;
                     }
-                    tx_queue_.push(std::move(frag));
+                    tx_queue_.push(TxPacket(std::move(frag)));
                 }
 #ifdef WITH_UI
                 if (g_ui_state) {
@@ -396,14 +397,14 @@ private:
             } else {
                 std::vector<uint8_t> frame_data = data;
                 if (frame_data.size() > max_payload) {
-                    std::cerr << "Warning: Frame too large (" << frame_data.size() 
+                    std::cerr << "Warning: Frame too large (" << frame_data.size()
                               << " > " << max_payload << "), truncating" << std::endl;
                     frame_data.resize(max_payload);
                 }
                 if (g_verbose) {
                     std::cerr << packet_visualize(frame_data.data(), frame_data.size(), true, config_.fragmentation_enabled) << std::endl;
                 }
-                tx_queue_.push(frame_data);
+                tx_queue_.push(TxPacket(frame_data));
 #ifdef WITH_UI
                 if (g_ui_state) {
                     g_ui_state->tx_queue_size = tx_queue_.size();
@@ -462,8 +463,8 @@ private:
         std::mt19937 gen(rd());
         
         while (tx_running_ && g_running) {
-            std::vector<uint8_t> frame;
-            if (tx_queue_.pop(frame)) {
+            TxPacket pkt;
+            if (tx_queue_.pop(pkt)) {
 #ifdef WITH_UI
                 if (g_ui_state) {
                     g_ui_state->tx_queue_size = tx_queue_.size();
@@ -522,40 +523,46 @@ private:
                     }
                 }
                 
-                transmit(frame);
+                transmit(pkt.data, pkt.oper_mode);
             } else {
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
         }
     }
     
-    void transmit(const std::vector<uint8_t>& data) {
-        ui_log("TX: " + std::to_string(data.size()) + " bytes");
+    void transmit(const std::vector<uint8_t>& data, int oper_mode_override = -1) {
+        int tx_mode = (oper_mode_override >= 0) ? oper_mode_override : modem_config_.oper_mode;
+
+        if (oper_mode_override >= 0) {
+            ui_log("TX: " + std::to_string(data.size()) + " bytes (mode override)");
+        } else {
+            ui_log("TX: " + std::to_string(data.size()) + " bytes");
+        }
         if (g_verbose) {
             std::cerr << packet_visualize(data.data(), data.size(), true, config_.fragmentation_enabled) << std::endl;
         }
-        
+
         if (config_.tx_blanking_enabled) {
             tx_blanking_active_ = true;
         }
-        
+
 #ifdef WITH_UI
         if (g_ui_state) {
             g_ui_state->transmitting = true;
             g_ui_state->tx_frame_count++;
-            g_ui_state->add_packet(true, data.size(), 0);  
+            g_ui_state->add_packet(true, data.size(), 0);
         }
 #endif
-        
+
         // Add length prefix framing
         auto framed_data = frame_with_length(data);
-        
+
         // Encode to audio
         auto samples = encoder_->encode(
             framed_data.data(), framed_data.size(),
             modem_config_.center_freq,
             modem_config_.call_sign,
-            modem_config_.oper_mode
+            tx_mode
         );
         
         if (samples.empty()) {
@@ -661,7 +668,7 @@ private:
         }
         
         tx_blanking_active_ = false;
-        
+
 #ifdef WITH_UI
         if (g_ui_state) {
             g_ui_state->transmitting = false;
@@ -885,9 +892,9 @@ private:
     
     int server_fd_ = -1;
     std::list<std::unique_ptr<ClientConnection>> clients_;
-    std::mutex clients_mutex_;
+    mutable std::mutex clients_mutex_;
     
-    PacketQueue<std::vector<uint8_t>> tx_queue_;
+    PacketQueue<TxPacket> tx_queue_;
     std::atomic<bool> tx_running_{false};
     std::atomic<bool> rx_running_{false};
     
@@ -895,7 +902,7 @@ private:
     Reassembler reassembler_;
     
     // TX lockout - prevents TX while receiving
-    std::mutex lockout_mutex_;
+    mutable std::mutex lockout_mutex_;
     std::chrono::steady_clock::time_point tx_lockout_until_;
     static constexpr float RX_LOCKOUT_SECONDS = 0.5f;
     
@@ -955,7 +962,43 @@ public:
     }
     
     TNCConfig& get_config() { return config_; }
-    
+
+    int get_payload_size() const { return payload_size_; }
+
+    struct DecoderStats {
+        int sync_count, preamble_errors, symbol_errors, crc_errors;
+        float last_snr, last_ber, ber_ema;
+    };
+
+    DecoderStats get_decoder_stats() const {
+        return {
+            decoder_->stats_sync_count,
+            decoder_->stats_preamble_errors,
+            decoder_->stats_symbol_errors,
+            decoder_->stats_crc_errors,
+            decoder_->get_last_snr(),
+            decoder_->get_last_ber(),
+            decoder_->get_ber_ema()
+        };
+    }
+
+    bool is_transmitting() const { return tx_blanking_active_.load(); }
+
+    bool is_receiving() const {
+        std::lock_guard<std::mutex> lock(lockout_mutex_);
+        return std::chrono::steady_clock::now() < tx_lockout_until_;
+    }
+
+    int get_client_count() const {
+        std::lock_guard<std::mutex> lock(clients_mutex_);
+        return clients_.size();
+    }
+
+    std::string rigctl_command(const std::string& cmd) {
+        if (rigctl_) return rigctl_->send_command(cmd);
+        return "ERR: rigctl not enabled";
+    }
+
     bool is_rigctl_connected() const {
         if (rigctl_) return rigctl_->is_connected();
         return false;
@@ -974,17 +1017,27 @@ public:
     }
     
     void queue_data(const std::vector<uint8_t>& data) {
-        size_t max_payload = payload_size_ - 2;
-        
-        if (config_.fragmentation_enabled && fragmenter_.needs_fragmentation(data.size(), max_payload)) {
-            auto fragments = fragmenter_.fragment(data, max_payload);
-            ui_log("TX: Fragmenting " + std::to_string(data.size()) + " bytes into " + 
+        queue_data_ex(data, -1);
+    }
+
+    // Queue data with an optional per-packet oper_mode override (-1 = default)
+    void queue_data_ex(const std::vector<uint8_t>& data, int oper_mode) {
+        size_t effective_payload;
+        if (oper_mode >= 0) {
+            effective_payload = encoder_->get_payload_size(oper_mode) - 2;
+        } else {
+            effective_payload = payload_size_ - 2;
+        }
+
+        if (config_.fragmentation_enabled && fragmenter_.needs_fragmentation(data.size(), effective_payload)) {
+            auto fragments = fragmenter_.fragment(data, effective_payload);
+            ui_log("TX: Fragmenting " + std::to_string(data.size()) + " bytes into " +
                    std::to_string(fragments.size()) + " fragments");
             for (auto& frag : fragments) {
-                tx_queue_.push(std::move(frag));
+                tx_queue_.push(TxPacket(std::move(frag), oper_mode));
             }
         } else {
-            tx_queue_.push(data);
+            tx_queue_.push(TxPacket(data, oper_mode));
         }
 #ifdef WITH_UI
         if (g_ui_state) {
@@ -992,13 +1045,23 @@ public:
         }
 #endif
     }
+
+    // Compute oper_mode for a given short_frame setting using current modulation/code_rate
+    int compute_oper_mode(bool short_frame) const {
+        return ModemConfig::encode_mode(
+            config_.modulation.c_str(),
+            config_.code_rate.c_str(),
+            short_frame
+        );
+    }
 };
 
 void print_help(const char* prog) {
     std::cerr << "MODEM73\n\n"
               << "Usage: " << prog << " [options]\n\n"
               << "Options:\n"
-              << "  -p, --port PORT         TCP port (default: 8001)\n"
+              << "  -p, --port PORT         KISS TCP port (default: 8001)\n"
+              << "  --control-port PORT     Control port (default: 8073, 0 to disable)\n"
               << "  -d, --device DEV        Audio device for both I/O\n"
               << "  --input-device DEV      Audio input  device\n"
               << "  --output-device DEV     Audio output device\n"
@@ -1048,7 +1111,13 @@ void print_help(const char* prog) {
 
 int main(int argc, char** argv) {
     TNCConfig config;
-    
+
+    // Track which settings were explicitly set on CLI
+    bool cli_port = false;
+    bool cli_control_port = false;
+    bool cli_callsign = false;
+    bool cli_ptt = false;
+
     // Parse arguments
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -1076,6 +1145,10 @@ int main(int argc, char** argv) {
 #endif
         } else if ((arg == "-p" || arg == "--port") && i + 1 < argc) {
             config.port = std::atoi(argv[++i]);
+            cli_port = true;
+        } else if (arg == "--control-port" && i + 1 < argc) {
+            config.control_port = std::atoi(argv[++i]);
+            cli_control_port = true;
         } else if ((arg == "-d" || arg == "--device") && i + 1 < argc) {
             // Set both input and output to same device
             config.audio_input_device = argv[++i];
@@ -1086,6 +1159,7 @@ int main(int argc, char** argv) {
             config.audio_output_device = argv[++i];
         } else if ((arg == "-c" || arg == "--callsign") && i + 1 < argc) {
             config.callsign = argv[++i];
+            cli_callsign = true;
         } else if ((arg == "-m" || arg == "--modulation") && i + 1 < argc) {
             config.modulation = argv[++i];
         } else if ((arg == "-r" || arg == "--rate") && i + 1 < argc) {
@@ -1118,6 +1192,7 @@ int main(int argc, char** argv) {
                 return 1;
             }
         } else if (arg == "--ptt" && i + 1 < argc) {
+            cli_ptt = true;
             std::string ptt_type = argv[++i];
             if (ptt_type == "none") config.ptt_type = PTTType::NONE;
             else if (ptt_type == "rigctl") config.ptt_type = PTTType::RIGCTL;
@@ -1213,8 +1288,9 @@ int main(int argc, char** argv) {
             
             // Try to load saved settings
             if (ui_state.load_settings()) {
-                // Apply loaded settings to config
-                config.callsign = ui_state.callsign;
+                // Apply loaded settings to config 
+                if (!cli_callsign)
+                    config.callsign = ui_state.callsign;
                 config.center_freq = ui_state.center_freq;
                 config.modulation = MODULATION_OPTIONS[ui_state.modulation_index];
                 config.code_rate = CODE_RATE_OPTIONS[ui_state.code_rate_index];
@@ -1229,7 +1305,8 @@ int main(int argc, char** argv) {
                 config.audio_input_device = ui_state.audio_input_device;
                 config.audio_output_device = ui_state.audio_output_device;
                 // PTT settings
-                config.ptt_type = static_cast<PTTType>(ui_state.ptt_type_index);
+                if (!cli_ptt)
+                    config.ptt_type = static_cast<PTTType>(ui_state.ptt_type_index);
                 config.vox_tone_freq = ui_state.vox_tone_freq;
                 config.vox_lead_ms = ui_state.vox_lead_ms;
                 config.vox_tail_ms = ui_state.vox_tail_ms;
@@ -1241,9 +1318,10 @@ int main(int argc, char** argv) {
                 config.com_invert_rts = ui_state.com_invert_rts;
 
 
-                // Network settings
-                config.port = ui_state.port;
-                
+                // Network settings 
+                if (!cli_port)
+                    config.port = ui_state.port;
+
                 // Find audio device indices
                 for (size_t i = 0; i < ui_state.available_input_devices.size(); i++) {
                     if (ui_state.available_input_devices[i] == ui_state.audio_input_device) {
@@ -1368,12 +1446,168 @@ int main(int argc, char** argv) {
         }
     }
     
+    while (config.control_port > 0 && !check_port_available(config.bind_address, config.control_port)) {
+        std::cerr << "Error: Control port " << config.control_port << " is already in use" << std::endl;
+
+        if (!g_use_ui) {
+            std::cerr << "Use --control-port to specify a different port." << std::endl;
+            return 1;
+        }
+
+        std::cerr << "\nEnter a different control port (or 'q' to quit, 0 to disable): ";
+        std::string input;
+        if (!std::getline(std::cin, input) || input.empty() || input == "q" || input == "Q") {
+            std::cerr << "Exiting." << std::endl;
+            return 1;
+        }
+
+        try {
+            int new_port = std::stoi(input);
+            if (new_port < 0 || new_port > 65535) {
+                std::cerr << "Invalid port number. Must be 0-65535." << std::endl;
+                continue;
+            }
+            config.control_port = new_port;
+            if (new_port == 0)
+                std::cerr << "Control port disabled." << std::endl;
+            else
+                std::cerr << "Trying control port " << config.control_port << "..." << std::endl;
+        } catch (const std::exception&) {
+            std::cerr << "Invalid input. Please enter a number." << std::endl;
+        }
+    }
+
     try {
         KISSTNC tnc(config);
-        
+
+        // Set up control port
+        std::unique_ptr<ControlPort> ctrl;
+        if (config.control_port > 0) {
+            ControlPort::TNCInterface ctrl_iface;
+
+            ctrl_iface.get_status = [&tnc]() -> cJSON* {
+                cJSON* j = cJSON_CreateObject();
+                auto stats = tnc.get_decoder_stats();
+
+                // Channel state
+                const char* state = "idle";
+                if (tnc.is_transmitting()) state = "tx";
+                else if (tnc.is_receiving()) state = "rx";
+                cJSON_AddStringToObject(j, "channel_state", state);
+
+                cJSON_AddBoolToObject(j, "ptt_on", tnc.is_transmitting());
+                cJSON_AddNumberToObject(j, "rx_frame_count", stats.sync_count - stats.preamble_errors - stats.crc_errors);
+                cJSON_AddNumberToObject(j, "tx_frame_count", 0); // TODO: add tx counter to KISSTNC
+                cJSON_AddNumberToObject(j, "rx_error_count", stats.preamble_errors + stats.crc_errors);
+                cJSON_AddNumberToObject(j, "sync_count", stats.sync_count);
+                cJSON_AddNumberToObject(j, "preamble_errors", stats.preamble_errors);
+                cJSON_AddNumberToObject(j, "symbol_errors", stats.symbol_errors);
+                cJSON_AddNumberToObject(j, "crc_errors", stats.crc_errors);
+                cJSON_AddNumberToObject(j, "last_snr", stats.last_snr);
+                cJSON_AddNumberToObject(j, "last_ber", stats.last_ber);
+                cJSON_AddNumberToObject(j, "ber_ema", stats.ber_ema);
+                cJSON_AddNumberToObject(j, "client_count", tnc.get_client_count());
+                cJSON_AddBoolToObject(j, "rigctl_connected", tnc.is_rigctl_connected());
+                cJSON_AddBoolToObject(j, "audio_connected", tnc.is_audio_healthy());
+
+                return j;
+            };
+
+            ctrl_iface.get_config = [&tnc]() -> cJSON* {
+                cJSON* j = cJSON_CreateObject();
+                auto& cfg = tnc.get_config();
+
+                cJSON_AddStringToObject(j, "callsign", cfg.callsign.c_str());
+                cJSON_AddStringToObject(j, "modulation", cfg.modulation.c_str());
+                cJSON_AddStringToObject(j, "code_rate", cfg.code_rate.c_str());
+                cJSON_AddBoolToObject(j, "short_frame", cfg.short_frame);
+                cJSON_AddNumberToObject(j, "center_freq", cfg.center_freq);
+                cJSON_AddNumberToObject(j, "payload_size", tnc.get_payload_size());
+                cJSON_AddBoolToObject(j, "csma_enabled", cfg.csma_enabled);
+                cJSON_AddNumberToObject(j, "carrier_threshold_db", cfg.carrier_threshold_db);
+                cJSON_AddNumberToObject(j, "p_persistence", cfg.p_persistence);
+                cJSON_AddNumberToObject(j, "slot_time_ms", cfg.slot_time_ms);
+                cJSON_AddBoolToObject(j, "tx_blanking_enabled", cfg.tx_blanking_enabled);
+
+                return j;
+            };
+
+            ctrl_iface.set_config = [&tnc](cJSON* params) -> bool {
+                TNCConfig new_config = tnc.get_config();
+
+                cJSON* item;
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "callsign")) && cJSON_IsString(item))
+                    new_config.callsign = item->valuestring;
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "modulation")) && cJSON_IsString(item))
+                    new_config.modulation = item->valuestring;
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "code_rate")) && cJSON_IsString(item))
+                    new_config.code_rate = item->valuestring;
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "short_frame")) && cJSON_IsBool(item))
+                    new_config.short_frame = cJSON_IsTrue(item);
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "center_freq")) && cJSON_IsNumber(item))
+                    new_config.center_freq = item->valueint;
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "csma_enabled")) && cJSON_IsBool(item))
+                    new_config.csma_enabled = cJSON_IsTrue(item);
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "carrier_threshold_db")) && cJSON_IsNumber(item))
+                    new_config.carrier_threshold_db = (float)item->valuedouble;
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "p_persistence")) && cJSON_IsNumber(item))
+                    new_config.p_persistence = item->valueint;
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "slot_time_ms")) && cJSON_IsNumber(item))
+                    new_config.slot_time_ms = item->valueint;
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "tx_blanking_enabled")) && cJSON_IsBool(item))
+                    new_config.tx_blanking_enabled = cJSON_IsTrue(item);
+
+                tnc.update_config(new_config);
+
+#ifdef WITH_UI
+                // Sync config back to TUI state so the UI reflects changes
+                if (g_ui_state) {
+                    g_ui_state->callsign = new_config.callsign;
+                    g_ui_state->center_freq = new_config.center_freq;
+                    g_ui_state->short_frame = new_config.short_frame;
+                    g_ui_state->csma_enabled = new_config.csma_enabled;
+                    g_ui_state->carrier_threshold_db = new_config.carrier_threshold_db;
+                    g_ui_state->p_persistence = new_config.p_persistence;
+                    g_ui_state->slot_time_ms = new_config.slot_time_ms;
+                    g_ui_state->tx_blanking_enabled = new_config.tx_blanking_enabled;
+
+                    // Map modulation string back to index
+                    for (size_t i = 0; i < MODULATION_OPTIONS.size(); i++) {
+                        if (MODULATION_OPTIONS[i] == new_config.modulation) {
+                            g_ui_state->modulation_index = i;
+                            break;
+                        }
+                    }
+                    // Map code rate string back to index
+                    for (size_t i = 0; i < CODE_RATE_OPTIONS.size(); i++) {
+                        if (CODE_RATE_OPTIONS[i] == new_config.code_rate) {
+                            g_ui_state->code_rate_index = i;
+                            break;
+                        }
+                    }
+
+                    g_ui_state->update_modem_info();
+                }
+#endif
+                return true;
+            };
+
+            ctrl_iface.rigctl_command = [&tnc](const std::string& cmd) -> std::string {
+                return tnc.rigctl_command(cmd);
+            };
+
+            ctrl_iface.tx_data = [&tnc](const std::vector<uint8_t>& data, int oper_mode) -> bool {
+                tnc.queue_data_ex(data, oper_mode);
+                return true;
+            };
+
+            ctrl = std::make_unique<ControlPort>(config.control_port, config.bind_address, ctrl_iface);
+            ctrl->start();
+        }
+
 #ifdef WITH_UI
         if (g_use_ui) {
-            ui_state.on_settings_changed = [&tnc](TNCUIState& state) {
+            ui_state.on_settings_changed = [&tnc, &ctrl](TNCUIState& state) {
                 TNCConfig new_config = tnc.get_config();
                 new_config.callsign = state.callsign;
                 new_config.center_freq = state.center_freq;
@@ -1393,13 +1627,14 @@ int main(int argc, char** argv) {
                 new_config.vox_tone_freq = state.vox_tone_freq;
                 new_config.vox_lead_ms = state.vox_lead_ms;
                 new_config.vox_tail_ms = state.vox_tail_ms;
-                // COM PTT settings 
+                // COM PTT settings
                 new_config.com_port = state.com_port;
                 new_config.com_ptt_line = state.com_ptt_line;
                 new_config.com_invert_dtr = state.com_invert_dtr;
                 new_config.com_invert_rts = state.com_invert_rts;
-                
+
                 tnc.update_config(new_config);
+                if (ctrl) ctrl->notify_config_changed();
             };
             
             // Set up send data callback for UTILS tab
@@ -1434,13 +1669,14 @@ int main(int argc, char** argv) {
             status_thread.join();
             tnc_thread.join();
 
-  
+
         } else {
             tnc.run();
         }
 #else
         tnc.run();
 #endif
+        if (ctrl) ctrl->stop();
     } catch (const std::exception& e) {
         std::cerr << "error " << e.what() << std::endl;
         return 1;

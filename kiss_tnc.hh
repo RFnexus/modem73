@@ -104,6 +104,9 @@ struct TNCConfig {
     // TX blanking
     bool tx_blanking_enabled = false;
     
+    // Control port
+    int control_port = 8073;
+
     // Settings file path
     std::string config_file = "";
 };
@@ -377,6 +380,14 @@ inline std::vector<uint8_t> unframe_length(const uint8_t* data, size_t total_len
     }
     return std::vector<uint8_t>(data + 2, data + 2 + payload_len);
 }
+
+// TX packet with optional per-packet mode override
+struct TxPacket {
+    std::vector<uint8_t> data;
+    int oper_mode;  // -1 = use default mode
+    TxPacket() : oper_mode(-1) {}
+    TxPacket(std::vector<uint8_t> d, int mode = -1) : data(std::move(d)), oper_mode(mode) {}
+};
 
 namespace Frag {
     constexpr uint8_t MAGIC = 0xF3;

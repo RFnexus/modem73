@@ -342,22 +342,15 @@ public:
         
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
-    
+
+
+
+
     float measure_level(int duration_ms = 100) {
+        (void)duration_ms;
         if (!capture_open_) return -100.0f;
-        
-        int frames = (sample_rate_ * duration_ms) / 1000;
-        std::vector<float> buffer(frames);
-        
-        int total_read = read(buffer.data(), frames);
-        if (total_read <= 0) return -100.0f;
-        
-        float sum_sq = 0.0f;
-        for (int i = 0; i < total_read; i++) {
-            sum_sq += buffer[i] * buffer[i];
-        }
-        float rms = std::sqrt(sum_sq / total_read);
-        
+        float rms = std::sqrt(capture_level_sum_.load() /
+                              std::max(1.0f, (float)capture_level_count_.load()));
         if (rms < 1e-10f) return -100.0f;
         return 20.0f * std::log10(rms);
     }
@@ -411,11 +404,17 @@ private:
         
         ma_uint32 to_write = std::min((ma_uint32)available, frame_count);
         
+        float sum_sq = 0.0f;
         for (ma_uint32 i = 0; i < to_write; i++) {
             self->capture_buffer_[(write_pos + i) % RING_BUFFER_SIZE] = in[i];
+            sum_sq += in[i] * in[i];
         }
-        
+
         self->capture_write_pos_ = (write_pos + to_write) % RING_BUFFER_SIZE;
+
+        // Update running level for CSMA exponential moving average
+        self->capture_level_sum_ = sum_sq;
+        self->capture_level_count_ = to_write;
     }
     
     std::string capture_device_id_;
@@ -441,4 +440,8 @@ private:
     
     int consecutive_read_failures_ = 0;
     int consecutive_write_failures_ = 0;
+
+    // Running signal level for CSMA
+    std::atomic<float> capture_level_sum_{0.0f};
+    std::atomic<int> capture_level_count_{1};
 };
