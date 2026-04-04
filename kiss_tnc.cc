@@ -34,6 +34,7 @@
 #include "cm108_ptt.hh"
 #endif
 #include "modem.hh"
+#include "phy/mfsk_modem.hh"
 #include "control_port.hh"
 
 #ifdef WITH_UI
@@ -132,13 +133,19 @@ public:
 class KISSTNC {
 public:
     KISSTNC(const TNCConfig& config) : config_(config) {
-        // Allocate encoder/decoder on heap 
-        std::cerr << "  Creating encoder" << std::endl;
+        // Allocate OFDM encoder/decoder
+        std::cerr << "  Creating OFDM encoder/decoder" << std::endl;
         encoder_ = std::make_unique<Encoder48k>();
-        std::cerr << "  Creating decoder" << std::endl;
         decoder_ = std::make_unique<Decoder48k>();
-        std::cerr << "  Encoder/decoder created" << std::endl;
-        
+
+        // Allocate MFSK encoder/decoder
+        std::cerr << "  Creating MFSK encoder/decoder" << std::endl;
+        mfsk_encoder_ = std::make_unique<MFSKEncoder>();
+        mfsk_decoder_ = std::make_unique<MFSKDecoder>(
+            (MFSKMode)config.mfsk_mode, config.center_freq);
+
+        std::cerr << "  All encoders/decoders created" << std::endl;
+
         // Set up constellation callback for UI display
 #ifdef WITH_UI
         decoder_->constellation_callback = [this](const DSP::Complex<float>* symbols, int count, int mod_bits) {
@@ -153,7 +160,7 @@ public:
             }
         };
 #endif
-        
+
         // Init modem configuration
         modem_config_.sample_rate = config.sample_rate;
         modem_config_.center_freq = config.center_freq;
@@ -163,15 +170,19 @@ public:
             config.code_rate.c_str(),
             config.short_frame
         );
-        
+
         if (modem_config_.call_sign < 0) {
             throw std::runtime_error("Invalid callsign");
         }
         if (modem_config_.oper_mode < 0) {
             throw std::runtime_error("Invalid modulation or code rate");
         }
-        
-        payload_size_ = encoder_->get_payload_size(modem_config_.oper_mode);
+
+        if (config.modem_type == 1) {
+            payload_size_ = mfsk_encoder_->get_payload_size((MFSKMode)config.mfsk_mode);
+        } else {
+            payload_size_ = encoder_->get_payload_size(modem_config_.oper_mode);
+        }
         std::cerr << "Payload size: " << payload_size_ << " bytes" << std::endl;
     }
     
@@ -558,12 +569,21 @@ private:
         auto framed_data = frame_with_length(data);
 
         // Encode to audio
-        auto samples = encoder_->encode(
-            framed_data.data(), framed_data.size(),
-            modem_config_.center_freq,
-            modem_config_.call_sign,
-            tx_mode
-        );
+        std::vector<float> samples;
+        if (config_.modem_type == 1) {
+            samples = mfsk_encoder_->encode(
+                framed_data.data(), framed_data.size(),
+                modem_config_.center_freq,
+                (MFSKMode)config_.mfsk_mode
+            );
+        } else {
+            samples = encoder_->encode(
+                framed_data.data(), framed_data.size(),
+                modem_config_.center_freq,
+                modem_config_.call_sign,
+                tx_mode
+            );
+        }
         
         if (samples.empty()) {
             ui_log("TX: Encoding failed");
@@ -726,6 +746,7 @@ private:
             }
         };
         
+        // OFDM frame callback
         auto frame_callback = [this, &deliver_to_clients](const uint8_t* data, size_t len) {
             set_tx_lockout(RX_LOCKOUT_SECONDS);
 
@@ -754,7 +775,7 @@ private:
                 return;
             }
 
-            if (config_.fragmentation_enabled && reassembler_.is_fragment(payload)) {
+            if (reassembler_.is_fragment(payload)) {
                 if (g_verbose) {
                     std::cerr << packet_visualize(payload.data(), payload.size(), false, true) << std::endl;
                 }
@@ -768,28 +789,67 @@ private:
                 deliver_to_clients(payload, snr, ber_pct, false);
             }
         };
-        
+
+        // MFSK frame callback
+        auto mfsk_frame_callback = [this, &deliver_to_clients](const uint8_t* data, size_t len) {
+            set_tx_lockout(RX_LOCKOUT_SECONDS);
+
+            float snr = mfsk_decoder_->get_last_snr();
+            float ber_pct = -1.0f;
+
+#ifdef WITH_UI
+            if (g_ui_state) {
+                g_ui_state->rx_frame_count++;
+                g_ui_state->receiving = false;
+                g_ui_state->last_rx_snr = snr;
+            }
+#endif
+
+            auto payload = unframe_length(data, len);
+
+            if (payload.empty()) {
+                ui_log("MFSK RX: Empty payload after unframing");
+#ifdef WITH_UI
+                if (g_ui_state) g_ui_state->rx_error_count++;
+#endif
+                return;
+            }
+
+            if (reassembler_.is_fragment(payload)) {
+                auto reassembled = reassembler_.process(payload);
+                if (!reassembled.empty()) {
+                    ui_log("MFSK RX: Reassembled " + std::to_string(reassembled.size()) + " bytes");
+                    deliver_to_clients(reassembled, snr, ber_pct, true);
+                }
+            } else {
+                deliver_to_clients(payload, snr, ber_pct, false);
+            }
+        };
+
         bool was_blanking = false;
-        
+
         while (rx_running_ && g_running) {
             int n = audio_->read(buffer.data(), buffer.size());
             if (n > 0) {
                 bool blanking = tx_blanking_active_.load();
-                
+
                 if (blanking) {
                     was_blanking = true;
                 } else {
                     if (was_blanking) {
                         decoder_->reset();
+                        mfsk_decoder_->reset();
                         was_blanking = false;
                     }
+                    // Feed same audio to both decod,ers
                     decoder_->process(buffer.data(), n, frame_callback);
+                    mfsk_decoder_->process(buffer.data(), n, mfsk_frame_callback);
                 }
-                
+
 #ifdef WITH_UI
                 if (g_ui_state && ++level_update_counter >= LEVEL_UPDATE_INTERVAL) {
                     level_update_counter = 0;
-                    
+
                     // Calculate RMS level in dB
                     float sum_sq = 0.0f;
                     for (int i = 0; i < n; i++) {
@@ -797,9 +857,9 @@ private:
                     }
                     float rms = std::sqrt(sum_sq / n);
                     float db = 20.0f * std::log10(rms + 1e-10f);
-                    
+
                     g_ui_state->update_level(db);
-                    
+
                     // Copy decoder stats
                     if (g_ui_state->stats_reset_requested.exchange(false)) {
                         decoder_->stats_sync_count = 0;
@@ -807,12 +867,20 @@ private:
                         decoder_->stats_symbol_errors = 0;
                         decoder_->stats_crc_errors = 0;
                         decoder_->reset_ber();
+                        mfsk_decoder_->reset_stats();
                         g_ui_state->last_rx_ber = -1.0f;
                     }
-                    g_ui_state->sync_count = decoder_->stats_sync_count;
-                    g_ui_state->preamble_errors = decoder_->stats_preamble_errors;
-                    g_ui_state->symbol_errors = decoder_->stats_symbol_errors;
-                    g_ui_state->crc_errors = decoder_->stats_crc_errors;
+                    if (config_.modem_type == 1) {
+                        g_ui_state->sync_count = mfsk_decoder_->stats_sync_count;
+                        g_ui_state->preamble_errors = mfsk_decoder_->stats_preamble_errors;
+                        g_ui_state->symbol_errors = 0;
+                        g_ui_state->crc_errors = mfsk_decoder_->stats_crc_errors;
+                    } else {
+                        g_ui_state->sync_count = decoder_->stats_sync_count;
+                        g_ui_state->preamble_errors = decoder_->stats_preamble_errors;
+                        g_ui_state->symbol_errors = decoder_->stats_symbol_errors;
+                        g_ui_state->crc_errors = decoder_->stats_crc_errors;
+                    }
                 }
 #endif
             }
@@ -881,7 +949,9 @@ private:
     
     std::unique_ptr<Encoder48k> encoder_;
     std::unique_ptr<Decoder48k> decoder_;
-    
+    std::unique_ptr<MFSKEncoder> mfsk_encoder_;
+    std::unique_ptr<MFSKDecoder> mfsk_decoder_;
+
     std::unique_ptr<MiniAudio> audio_;
     std::unique_ptr<RigctlPTT> rigctl_;
     std::unique_ptr<SerialPTT> serial_ptt_;
@@ -932,31 +1002,50 @@ public:
         if (config_.center_freq != new_config.center_freq) {
             config_.center_freq = new_config.center_freq;
             modem_config_.center_freq = config_.center_freq;
+            // Reconfigure MFSK decoder with new center freq
+            mfsk_decoder_->configure((MFSKMode)config_.mfsk_mode, config_.center_freq);
             ui_log("Center frequency changed to " + std::to_string(config_.center_freq) + " Hz");
         }
-        
-        // Update modulation settings
+
+        // Update modem type and sub-mode
+        if (config_.modem_type != new_config.modem_type || config_.mfsk_mode != new_config.mfsk_mode) {
+            config_.modem_type = new_config.modem_type;
+            config_.mfsk_mode = new_config.mfsk_mode;
+            if (config_.modem_type == 1) {
+                MFSKMode mmode = (MFSKMode)config_.mfsk_mode;
+                mfsk_decoder_->configure(mmode, config_.center_freq);
+                payload_size_ = mfsk_encoder_->get_payload_size(mmode);
+                ui_log("Mode changed to " + std::string(MFSK_MODE_NAMES[(int)mmode]) +
+                       " (" + std::to_string(MFSKParams::max_payload(mmode)) + " bytes)");
+            } else {
+                payload_size_ = encoder_->get_payload_size(modem_config_.oper_mode);
+            }
+        }
+
+        // Update OFDM modulation settings
         bool mode_changed = (config_.modulation != new_config.modulation ||
                             config_.code_rate != new_config.code_rate ||
                             config_.short_frame != new_config.short_frame);
-        
+
         if (mode_changed) {
             config_.modulation = new_config.modulation;
             config_.code_rate = new_config.code_rate;
             config_.short_frame = new_config.short_frame;
-            
+
             int new_mode = ModemConfig::encode_mode(
                 config_.modulation.c_str(),
                 config_.code_rate.c_str(),
                 config_.short_frame
             );
-            
+
             if (new_mode >= 0) {
                 modem_config_.oper_mode = new_mode;
-                payload_size_ = encoder_->get_payload_size(modem_config_.oper_mode);
-                ui_log("Mode changed to " + config_.modulation + " " + config_.code_rate + 
+                if (config_.modem_type == 0) {
+                    payload_size_ = encoder_->get_payload_size(modem_config_.oper_mode);
+                }
+                ui_log("OFDM mode changed to " + config_.modulation + " " + config_.code_rate +
                        " " + (config_.short_frame ? "short" : "normal") +
-                       " (" + std::to_string(payload_size_) + " bytes)");
+                       " (" + std::to_string(encoder_->get_payload_size(modem_config_.oper_mode)) + " bytes)");
             }
         }
     }
@@ -971,6 +1060,17 @@ public:
     };
 
     DecoderStats get_decoder_stats() const {
+        if (config_.modem_type == 1) {
+            return {
+                mfsk_decoder_->stats_sync_count,
+                mfsk_decoder_->stats_preamble_errors,
+                0, // MFSK has no symbol errors stat
+                mfsk_decoder_->stats_crc_errors,
+                mfsk_decoder_->get_last_snr(),
+                mfsk_decoder_->get_last_ber(),
+                mfsk_decoder_->get_ber_ema()
+            };
+        }
         return {
             decoder_->stats_sync_count,
             decoder_->stats_preamble_errors,
@@ -1288,9 +1388,11 @@ int main(int argc, char** argv) {
             
             // Try to load saved settings
             if (ui_state.load_settings()) {
-                // Apply loaded settings to config 
+                // Apply loaded settings to config
                 if (!cli_callsign)
                     config.callsign = ui_state.callsign;
+                config.modem_type = ui_state.modem_type_index;
+                config.mfsk_mode = ui_state.mfsk_mode_index;
                 config.center_freq = ui_state.center_freq;
                 config.modulation = MODULATION_OPTIONS[ui_state.modulation_index];
                 config.code_rate = CODE_RATE_OPTIONS[ui_state.code_rate_index];
@@ -1518,7 +1620,14 @@ int main(int argc, char** argv) {
                 auto& cfg = tnc.get_config();
 
                 cJSON_AddStringToObject(j, "callsign", cfg.callsign.c_str());
-                cJSON_AddStringToObject(j, "modulation", cfg.modulation.c_str());
+                cJSON_AddNumberToObject(j, "modem_type", cfg.modem_type);
+                cJSON_AddNumberToObject(j, "mfsk_mode", cfg.mfsk_mode);
+                if (cfg.modem_type == 1) {
+                    cJSON_AddStringToObject(j, "modulation",
+                        MFSK_MODE_NAMES[cfg.mfsk_mode < 4 ? cfg.mfsk_mode : 0]);
+                } else {
+                    cJSON_AddStringToObject(j, "modulation", cfg.modulation.c_str());
+                }
                 cJSON_AddStringToObject(j, "code_rate", cfg.code_rate.c_str());
                 cJSON_AddBoolToObject(j, "short_frame", cfg.short_frame);
                 cJSON_AddNumberToObject(j, "center_freq", cfg.center_freq);
@@ -1536,6 +1645,10 @@ int main(int argc, char** argv) {
                 TNCConfig new_config = tnc.get_config();
 
                 cJSON* item;
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "modem_type")) && cJSON_IsNumber(item))
+                    new_config.modem_type = item->valueint;
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "mfsk_mode")) && cJSON_IsNumber(item))
+                    new_config.mfsk_mode = item->valueint;
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "callsign")) && cJSON_IsString(item))
                     new_config.callsign = item->valuestring;
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "modulation")) && cJSON_IsString(item))
@@ -1563,6 +1676,8 @@ int main(int argc, char** argv) {
                 // Sync config back to TUI state so the UI reflects changes
                 if (g_ui_state) {
                     g_ui_state->callsign = new_config.callsign;
+                    g_ui_state->modem_type_index = new_config.modem_type;
+                    g_ui_state->mfsk_mode_index = new_config.mfsk_mode;
                     g_ui_state->center_freq = new_config.center_freq;
                     g_ui_state->short_frame = new_config.short_frame;
                     g_ui_state->csma_enabled = new_config.csma_enabled;
@@ -1609,6 +1724,8 @@ int main(int argc, char** argv) {
         if (g_use_ui) {
             ui_state.on_settings_changed = [&tnc, &ctrl](TNCUIState& state) {
                 TNCConfig new_config = tnc.get_config();
+                new_config.modem_type = state.modem_type_index;
+                new_config.mfsk_mode = state.mfsk_mode_index;
                 new_config.callsign = state.callsign;
                 new_config.center_freq = state.center_freq;
                 new_config.modulation = MODULATION_OPTIONS[state.modulation_index];

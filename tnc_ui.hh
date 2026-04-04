@@ -25,8 +25,12 @@
 #include <fcntl.h>
 
 #include "kiss_tnc.hh"
+#include "phy/mfsk_modem.hh"
 
 constexpr size_t MAX_LOG_ENTRIES = 500;
+
+const std::vector<std::string> MODEM_TYPE_OPTIONS = {"OFDM", "MFSK"};
+const std::vector<std::string> MFSK_MODE_OPTIONS = {"MFSK-8", "MFSK-16", "MFSK-32", "MFSK-32R"};
 
 const std::vector<std::string> MODULATION_OPTIONS = {
     "BPSK", "QPSK", "8PSK", "QAM16", "QAM64", "QAM256", "QAM1024", "QAM4096"
@@ -49,9 +53,11 @@ const std::vector<std::string> PTT_LINE_OPTIONS = {
 
 struct TNCUIState {
     std::string callsign = "N0CALL";
-    int modulation_index = 1;  // default QSPK N 1/2
-    int code_rate_index = 0;   
-    bool short_frame = false;  
+    int modem_type_index = 0;  // 0=OFDM, 1=MFSK
+    int mfsk_mode_index = 1;   // 0=MFSK-8, 1=MFSK-16, 2=MFSK-32, 3=MFSK-32R
+    int modulation_index = 1;  // default QPSK N 1/2
+    int code_rate_index = 0;
+    bool short_frame = false;
     int center_freq = 1500;
     
     bool csma_enabled = true;
@@ -114,7 +120,10 @@ struct TNCUIState {
     // Presets 
     struct Preset {
         std::string name;
-        // Modem
+        // Modem type
+        int modem_type_index = 0;  // 0=OFDM, 1=MFSK
+        int mfsk_mode_index = 1;   // 0=MFSK-8, 1=MFSK-16, 2=MFSK-32, 3=MFSK-32R
+        // OFDM modem
         int modulation_index;
         int code_rate_index;
         bool short_frame;
@@ -284,6 +293,17 @@ struct TNCUIState {
     
     // TEMP modem tables
     void update_modem_info() {
+        // MFSK mode
+        if (modem_type_index == 1) {
+            MFSKMode mmode = (MFSKMode)mfsk_mode_index;
+            mtu_bytes = MFSKParams::max_payload(mmode);
+            bitrate_bps = MFSKParams::bitrate(mmode);
+            airtime_seconds = MFSKParams::frame_duration();
+            if (random_data_size == 0 || (!fragmentation_enabled && random_data_size > mtu_bytes))
+                random_data_size = mtu_bytes;
+            return;
+        }
+
         // Modulations: BPSK=0, QPSK=1, 8PSK=2, QAM16=3, QAM64=4, QAM256=5, QAM1024=6, QAM4096=7
         // Code rates: 1/2=0, 2/3=1, 3/4=2, 5/6=3, 1/4=4
         // Columns: [1/2, 2/3, 3/4, 5/6, 1/4]
@@ -425,6 +445,8 @@ struct TNCUIState {
         
         fprintf(f, "# MODEM73 Settings\n");
         fprintf(f, "callsign=%s\n", callsign.c_str());
+        fprintf(f, "modem_type=%d\n", modem_type_index);
+        fprintf(f, "mfsk_mode=%d\n", mfsk_mode_index);
         fprintf(f, "modulation=%d\n", modulation_index);
         fprintf(f, "code_rate=%d\n", code_rate_index);
         fprintf(f, "short_frame=%d\n", short_frame ? 1 : 0);
@@ -474,6 +496,8 @@ struct TNCUIState {
             char key[64], value[192];
             if (sscanf(line, "%63[^=]=%191[^\n]", key, value) == 2) {
                 if (strcmp(key, "callsign") == 0) callsign = value;
+                else if (strcmp(key, "modem_type") == 0) modem_type_index = atoi(value);
+                else if (strcmp(key, "mfsk_mode") == 0) mfsk_mode_index = atoi(value);
                 else if (strcmp(key, "modulation") == 0) modulation_index = atoi(value);
                 else if (strcmp(key, "code_rate") == 0) code_rate_index = atoi(value);
                 else if (strcmp(key, "short_frame") == 0) short_frame = atoi(value) != 0;
@@ -520,8 +544,8 @@ struct TNCUIState {
         
         fprintf(f, "# MODEM73 Presets \n");
         for (const auto& p : presets) {
-            // name,mod,rate,sf,freq,csma,thresh,slot,persist,ptt,vox_freq,vox_lead,vox_tail
-            fprintf(f, "preset=%s,%d,%d,%d,%d,%d,%.1f,%d,%d,%d,%d,%d,%d\n",
+            // name,mod,rate,sf,freq,csma,thresh,slot,persist,ptt,vox_freq,vox_lead,vox_tail,modem_type,mfsk_mode
+            fprintf(f, "preset=%s,%d,%d,%d,%d,%d,%.1f,%d,%d,%d,%d,%d,%d,%d,%d\n",
                     p.name.c_str(),
                     p.modulation_index,
                     p.code_rate_index,
@@ -534,7 +558,9 @@ struct TNCUIState {
                     p.ptt_type_index,
                     p.vox_tone_freq,
                     p.vox_lead_ms,
-                    p.vox_tail_ms);
+                    p.vox_tail_ms,
+                    p.modem_type_index,
+                    p.mfsk_mode_index);
         }
         
         fclose(f);
@@ -557,14 +583,16 @@ struct TNCUIState {
             
             char name[64];
             int mod, rate, sf, freq, csma, slot, persist;
-            int ptt_type = 1, vox_freq = 1200, vox_lead = 150, vox_tail = 100;  
+            int ptt_type = 1, vox_freq = 1200, vox_lead = 150, vox_tail = 100;
+            int modem_type = 0, mfsk_mode = 1;
             float thresh;
-            
-            int n = sscanf(line + 7, "%63[^,],%d,%d,%d,%d,%d,%f,%d,%d,%d,%d,%d,%d",
+
+            int n = sscanf(line + 7, "%63[^,],%d,%d,%d,%d,%d,%f,%d,%d,%d,%d,%d,%d,%d,%d",
                        name, &mod, &rate, &sf, &freq, &csma, &thresh, &slot, &persist,
-                       &ptt_type, &vox_freq, &vox_lead, &vox_tail);
-            
-            if (n >= 9) {  
+                       &ptt_type, &vox_freq, &vox_lead, &vox_tail,
+                       &modem_type, &mfsk_mode);
+
+            if (n >= 9) {
                 Preset p;
                 p.name = name;
                 p.modulation_index = mod;
@@ -580,6 +608,10 @@ struct TNCUIState {
                 p.vox_tone_freq = (n >= 11) ? vox_freq : 1200;
                 p.vox_lead_ms = (n >= 12) ? vox_lead : 150;
                 p.vox_tail_ms = (n >= 13) ? vox_tail : 100;
+
+
+                p.modem_type_index = (n >= 14) ? modem_type : 0;
+                p.mfsk_mode_index = (n >= 15) ? mfsk_mode : 1;
                 presets.push_back(p);
             }
         }
@@ -600,6 +632,8 @@ struct TNCUIState {
         
         Preset p;
         p.name = name;
+        p.modem_type_index = modem_type_index;
+        p.mfsk_mode_index = mfsk_mode_index;
         p.modulation_index = modulation_index;
         p.code_rate_index = code_rate_index;
         p.short_frame = short_frame;
@@ -623,6 +657,8 @@ struct TNCUIState {
         if (index < 0 || index >= (int)presets.size()) return false;
         
         const Preset& p = presets[index];
+        modem_type_index = p.modem_type_index;
+        mfsk_mode_index = p.mfsk_mode_index;
         modulation_index = p.modulation_index;
         code_rate_index = p.code_rate_index;
         short_frame = p.short_frame;
@@ -753,9 +789,11 @@ public:
 private:
     enum Field {
         FIELD_CALLSIGN = 0,
+        FIELD_MODEM_TYPE,
         FIELD_MODULATION,
         FIELD_CODERATE,
         FIELD_FRAMESIZE,
+        FIELD_MFSK_MODE,
         FIELD_FREQ,
         FIELD_CSMA,
         FIELD_THRESHOLD,
@@ -851,7 +889,7 @@ private:
                                 state_.selected_preset = state_.presets.size() - 1;
                             }
                         }
-                    } else if (current_field_ >= FIELD_MODULATION && current_field_ != FIELD_PRESET) {
+                    } else if (current_field_ >= FIELD_MODEM_TYPE && current_field_ != FIELD_PRESET) {
                         adjust_field(-1);
                     }
                 } else if (current_tab_ == 3 && (utils_selection_ == 0 || utils_selection_ == 1)) {
@@ -872,7 +910,7 @@ private:
                                 state_.selected_preset = 0;
                             }
                         }
-                    } else if (current_field_ >= FIELD_MODULATION && current_field_ != FIELD_PRESET) {
+                    } else if (current_field_ >= FIELD_MODEM_TYPE && current_field_ != FIELD_PRESET) {
                         adjust_field(1);
                     }
                 } else if (current_tab_ == 3 && (utils_selection_ == 0 || utils_selection_ == 1)) {
@@ -1216,6 +1254,15 @@ private:
     }
     
     bool should_skip_field(int field) {
+        // Hide OFDM-only fields when in MFSK mode
+        if (state_.modem_type_index == 1) {
+            if (field == FIELD_MODULATION || field == FIELD_CODERATE || field == FIELD_FRAMESIZE)
+                return true;
+        }
+        // Hide MFSK-only fields when in OFDM mode
+        if (state_.modem_type_index == 0) {
+            if (field == FIELD_MFSK_MODE) return true;
+        }
         if (state_.ptt_type_index != 2) {  // not VOX
             if (field == FIELD_VOX_FREQ || field == FIELD_VOX_LEAD || field == FIELD_VOX_TAIL) {
                 return true;
@@ -1238,6 +1285,14 @@ private:
     
     void adjust_field(int delta) {
         switch (current_field_) {
+            case FIELD_MODEM_TYPE:
+                state_.modem_type_index = (state_.modem_type_index + delta + 2) % 2;
+                state_.update_modem_info();
+                break;
+            case FIELD_MFSK_MODE:
+                state_.mfsk_mode_index = (state_.mfsk_mode_index + delta + 4) % 4;
+                state_.update_modem_info();
+                break;
             case FIELD_MODULATION:
                 state_.modulation_index = (state_.modulation_index + delta + 8) % 8;
                 break;
@@ -1629,11 +1684,17 @@ private:
         attron(A_BOLD);
         addstr(state_.callsign.c_str());
         attroff(A_BOLD);
-        printw("  %s %s %s %dHz",
-               MODULATION_OPTIONS[state_.modulation_index].c_str(),
-               CODE_RATE_OPTIONS[state_.code_rate_index].c_str(),
-               state_.short_frame ? "S" : "N",
-               state_.center_freq);
+        if (state_.modem_type_index == 1) {
+            printw("  %s %dHz",
+                   MFSK_MODE_OPTIONS[state_.mfsk_mode_index].c_str(),
+                   state_.center_freq);
+        } else {
+            printw("  %s %s %s %dHz",
+                   MODULATION_OPTIONS[state_.modulation_index].c_str(),
+                   CODE_RATE_OPTIONS[state_.code_rate_index].c_str(),
+                   state_.short_frame ? "S" : "N",
+                   state_.center_freq);
+        }
         
         // Stats 
         int rx = cols - 20;
@@ -2170,12 +2231,20 @@ private:
             row++; // header
             if (field == FIELD_CALLSIGN) return row;
             row++;
-            if (field == FIELD_MODULATION) return row;
+            if (field == FIELD_MODEM_TYPE) return row;
             row++;
-            if (field == FIELD_CODERATE) return row;
-            row++;
-            if (field == FIELD_FRAMESIZE) return row;
-            row++;
+            if (state_.modem_type_index == 0) {
+                if (field == FIELD_MODULATION) return row;
+                row++;
+                if (field == FIELD_CODERATE) return row;
+                row++;
+                if (field == FIELD_FRAMESIZE) return row;
+                row++;
+            } else {
+                // MFSK field
+                if (field == FIELD_MFSK_MODE) return row;
+                row++;
+            }
             if (field == FIELD_FREQ) return row;
             row += 2;
             // CSMA section
@@ -2269,22 +2338,36 @@ private:
         dy = visible_y(row);
         if (dy >= 0) draw_field(dy, c1, c2, "Callsign", FIELD_CALLSIGN, state_.callsign, true);
         row++;
-        
+
         dy = visible_y(row);
-        if (dy >= 0) draw_selector_field(dy, c1, c2, "Modulation", FIELD_MODULATION,
-                           MODULATION_OPTIONS[state_.modulation_index]);
+        if (dy >= 0) draw_selector_field(dy, c1, c2, "Modem", FIELD_MODEM_TYPE,
+                           MODEM_TYPE_OPTIONS[state_.modem_type_index]);
         row++;
-        
-        dy = visible_y(row);
-        if (dy >= 0) draw_selector_field(dy, c1, c2, "Code Rate", FIELD_CODERATE,
-                           CODE_RATE_OPTIONS[state_.code_rate_index]);
-        row++;
-        
-        dy = visible_y(row);
-        if (dy >= 0) draw_selector_field(dy, c1, c2, "Frame Size", FIELD_FRAMESIZE,
-                           state_.short_frame ? "SHORT" : "NORMAL");
-        row++;
-        
+
+        if (state_.modem_type_index == 0) {
+            // OFDM fields
+            dy = visible_y(row);
+            if (dy >= 0) draw_selector_field(dy, c1, c2, "Modulation", FIELD_MODULATION,
+                               MODULATION_OPTIONS[state_.modulation_index]);
+            row++;
+
+            dy = visible_y(row);
+            if (dy >= 0) draw_selector_field(dy, c1, c2, "Code Rate", FIELD_CODERATE,
+                               CODE_RATE_OPTIONS[state_.code_rate_index]);
+            row++;
+
+            dy = visible_y(row);
+            if (dy >= 0) draw_selector_field(dy, c1, c2, "Frame Size", FIELD_FRAMESIZE,
+                               state_.short_frame ? "SHORT" : "NORMAL");
+            row++;
+        } else {
+            // MFSK field
+            dy = visible_y(row);
+            if (dy >= 0) draw_selector_field(dy, c1, c2, "MFSK Mode", FIELD_MFSK_MODE,
+                               MFSK_MODE_OPTIONS[state_.mfsk_mode_index]);
+            row++;
+        }
+
         dy = visible_y(row);
         if (dy >= 0) {
             char freq_buf[32];
@@ -2353,12 +2436,6 @@ private:
         }
         row++;
         
-        dy = visible_y(row);
-        if (dy >= 0) {
-            attron(A_DIM);
-            mvaddstr(dy, c1, "Both sides must have frag enabled");
-            attroff(A_DIM);
-        }
         row++;
         
         dy = visible_y(row);
@@ -2569,6 +2646,35 @@ private:
         printw("  TX ");
         if (tx_time < 60) printw("%.0fs", tx_time);
         else printw("%.1fm", tx_time / 60.0f);
+        y++;
+
+
+
+
+        {
+            bool hf_ok = (state_.modem_type_index == 1) ||
+                         (state_.modulation_index <= 2); // BPSK, QPSK, 8PSK
+            mvaddstr(y, c3, "Band  ");
+            if (hf_ok) {
+                attron(COLOR_PAIR(3) | A_BOLD);
+                addstr("HF/VHF");
+                attroff(COLOR_PAIR(3) | A_BOLD);
+            } else {
+                attron(A_DIM);
+                addstr("HF/VHF");
+                attroff(A_DIM);
+            }
+            addstr("  ");
+            if (!hf_ok) {
+                attron(COLOR_PAIR(3) | A_BOLD);
+                addstr("VHF/UHF");
+                attroff(COLOR_PAIR(3) | A_BOLD);
+            } else {
+                attron(A_DIM);
+                addstr("VHF/UHF");
+                attroff(A_DIM);
+            }
+        }
         y += 2;
         
         // Right side, for audio / ptt status

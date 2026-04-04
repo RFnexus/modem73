@@ -19,7 +19,7 @@
 #include <poll.h>
 
 extern "C" {
-#include "cJSON.h"
+#include "deps/cJSON.h"
 }
 
 // Base64 decode (RFC 4648)
