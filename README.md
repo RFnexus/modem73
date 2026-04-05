@@ -21,16 +21,18 @@ Windows fork by SP5LOT https://github.com/SP5LOT/modem73
 
 ### Linux
 
+On a system with `apt`? Run the installer script:
+```
+./install.sh
+```
+
 1. Install dependencies
 
 ```
 # Debian/Ubuntu/Pi
 sudo apt install git build-essential libncurses-dev g++
 ```
-Or if on a system with `apt` run:
-```
-./install.sh
-```
+
 
 #### Optional Addons
 
@@ -123,6 +125,10 @@ while running `rigctld`
 # CM108 USB audio interface PTT (GPIO3 is the default)
 ./modem73 --ptt cm108 --cm108-gpio 3
 ```
+
+### Control port
+
+A control port for modem73 will automatically start on port `8073` by default. View `CONTROL_PORT.md` for the full JSON spec
 
 
 ## Updating
