@@ -5,7 +5,7 @@
 #define MA_NO_GENERATION
 #define MA_NO_ENGINE
 #define MA_NO_NODE_GRAPH
-#include "miniaudio.h"
+#include "deps/miniaudio.h"
 
 #include <vector>
 #include <string>
