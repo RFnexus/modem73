@@ -27,7 +27,8 @@ jobs:
             cross_triple: ""
           - runner: ubuntu-24.04
             arch: armhf
-            arch_flags: "-march=armv7-a"
+            # Debian armhf baseline: ARMv7-A + VFPv3-D16 hardfloat.
+            arch_flags: "-march=armv7-a -mfpu=vfpv3-d16 -mfloat-abi=hard"
             cross_triple: "arm-linux-gnueabihf"
 
     runs-on: ${{ matrix.runner }}
@@ -192,7 +193,8 @@ jobs:
 
       - name: Build .deb with fpm
         run: |
-          DEPS="-d libc6 -d libstdc++6 -d libncurses6 -d libtinfo6 -d libhidapi-hidraw0"
+          # ncurses/tinfo went through the time_t-64 transition in 2024 — accept
+          # either name so the package installs on pre- and post-t64 systems.
           fpm -s dir -t deb \
             -n modem73 \
             -v "${{ steps.ver.outputs.version }}" \
@@ -201,11 +203,21 @@ jobs:
             --url "https://github.com/${{ github.repository }}" \
             --license "see LICENSE" \
             --maintainer "modem73 maintainers" \
-            $DEPS \
+            -d libc6 \
+            -d 'libstdc++6' \
+            -d 'libncurses6 | libncurses6t64' \
+            -d 'libtinfo6 | libtinfo6t64' \
+            -d libhidapi-hidraw0 \
             --deb-no-default-config-files \
             -C staging \
             -p "modem73_${{ steps.ver.outputs.version }}_${{ matrix.arch }}.deb" \
             usr lib
+
+      - name: Generate checksums
+        run: |
+          DEB="modem73_${{ steps.ver.outputs.version }}_${{ matrix.arch }}.deb"
+          sha256sum  "$DEB" | tee "${DEB}.sha256"
+          sha512sum  "$DEB" | tee "${DEB}.sha512"
 
       - name: Smoke test the .deb (native)
         if: '!matrix.cross_triple'
@@ -229,11 +241,17 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: modem73_${{ matrix.arch }}
-          path: modem73_*.deb
+          path: |
+            modem73_*.deb
+            modem73_*.deb.sha256
+            modem73_*.deb.sha512
 
       - name: Attach to release
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: modem73_*.deb
+          files: |
+            modem73_*.deb
+            modem73_*.deb.sha256
+            modem73_*.deb.sha512
           generate_release_notes: true
