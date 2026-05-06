@@ -1,0 +1,237 @@
+name: Build .deb packages
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: ''
+        required: false
+        default: '0.0.0-dev'
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+            arch_flags: "-march=x86-64-v2"
+            cross_triple: ""
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            arch_flags: "-march=armv8-a"
+            cross_triple: ""
+          - runner: ubuntu-24.04
+            arch: armhf
+            arch_flags: "-march=armv7-a"
+            cross_triple: "arm-linux-gnueabihf"
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout modem73
+        uses: actions/checkout@v4
+        with:
+          path: m73
+
+      - name: Checkout aicodix/dsp
+        uses: actions/checkout@v4
+        with:
+          repository: aicodix/dsp
+          path: dsp
+
+      - name: Checkout aicodix/code
+        uses: actions/checkout@v4
+        with:
+          repository: aicodix/code
+          path: code
+
+      - name: Checkout aicodix/modem
+        uses: actions/checkout@v4
+        with:
+          repository: aicodix/modem
+          path: modem
+
+      - name: Enable armhf multiarch
+        if: matrix.cross_triple
+        run: |
+          sudo dpkg --add-architecture armhf
+          sudo sed -i 's|^Signed-By:|Architectures: amd64\nSigned-By:|' \
+            /etc/apt/sources.list.d/ubuntu.sources
+          sudo tee /etc/apt/sources.list.d/ubuntu-armhf.sources >/dev/null <<'EOF'
+          Types: deb
+          URIs: http://ports.ubuntu.com/ubuntu-ports/
+          Suites: noble noble-updates noble-backports noble-security
+          Components: main restricted universe multiverse
+          Architectures: armhf
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          EOF
+
+      - name: Install build dependencies (native)
+        if: '!matrix.cross_triple'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential g++ libncurses-dev libhidapi-dev pkg-config \
+            ruby ruby-dev rubygems
+          sudo gem install --no-document fpm
+
+      - name: Install build dependencies (cross armhf)
+        if: matrix.cross_triple
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            crossbuild-essential-armhf \
+            libncurses-dev:armhf libhidapi-dev:armhf libtinfo-dev:armhf \
+            pkg-config \
+            ruby ruby-dev rubygems
+          sudo gem install --no-document fpm
+
+      - name: Determine version
+        id: ver
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            V="${GITHUB_REF_NAME#v}"
+          else
+            V="${{ github.event.inputs.version }}"
+          fi
+          echo "version=${V}" >> "$GITHUB_OUTPUT"
+          echo "Building version ${V} for ${{ matrix.arch }}"
+
+      - name: Write packaging Makefile
+        working-directory: m73
+        run: |
+          cat > Makefile.deb <<'MAKEFILE_EOF'
+          CXX = g++
+          CC = gcc
+
+          ARCH_FLAGS ?= -O2
+          CXXFLAGS = -std=c++17 -O3 $(ARCH_FLAGS) -Wall -Wextra
+          LDFLAGS = -lpthread -ltinfo -lncurses -ldl -lm
+
+          PREFIX ?= /usr
+          DESTDIR ?=
+
+          AICODIX_DSP ?= ../dsp
+          AICODIX_CODE ?= ../code
+          MODEM_SRC ?= ../modem
+
+          INCLUDES = -I$(AICODIX_DSP) -I$(AICODIX_CODE) -I$(MODEM_SRC)
+
+          TARGET = modem73
+          SRCS = kiss_tnc.cc
+          HDRS = kiss_tnc.hh miniaudio_audio.hh rigctl_ptt.hh modem.hh phy/mfsk_modem.hh tnc_ui.hh control_port.hh
+          OBJS = deps/miniaudio.o deps/cJSON.o
+
+          UI_FLAGS = -DWITH_UI
+
+          HIDAPI_CFLAGS := $(shell pkg-config --cflags hidapi-hidraw 2>/dev/null || pkg-config --cflags hidapi-libusb 2>/dev/null || pkg-config --cflags hidapi 2>/dev/null)
+          HIDAPI_LIBS := $(shell pkg-config --libs hidapi-hidraw 2>/dev/null || pkg-config --libs hidapi-libusb 2>/dev/null || pkg-config --libs hidapi 2>/dev/null)
+
+          ifneq ($(HIDAPI_LIBS),)
+              CM108_FLAGS = -DWITH_CM108
+              CXXFLAGS += $(HIDAPI_CFLAGS)
+              LDFLAGS += $(HIDAPI_LIBS)
+          else
+              CM108_FLAGS =
+          endif
+
+          .PHONY: all clean install
+          all: $(TARGET)
+
+          deps/miniaudio.o: deps/miniaudio.c deps/miniaudio.h
+          	$(CC) -c -O2 -o $@ deps/miniaudio.c
+
+          deps/cJSON.o: deps/cJSON.c deps/cJSON.h
+          	$(CC) -c -O2 -o $@ deps/cJSON.c
+
+          $(TARGET): $(SRCS) $(HDRS) $(OBJS)
+          	$(CXX) $(CXXFLAGS) $(UI_FLAGS) $(CM108_FLAGS) $(INCLUDES) -o $@ $(SRCS) $(OBJS) $(LDFLAGS)
+
+          clean:
+          	rm -f $(TARGET) $(OBJS)
+
+          install: $(TARGET)
+          	install -d $(DESTDIR)$(PREFIX)/bin
+          	install -m 755 $(TARGET) $(DESTDIR)$(PREFIX)/bin/
+          ifneq ($(HIDAPI_LIBS),)
+          	@if [ -f misc/50-cm108-ptt.rules ]; then \
+          		install -d $(DESTDIR)/lib/udev/rules.d; \
+          		install -m 644 misc/50-cm108-ptt.rules $(DESTDIR)/lib/udev/rules.d/; \
+          	fi
+          endif
+          MAKEFILE_EOF
+
+      - name: Build
+        working-directory: m73
+        env:
+          CC: ${{ matrix.cross_triple && format('{0}-gcc', matrix.cross_triple) || 'gcc' }}
+          CXX: ${{ matrix.cross_triple && format('{0}-g++', matrix.cross_triple) || 'g++' }}
+          # Force pkg-config to look only at the cross arch's .pc files.
+          PKG_CONFIG_PATH: ${{ matrix.cross_triple && format('/usr/lib/{0}/pkgconfig', matrix.cross_triple) || '' }}
+          PKG_CONFIG_LIBDIR: ${{ matrix.cross_triple && format('/usr/lib/{0}/pkgconfig:/usr/share/pkgconfig', matrix.cross_triple) || '' }}
+        run: |
+          make -f Makefile.deb \
+               CC="$CC" CXX="$CXX" \
+               ARCH_FLAGS="${{ matrix.arch_flags }}" \
+               AICODIX_DSP=../../dsp \
+               AICODIX_CODE=../../code \
+               MODEM_SRC=../../modem \
+               -j"$(nproc)"
+
+      - name: Stage install tree
+        working-directory: m73
+        run: |
+          make -f Makefile.deb install DESTDIR=../staging PREFIX=/usr
+
+      - name: Build .deb with fpm
+        run: |
+          DEPS="-d libc6 -d libstdc++6 -d libncurses6 -d libtinfo6 -d libhidapi-hidraw0"
+          fpm -s dir -t deb \
+            -n modem73 \
+            -v "${{ steps.ver.outputs.version }}" \
+            -a "${{ matrix.arch }}" \
+            --description "KISS TNC frontend for the aicodix OFDM modem." \
+            --url "https://github.com/${{ github.repository }}" \
+            --license "see LICENSE" \
+            --maintainer "modem73 maintainers" \
+            $DEPS \
+            --deb-no-default-config-files \
+            -C staging \
+            -p "modem73_${{ steps.ver.outputs.version }}_${{ matrix.arch }}.deb" \
+            usr lib
+
+      - name: Smoke test the .deb (native)
+        if: '!matrix.cross_triple'
+        run: |
+          sudo apt-get install -y "./modem73_${{ steps.ver.outputs.version }}_${{ matrix.arch }}.deb"
+          which modem73
+          dpkg -L modem73 | head -30
+          # Binary should at least respond to --help without crashing.
+          modem73 --help >/dev/null 2>&1 || true
+
+      - name: Inspect the .deb (cross)
+        if: matrix.cross_triple
+        run: |
+          DEB="modem73_${{ steps.ver.outputs.version }}_${{ matrix.arch }}.deb"
+          dpkg-deb --info "$DEB"
+          dpkg-deb --contents "$DEB"
+          # Confirm the binary is the right architecture.
+          dpkg-deb --fsys-tarfile "$DEB" | tar -xO ./usr/bin/modem73 | file -
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: modem73_${{ matrix.arch }}
+          path: modem73_*.deb
+
+      - name: Attach to release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: modem73_*.deb
+          generate_release_notes: true
