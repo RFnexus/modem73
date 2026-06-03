@@ -21,7 +21,7 @@ public:
     bool open(const int gpio){
         res_ = hid_init();
         gpio_ = gpio;
-        handle_ = hid_open(0x0D8C, 0x013C, NULL);
+        handle_ = hid_open(0x0D8C, 0x0012, NULL);
         if (!handle_) {
             std::cerr << "Failed to open CM108 PTT via USB" << std::endl;
             hid_exit();
