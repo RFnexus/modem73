@@ -29,7 +29,8 @@ struct Common
 	static const int code_max = 16;
 	static const int bits_max = 1 << code_max;
 	static const int data_max = 8192;
-	static const int symbols_max = 26 + 1;
+	// largest frame: 8PSK/QAM64 long = 44 data symbols, plus meta
+	static const int symbols_max = 44 + 1;
 	static const int mls0_poly = 0x331;
 	static const int mls0_seed = 214;
 	static const int mls1_poly = 0x43;
@@ -59,11 +60,10 @@ struct Common
 
 	bool setup(int mode)
 	{
-		bool analog_mode = mode & 128;
-		if (analog_mode) {
-			std::cerr << "analog mode not supported yet" << std::endl;
-			return false;
-		}
+		// bit 7: long frame (double a normal frame). Receivers without
+		// long-frame support reject this bit, so frames are ignored
+		// cleanly rather than misdecoded.
+		bool long_frame = mode & 128;
 		std::cerr << "modulation: ";
 		int modulation = (mode >> 4) & 7;
 		switch (modulation) {
@@ -120,7 +120,9 @@ struct Common
 		}
 		std::cerr << std::endl;
 		bool frame_size = mode & 1;
-		std::cerr << "frame size: " << (frame_size ? "normal" : "short") << std::endl;
+		if (long_frame && !frame_size)
+			return false;
+		std::cerr << "frame size: " << (long_frame ? "long" : frame_size ? "normal" : "short") << std::endl;
 		if (frame_size) {
 			if (symbol_count == 4) {
 				symbol_count *= 4;
@@ -129,6 +131,12 @@ struct Common
 				symbol_count *= 2;
 				++code_order;
 			}
+		}
+		if (long_frame) {
+			// code_order 17 combos (QAM1024/4096 long) fall through to
+			// the rate tables below, which reject the unknown order.
+			symbol_count *= 2;
+			++code_order;
 		}
 		int code_rate = (mode >> 1) & 7;
 		std::cerr << "code rate: ";

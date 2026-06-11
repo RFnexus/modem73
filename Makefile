@@ -53,7 +53,7 @@ ifneq ($(HIDAPI_LIBS),)
 endif
 
 clean:
-	rm -f $(TARGET) $(OBJS)
+	rm -f $(TARGET) $(OBJS) test_fade test_awgn test_mfsk
 
 install: $(TARGET)
 	install -m 755 $(TARGET) /usr/local/bin/
@@ -67,6 +67,15 @@ endif
 # Debug build
 debug: CXXFLAGS = -std=c++17 -g -O0 -Wall -Wextra -DDEBUG
 debug: $(TARGET)
+
+test_fade: test_fade.cc modem.hh phy/common.hh
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ test_fade.cc -lm
+
+test_awgn: test_awgn.cc modem.hh phy/common.hh
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ test_awgn.cc -lm
+
+test_mfsk: test_mfsk.cc phy/mfsk_modem.hh
+	$(CXX) $(CXXFLAGS) -o $@ test_mfsk.cc -lm
 
 # Help
 help:

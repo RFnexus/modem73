@@ -4,3 +4,14 @@ TODO
 test-dual.sh
 nohup.out
 modem73.log
+matlab/
+mlb/
+deps/cJSON.o
+test_fade
+test_fade.cc
+test_awgn
+test_awgn.cc
+test_mfsk
+test_mfsk.cc
+test_watterson
+test_watterson.cc

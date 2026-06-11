@@ -15,6 +15,8 @@
 #include <mutex>
 #include <memory>
 #include <random>
+#include <algorithm>
+#include <cctype>
 
 // Network
 #include <sys/socket.h>
@@ -138,6 +140,7 @@ public:
         std::cerr << "  Creating OFDM encoder/decoder" << std::endl;
         encoder_ = std::make_unique<Encoder48k>();
         decoder_ = std::make_unique<Decoder48k>();
+        decoder_->configure_frontend(config.center_freq, config.rx_filter_enabled);
 
         // Allocate MFSK encoder/decoder
         std::cerr << "  Creating MFSK encoder/decoder" << std::endl;
@@ -169,7 +172,7 @@ public:
         modem_config_.oper_mode = ModemConfig::encode_mode(
             config.modulation.c_str(),
             config.code_rate.c_str(),
-            config.short_frame
+            config.frame_size
         );
 
         if (modem_config_.call_sign < 0) {
@@ -253,8 +256,8 @@ public:
         
         std::cerr << "KISS TNC listening on " << config_.bind_address << ":" << config_.port << std::endl;
         std::cerr << "Callsign: " << config_.callsign << std::endl;
-        std::cerr << "Modulation: " << config_.modulation << " " << config_.code_rate 
-                  << " " << (config_.short_frame ? "short" : "normal") << std::endl;
+        std::cerr << "Modulation: " << config_.modulation << " " << config_.code_rate
+                  << " " << ModemConfig::frame_size_name(config_.frame_size) << std::endl;
         std::cerr << "Payload: " << payload_size_ << " bytes (including 2-byte length prefix)" << std::endl;
         
         if (config_.csma_enabled) {
@@ -738,7 +741,28 @@ private:
                 g_ui_state->add_packet(false, payload.size(), snr, ber_pct);
             }
 #endif
-            
+
+            if (payload.size() > 4 && !memcmp(payload.data(), "M73:", 4)) {
+                auto sep = std::find(payload.begin() + 4, payload.end(), (uint8_t)':');
+                if (sep != payload.end() && sep - payload.begin() <= 16) {
+                    std::string from(payload.begin() + 4, sep);
+                    std::string text(sep + 1, payload.end());
+                    if (text.size() <= 200) {
+                        for (auto& c : from)
+                            if (!isprint((unsigned char)c)) c = '?';
+                        for (auto& c : text)
+                            if ((unsigned char)c < 32) c = ' ';
+                        std::cerr << "MSG from " << from << ": " << text << std::endl;
+#ifdef WITH_UI
+                        if (g_ui_state) {
+                            g_ui_state->add_message(from, text, false);
+                            g_ui_state->add_log("MSG from " + from);
+                        }
+#endif
+                    }
+                }
+            }
+
             auto kiss_frame = KISSParser::wrap(payload);
             
             std::lock_guard<std::mutex> lock(clients_mutex_);
@@ -866,6 +890,7 @@ private:
                         decoder_->stats_sync_count = 0;
                         decoder_->stats_preamble_errors = 0;
                         decoder_->stats_symbol_errors = 0;
+                        decoder_->stats_erased_symbols = 0;
                         decoder_->stats_crc_errors = 0;
                         decoder_->reset_ber();
                         mfsk_decoder_->reset_stats();
@@ -875,11 +900,13 @@ private:
                         g_ui_state->sync_count = mfsk_decoder_->stats_sync_count;
                         g_ui_state->preamble_errors = mfsk_decoder_->stats_preamble_errors;
                         g_ui_state->symbol_errors = 0;
+                        g_ui_state->erased_symbols = 0;
                         g_ui_state->crc_errors = mfsk_decoder_->stats_crc_errors;
                     } else {
                         g_ui_state->sync_count = decoder_->stats_sync_count;
                         g_ui_state->preamble_errors = decoder_->stats_preamble_errors;
                         g_ui_state->symbol_errors = decoder_->stats_symbol_errors;
+                        g_ui_state->erased_symbols = decoder_->stats_erased_symbols;
                         g_ui_state->crc_errors = decoder_->stats_crc_errors;
                     }
                 }
@@ -1003,6 +1030,7 @@ public:
         if (config_.center_freq != new_config.center_freq) {
             config_.center_freq = new_config.center_freq;
             modem_config_.center_freq = config_.center_freq;
+            decoder_->configure_frontend(config_.center_freq, config_.rx_filter_enabled);
             // Reconfigure MFSK decoder with new center freq
             mfsk_decoder_->configure((MFSKMode)config_.mfsk_mode, config_.center_freq);
             ui_log("Center frequency changed to " + std::to_string(config_.center_freq) + " Hz");
@@ -1026,17 +1054,17 @@ public:
         // Update OFDM modulation settings
         bool mode_changed = (config_.modulation != new_config.modulation ||
                             config_.code_rate != new_config.code_rate ||
-                            config_.short_frame != new_config.short_frame);
+                            config_.frame_size != new_config.frame_size);
 
         if (mode_changed) {
             config_.modulation = new_config.modulation;
             config_.code_rate = new_config.code_rate;
-            config_.short_frame = new_config.short_frame;
+            config_.frame_size = new_config.frame_size;
 
             int new_mode = ModemConfig::encode_mode(
                 config_.modulation.c_str(),
                 config_.code_rate.c_str(),
-                config_.short_frame
+                config_.frame_size
             );
 
             if (new_mode >= 0) {
@@ -1045,8 +1073,11 @@ public:
                     payload_size_ = encoder_->get_payload_size(modem_config_.oper_mode);
                 }
                 ui_log("OFDM mode changed to " + config_.modulation + " " + config_.code_rate +
-                       " " + (config_.short_frame ? "short" : "normal") +
+                       " " + ModemConfig::frame_size_name(config_.frame_size) +
                        " (" + std::to_string(encoder_->get_payload_size(modem_config_.oper_mode)) + " bytes)");
+            } else {
+                ui_log("Invalid OFDM mode " + config_.modulation + " " + config_.code_rate +
+                       " " + ModemConfig::frame_size_name(config_.frame_size) + ", keeping previous");
             }
         }
     }
@@ -1056,7 +1087,7 @@ public:
     int get_payload_size() const { return payload_size_; }
 
     struct DecoderStats {
-        int sync_count, preamble_errors, symbol_errors, crc_errors;
+        int sync_count, preamble_errors, symbol_errors, erased_symbols, crc_errors;
         float last_snr, last_ber, ber_ema;
     };
 
@@ -1065,6 +1096,7 @@ public:
             return {
                 mfsk_decoder_->stats_sync_count,
                 mfsk_decoder_->stats_preamble_errors,
+                0, // MFSK has no symbol errors stat
                 0, // MFSK has no symbol errors stat
                 mfsk_decoder_->stats_crc_errors,
                 mfsk_decoder_->get_last_snr(),
@@ -1076,6 +1108,7 @@ public:
             decoder_->stats_sync_count,
             decoder_->stats_preamble_errors,
             decoder_->stats_symbol_errors,
+            decoder_->stats_erased_symbols,
             decoder_->stats_crc_errors,
             decoder_->get_last_snr(),
             decoder_->get_last_ber(),
@@ -1147,12 +1180,12 @@ public:
 #endif
     }
 
-    // Compute oper_mode for a given short_frame setting using current modulation/code_rate
-    int compute_oper_mode(bool short_frame) const {
+    // Compute oper_mode for a given frame_size setting using current modulation/code_rate
+    int compute_oper_mode(int frame_size) const {
         return ModemConfig::encode_mode(
             config_.modulation.c_str(),
             config_.code_rate.c_str(),
-            short_frame
+            frame_size
         );
     }
 };
@@ -1191,8 +1224,13 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
             int idx = atoi(value);
             if (idx >= 0 && idx < N_RATE) config.code_rate = RATE_OPTS[idx];
         }
-        else if (!strcmp(key, "short_frame") && take(key)) config.short_frame = atoi(value) != 0;
+        else if (!strcmp(key, "short_frame") && take("frame_size")) config.frame_size = atoi(value) != 0 ? 0 : 1;
+        else if (!strcmp(key, "frame_size") && take(key)) {
+            int v = atoi(value);
+            if (v >= 0 && v <= 2) config.frame_size = v;
+        }
         else if (!strcmp(key, "center_freq") && take(key)) config.center_freq = atoi(value);
+        else if (!strcmp(key, "rx_filter_enabled") && take(key)) config.rx_filter_enabled = atoi(value) != 0;
         else if (!strcmp(key, "csma_enabled") && take(key)) config.csma_enabled = atoi(value) != 0;
         else if (!strcmp(key, "carrier_threshold_db") && take(key)) config.carrier_threshold_db = atof(value);
         else if (!strcmp(key, "slot_time_ms") && take(key)) config.slot_time_ms = atoi(value);
@@ -1239,6 +1277,8 @@ void print_help(const char* prog) {
               << "  -f, --freq FREQ         Center frequency in Hz (default: 1500)\n"
               << "  --short                 Use short frames\n"
               << "  --normal                Use normal frames (default)\n"
+              << "  --long                  Use long frames\n"
+              << "  --no-rxfilter           Disable RX bandpass in front of the OFDM decoder\n"
               << "\nPTT options:\n"
               << "  --ptt TYPE              PTT type: none, rigctl, vox, com"
 #ifdef WITH_CM108
@@ -1353,11 +1393,17 @@ int main(int argc, char** argv) {
             config.center_freq = std::atoi(argv[++i]);
             cli_set.insert("center_freq");
         } else if (arg == "--short") {
-            config.short_frame = true;
-            cli_set.insert("short_frame");
+            config.frame_size = 0;
+            cli_set.insert("frame_size");
         } else if (arg == "--normal") {
-            config.short_frame = false;
-            cli_set.insert("short_frame");
+            config.frame_size = 1;
+            cli_set.insert("frame_size");
+        } else if (arg == "--long") {
+            config.frame_size = 2;
+            cli_set.insert("frame_size");
+        } else if (arg == "--no-rxfilter") {
+            config.rx_filter_enabled = false;
+            cli_set.insert("rx_filter_enabled");
         } else if (arg == "--rigctl" && i + 1 < argc) {
             config.ptt_type = PTTType::RIGCTL;
             cli_set.insert("ptt_type");
@@ -1534,7 +1580,7 @@ int main(int argc, char** argv) {
                 config.center_freq = ui_state.center_freq;
                 config.modulation = MODULATION_OPTIONS[ui_state.modulation_index];
                 config.code_rate = CODE_RATE_OPTIONS[ui_state.code_rate_index];
-                config.short_frame = ui_state.short_frame;
+                config.frame_size = ui_state.frame_size;
                 config.csma_enabled = ui_state.csma_enabled;
                 config.carrier_threshold_db = ui_state.carrier_threshold_db;
                 config.slot_time_ms = ui_state.slot_time_ms;
@@ -1585,7 +1631,7 @@ int main(int argc, char** argv) {
                 ui_state.carrier_threshold_db = config.carrier_threshold_db;
                 ui_state.slot_time_ms = config.slot_time_ms;
                 ui_state.p_persistence = config.p_persistence;
-                ui_state.short_frame = config.short_frame;
+                ui_state.frame_size = config.frame_size;
                 ui_state.fragmentation_enabled = config.fragmentation_enabled;
                 ui_state.tx_blanking_enabled = config.tx_blanking_enabled;
                 // Audio devices
@@ -1742,6 +1788,7 @@ int main(int argc, char** argv) {
                 cJSON_AddNumberToObject(j, "sync_count", stats.sync_count);
                 cJSON_AddNumberToObject(j, "preamble_errors", stats.preamble_errors);
                 cJSON_AddNumberToObject(j, "symbol_errors", stats.symbol_errors);
+                cJSON_AddNumberToObject(j, "erased_symbols", stats.erased_symbols);
                 cJSON_AddNumberToObject(j, "crc_errors", stats.crc_errors);
                 cJSON_AddNumberToObject(j, "last_snr", stats.last_snr);
                 cJSON_AddNumberToObject(j, "last_ber", stats.last_ber);
@@ -1767,7 +1814,8 @@ int main(int argc, char** argv) {
                     cJSON_AddStringToObject(j, "modulation", cfg.modulation.c_str());
                 }
                 cJSON_AddStringToObject(j, "code_rate", cfg.code_rate.c_str());
-                cJSON_AddBoolToObject(j, "short_frame", cfg.short_frame);
+                cJSON_AddBoolToObject(j, "short_frame", cfg.frame_size == 0);
+                cJSON_AddNumberToObject(j, "frame_size", cfg.frame_size);
                 cJSON_AddNumberToObject(j, "center_freq", cfg.center_freq);
                 cJSON_AddNumberToObject(j, "payload_size", tnc.get_payload_size());
                 cJSON_AddBoolToObject(j, "csma_enabled", cfg.csma_enabled);
@@ -1795,7 +1843,10 @@ int main(int argc, char** argv) {
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "code_rate")) && cJSON_IsString(item))
                     new_config.code_rate = item->valuestring;
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "short_frame")) && cJSON_IsBool(item))
-                    new_config.short_frame = cJSON_IsTrue(item);
+                    new_config.frame_size = cJSON_IsTrue(item) ? 0 : 1;
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "frame_size")) && cJSON_IsNumber(item)
+                    && item->valueint >= 0 && item->valueint <= 2)
+                    new_config.frame_size = item->valueint;
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "center_freq")) && cJSON_IsNumber(item))
                     new_config.center_freq = item->valueint;
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "csma_enabled")) && cJSON_IsBool(item))
@@ -1820,7 +1871,7 @@ int main(int argc, char** argv) {
                     g_ui_state->modem_type_index = new_config.modem_type;
                     g_ui_state->mfsk_mode_index = new_config.mfsk_mode;
                     g_ui_state->center_freq = new_config.center_freq;
-                    g_ui_state->short_frame = new_config.short_frame;
+                    g_ui_state->frame_size = new_config.frame_size;
                     g_ui_state->csma_enabled = new_config.csma_enabled;
                     g_ui_state->carrier_threshold_db = new_config.carrier_threshold_db;
                     g_ui_state->p_persistence = new_config.p_persistence;
@@ -1872,7 +1923,7 @@ int main(int argc, char** argv) {
                 new_config.center_freq = state.center_freq;
                 new_config.modulation = MODULATION_OPTIONS[state.modulation_index];
                 new_config.code_rate = CODE_RATE_OPTIONS[state.code_rate_index];
-                new_config.short_frame = state.short_frame;
+                new_config.frame_size = state.frame_size;
                 new_config.csma_enabled = state.csma_enabled;
                 new_config.carrier_threshold_db = state.carrier_threshold_db;
                 new_config.p_persistence = state.p_persistence;

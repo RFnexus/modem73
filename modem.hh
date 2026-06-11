@@ -9,6 +9,13 @@
 
 #include "phy/common.hh"
 #include "schmidl_cox.hh"
+
+#ifndef CHAN_INTERP_ALPHA
+#define CHAN_INTERP_ALPHA 0.5
+#endif
+#ifndef PER_TONE_PRECISION
+#define PER_TONE_PRECISION 1
+#endif
 #include "bip_buffer.hh"
 #include "theil_sen.hh"
 #include "blockdc.hh"
@@ -81,8 +88,12 @@ struct ModemConfig {
         return acc;
     }
     
-  static int encode_mode(const char* modulation, const char* code_rate, bool short_frame) {
+    // frame_size: 0=short, 1=normal, 2=long (bit 7; doubles a normal frame)
+    static int encode_mode(const char* modulation, const char* code_rate, int frame_size) {
         int mode = 0;
+
+        if (frame_size < 0 || frame_size > 2)
+            return -1;
         
         if (!strcmp(modulation, "BPSK"))
             mode |= 0 << 4;
@@ -116,10 +127,21 @@ struct ModemConfig {
         else
             return -1;
         
-        if (!short_frame)
+        if (frame_size >= 1)
             mode |= 1;
-        
+        if (frame_size == 2) {
+            // TODO
+            //
+            if (((mode >> 4) & 7) >= 6)
+                return -1;
+            mode |= 128;
+        }
+
         return mode;
+    }
+
+    static const char* frame_size_name(int frame_size) {
+        return frame_size == 0 ? "short" : frame_size == 2 ? "long" : "normal";
     }
 };
 
@@ -423,6 +445,25 @@ public:
         init_mls0_seq();
         correlator_ptr = new SchmidlCox<value, cmplx, search_pos, symbol_len, guard_len>(fdom_mls);
         blockdc.samples(filter_len);
+        configure_frontend(1500, true);
+    }
+
+    void configure_frontend(int center_freq, bool enable_filter) {
+        bpf_enabled_ = enable_filter;
+        // signal spans center +-1200 Hz; +-150 Hz margin for mistuning
+        value f1 = std::max(100, center_freq - 1350);
+        value f2 = std::min(rate / 2 - 100, center_freq + 1350);
+        for (int i = 0; i < bpf_len; ++i) {
+            int k = i - bpf_len / 2;
+            value lp2 = k == 0 ? 2 * f2 / rate
+                : std::sin(2 * Const::Pi() * f2 * k / rate) / (Const::Pi() * k);
+            value lp1 = k == 0 ? 2 * f1 / rate
+                : std::sin(2 * Const::Pi() * f1 * k / rate) / (Const::Pi() * k);
+            value w = value(0.54) - value(0.46) * std::cos(2 * Const::Pi() * i / (bpf_len - 1));
+            bpf_taps_[i] = (lp2 - lp1) * w;
+        }
+        std::memset(bpf_hist_, 0, sizeof(bpf_hist_));
+        bpf_pos_ = 0;
     }
     
     ~ModemDecoder() {
@@ -467,8 +508,9 @@ public:
     // decode statistics
     int stats_sync_count = 0;      // corelator
     int stats_preamble_errors = 0; // preamble decoding failed
-    int stats_symbol_errors = 0;   // seed damage
+    int stats_symbol_errors = 0;   // erasure budget
     int stats_crc_errors = 0;      // polar CRC failed
+    int stats_erased_symbols = 0;  // symbols erased (seed damage), frame continued
 private:
     enum class State {
         SEARCHING,           // looking for preamble
@@ -499,6 +541,9 @@ private:
     int fwd_perm_table[bits_max];
     value index[tone_count], phase[tone_count];
     value snr[symbols_max];
+    bool erased_[symbols_max];
+    int erased_count_ = 0;
+    int max_erased_ = 0;
     value cfo_rad;
     int symbol_pos;
     value last_avg_snr_ = 0;
@@ -512,6 +557,26 @@ private:
     int k_ = 0;
     const cmplx* buf_ = nullptr;
     CODE::MLS* seq1_ptr = nullptr;
+
+    static const int bpf_len = 257;
+    value bpf_taps_[bpf_len];
+    value bpf_hist_[bpf_len];
+    int bpf_pos_ = 0;
+    bool bpf_enabled_ = true;
+
+    value bandpass(value x) {
+        bpf_hist_[bpf_pos_] = x;
+        value acc = 0;
+        int idx = bpf_pos_;
+        for (int i = 0; i < bpf_len; ++i) {
+            acc += bpf_taps_[i] * bpf_hist_[idx];
+            if (--idx < 0)
+                idx = bpf_len - 1;
+        }
+        if (++bpf_pos_ >= bpf_len)
+            bpf_pos_ = 0;
+        return acc;
+    }
     
     static int bin(int carrier) {
         return (carrier + symbol_len) % symbol_len;
@@ -636,6 +701,8 @@ private:
     }
     
     void process_sample(value sample, FrameCallback callback) {
+        if (bpf_enabled_)
+            sample = bandpass(sample);
         // Convert to complex via Hilbert transform
         cmplx tmp = hilbert(blockdc(sample));
         buf_ = input_hist(tmp);
@@ -848,8 +915,15 @@ private:
         
         // Reset for data collection
         k_ = 0;
-        snr[0] = 100;  
-        
+        snr[0] = 100;
+
+        // Erasure budget: 3/4 of the code's redundancy fraction, beyond which
+        // the polar decoder has no realistic chance and we resync instead.
+        std::memset(erased_, 0, sizeof(erased_));
+        erased_count_ = 0;
+        int code_len = 1 << code_order;
+        max_erased_ = (symbol_count * (code_len - data_bits - 32) * 3) / (code_len * 4);
+
         return true;
     }
     
@@ -903,8 +977,32 @@ private:
             seed[i] = clamp(std::nearbyint(127 * demod[i * block_length + seed_off].real()));
         int seed_value = hadamard_decoder(seed);
         if (seed_value < 0) {
-            std::cerr << "Decoder: Seed damaged at symbol " << j << std::endl;
-            return false;
+            if (++erased_count_ > max_erased_) {
+                std::cerr << "Decoder: Seed damaged at symbol " << j << ", erasure budget (" << max_erased_ << ") exhausted" << std::endl;
+                return false;
+            }
+            std::cerr << "Decoder: Seed damaged at symbol " << j << ", erasing symbol" << std::endl;
+            ++stats_erased_symbols;
+            erased_[j] = true;
+            snr[j] = 0;
+            saved_seed_off[j] = seed_off;
+            // Without the seed value the data tones cannot be descrambled and
+            // the pilots cannot key phase/channel updates: emit zero LLRs so
+            // the polar decoder treats this symbol as punctured, and leave
+            // chan untouched.
+            for (int i = 0; i < tone_count; ++i) {
+                if (i % block_length != seed_off) {
+                    int bits = mod_bits;
+                    if (mod_bits == 3 && k_ % 32 == 30) bits = 2;
+                    if (mod_bits == 6 && k_ % 64 == 60) bits = 4;
+                    if (mod_bits == 10 && k_ % 128 == 120) bits = 8;
+                    if (mod_bits == 12 && k_ % 128 == 120) bits = 8;
+                    for (int b = 0; b < bits; ++b)
+                        perm[k_ + b] = 0;
+                    k_ += bits;
+                }
+            }
+            return true;
         }
         
         hadamard_encoder(seed, seed_value);
@@ -924,13 +1022,35 @@ private:
         for (int i = 0; i < tone_count; ++i)
             chan[i] *= DSP::polar<value>(1, tse(i + tone_off_const));
         
+        if (value(CHAN_INTERP_ALPHA) > 0) {
+            const value alpha = value(CHAN_INTERP_ALPHA);
+            int last_pilot = seed_off + (seed_tones - 1) * block_length;
+            for (int i = 0; i < tone_count; ++i) {
+                cmplx fresh;
+                if (i <= seed_off) {
+                    fresh = tone[seed_off];
+                } else if (i >= last_pilot) {
+                    fresh = tone[last_pilot];
+                } else {
+                    int k = (i - seed_off) / block_length;
+                    int p = seed_off + k * block_length;
+                    value t = value(i - p) / value(block_length);
+                    fresh = DSP::lerp(tone[p], tone[p + block_length], t);
+                }
+                chan[i] = DSP::lerp(chan[i], fresh, alpha);
+            }
+            for (int i = 0; i < tone_count; ++i)
+                if (i % block_length != seed_off)
+                    demod[i] = demod_or_erase(tone[i], chan[i]);
+        }
+
         if (seed_value) {
             CODE::MLS seq(mls2_poly, seed_value);
             for (int i = 0; i < tone_count; ++i)
                 if (i % block_length != seed_off)
                     demod[i] *= nrz(seq());
         }
-        
+
         // Save demod for post-decode corrected SNR
         std::memcpy(&saved_demod[j * tone_count], demod, tone_count * sizeof(cmplx));
         saved_seed_off[j] = seed_off;
@@ -969,6 +1089,16 @@ private:
         std::cerr << "Decoder: Symbol " << j << " SNR = " << 10 * std::log10(snr[j]) << " dB, k=" << k_ << std::endl;
 
 
+        // Per-tone confidence: after equalization, noise on a tone scales
+        // as 1/|chan|^2, so tones in selective-fading notches must demap
+        // with proportionally less confidence than strong tones.
+        value chan_pwr_mean = 0;
+        if (PER_TONE_PRECISION) {
+            for (int i = 0; i < tone_count; ++i)
+                chan_pwr_mean += norm(chan[i]);
+            chan_pwr_mean /= tone_count;
+        }
+
         for (int i = 0; i < tone_count; ++i) {
             if (i % block_length != seed_off) {
                 int bits = mod_bits;
@@ -976,18 +1106,19 @@ private:
                 if (mod_bits == 6 && k_ % 64 == 60) bits = 4;
                 if (mod_bits == 10 && k_ % 128 == 120) bits = 8;
                 if (mod_bits == 12 && k_ % 128 == 120) bits = 8;
-                demap_soft(perm + k_, demod[i], precision, bits);
+                value prec = precision;
+                if (PER_TONE_PRECISION && chan_pwr_mean > 0)
+                    prec = std::min(precision * norm(chan[i]) / chan_pwr_mean, value(1023));
+                demap_soft(perm + k_, demod[i], prec, bits);
                 k_ += bits;
             }
         }
-        
 
+        // legacy pilot-only channel update 
+        if (value(CHAN_INTERP_ALPHA) <= 0)
+            for (int i = seed_off; i < tone_count; i += block_length)
+                chan[i] = DSP::lerp(chan[i], tone[i], value(0.5));
 
-        for (int i = seed_off; i < tone_count; i += block_length)
-            chan[i] = DSP::lerp(chan[i], tone[i], value(0.5));
-
-
-        
         return true;
     }
     
@@ -1038,25 +1169,14 @@ private:
         for (int i = 0; i < data_bytes; ++i)
             data[i] ^= scrambler();
 
-        // BER: re-encode decoded message and compare against received hard decisions
-        int code_len = 1 << code_order;
         for (int i = 0; i < data_bits + 32; ++i)
             ber_mesg[i] = (mesg[i].v[best] < 0) ? -1 : 1;
         ber_encoder(ber_code, ber_mesg, frozen_bits, code_order);
-        int bit_errors = 0;
-        for (int i = 0; i < code_len; ++i) {
-            if ((code[i] < 0) != (ber_code[i] < 0))
-                bit_errors++;
-        }
-        last_ber_ = value(bit_errors) / value(code_len);
-        if (ber_ema_ < 0)
-            ber_ema_ = last_ber_;
-        else
-            ber_ema_ = value(0.3) * last_ber_ + value(0.7) * ber_ema_;
 
-        // use known-correct codeword as referenc 
+        // use known-correct codeword as referenc
         build_fwd_perm(fwd_perm_table, code_order);
         value corr_sp = 0, corr_np = 0;
+        int bit_errors = 0, counted_bits = 0;
         int bk = 0;
         for (int sj = 1; sj <= symbol_count; ++sj) {
             int soff = saved_seed_off[sj];
@@ -1067,21 +1187,33 @@ private:
                     if (mod_bits == 6 && bk % 64 == 60) bits = 4;
                     if (mod_bits == 10 && bk % 128 == 120) bits = 8;
                     if (mod_bits == 12 && bk % 128 == 120) bits = 8;
-                    code_type ideal_bits[mod_max];
-                    for (int b = 0; b < bits; ++b)
-                        ideal_bits[b] = ber_code[fwd_perm_table[bk + b]];
-                    cmplx ideal = map_bits(ideal_bits, bits);
-                    cmplx error = saved_demod[sj * tone_count + i] - ideal;
-                    corr_sp += norm(ideal);
-                    corr_np += norm(error);
+                    if (!erased_[sj]) {
+                        code_type ideal_bits[mod_max];
+                        for (int b = 0; b < bits; ++b) {
+                            int ci = fwd_perm_table[bk + b];
+                            ideal_bits[b] = ber_code[ci];
+                            if ((code[ci] < 0) != (ber_code[ci] < 0))
+                                ++bit_errors;
+                        }
+                        counted_bits += bits;
+                        cmplx ideal = map_bits(ideal_bits, bits);
+                        cmplx error = saved_demod[sj * tone_count + i] - ideal;
+                        corr_sp += norm(ideal);
+                        corr_np += norm(error);
+                    }
                     bk += bits;
                 }
             }
         }
+        last_ber_ = counted_bits > 0 ? value(bit_errors) / value(counted_bits) : 0;
+        if (ber_ema_ < 0)
+            ber_ema_ = last_ber_;
+        else
+            ber_ema_ = value(0.3) * last_ber_ + value(0.7) * ber_ema_;
         if (corr_np > 0)
             last_avg_snr_ = 10 * std::log10(corr_sp / corr_np);
 
-        std::cerr << "Decoder: Frame decoded " << data_bytes << " bytes, SNR=" << last_avg_snr_ << " dB, BER=" << (last_ber_ * 100) << "%" << std::endl;
+        std::cerr << "Decoder: Frame decoded " << data_bytes << " bytes, SNR=" << last_avg_snr_ << " dB, BER=" << (last_ber_ * 100) << "%, erased symbols=" << erased_count_ << std::endl;
 
         callback(data, data_bytes);
     }

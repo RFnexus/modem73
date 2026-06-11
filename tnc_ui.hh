@@ -57,7 +57,7 @@ struct TNCUIState {
     int mfsk_mode_index = 1;   // 0=MFSK-8, 1=MFSK-16, 2=MFSK-32, 3=MFSK-32R
     int modulation_index = 1;  // default QPSK N 1/2
     int code_rate_index = 0;
-    bool short_frame = false;
+    int frame_size = 1;        // 0=short, 1=normal, 2=long
     int center_freq = 1500;
     
     bool csma_enabled = true;
@@ -126,7 +126,7 @@ struct TNCUIState {
         // OFDM modem
         int modulation_index;
         int code_rate_index;
-        bool short_frame;
+        int frame_size;        // 0=short, 1=normal, 2=long
         int center_freq;
         // CSMA
         bool csma_enabled;
@@ -165,6 +165,7 @@ struct TNCUIState {
     std::atomic<int> sync_count{0};
     std::atomic<int> preamble_errors{0};
     std::atomic<int> symbol_errors{0};
+    std::atomic<int> erased_symbols{0};
     std::atomic<int> crc_errors{0};
     std::atomic<bool> stats_reset_requested{false};
     
@@ -352,21 +353,49 @@ struct TNCUIState {
             {9600, 12800, 14400, 16000, 4800}, // QAM4096
         };
         
+        // Long frames double a normal frame
+        static const int payload_long[8][5] = {
+            {512, 684, 768, 852, 256},      // BPSK
+            {1024, 1368, 1536, 1704, 512},  // QPSK
+            {2048, 2736, 3072, 3408, 1024}, // 8PSK
+            {2048, 2736, 3072, 3408, 1024}, // QAM16
+            {4096, 5472, 6144, 6816, 2048}, // QAM64
+            {4096, 5472, 6144, 6816, 2048}, // QAM256
+            {0, 0, 0, 0, 0},                // QAM1024
+            {0, 0, 0, 0, 0},                // QAM4096
+        };
+
+        static const int bitrate_long[8][5] = {
+            {856, 1144, 1285, 1425, 428},     // BPSK
+            {1713, 2288, 2569, 2850, 856},    // QPSK
+            {2551, 3408, 3826, 4245, 1275},   // 8PSK
+            {3425, 4576, 5138, 5700, 1713},   // QAM16
+            {5101, 6815, 7652, 8489, 2551},   // QAM64
+            {6851, 9152, 10276, 11400, 3425}, // QAM256
+            {0, 0, 0, 0, 0},                  // QAM1024
+            {0, 0, 0, 0, 0},                  // QAM4096
+        };
+
         static const int duration_short[8] = {1500, 1000, 1900, 1000, 1900, 1500, 2200, 1900};
         static const int duration_normal[8] = {2600, 2600, 3400, 2600, 3400, 2600, 4000, 3400};
-        
+        static const int duration_long[8] = {4800, 4800, 6400, 4800, 6400, 4800, 0, 0};
+
         int mod = modulation_index;
         int rate = code_rate_index;
-        
-        if (mod < 0 || mod > 7) mod = 1;  
-        if (rate < 0 || rate > 4) rate = 0;  
-        
-        if (short_frame) {
-            mtu_bytes = payload_short[mod][rate] - 2; 
+
+        if (mod < 0 || mod > 7) mod = 1;
+        if (rate < 0 || rate > 4) rate = 0;
+
+        if (frame_size == 0) {
+            mtu_bytes = payload_short[mod][rate] - 2;
             bitrate_bps = bitrate_short[mod][rate];
             airtime_seconds = duration_short[mod] / 1000.0f;
+        } else if (frame_size == 2) {
+            mtu_bytes = payload_long[mod][rate] > 0 ? payload_long[mod][rate] - 2 : 0;
+            bitrate_bps = bitrate_long[mod][rate];
+            airtime_seconds = duration_long[mod] / 1000.0f;
         } else {
-            mtu_bytes = payload_normal[mod][rate] - 2;  
+            mtu_bytes = payload_normal[mod][rate] - 2;
             bitrate_bps = bitrate_normal[mod][rate];
             airtime_seconds = duration_normal[mod] / 1000.0f;
         }
@@ -449,7 +478,8 @@ struct TNCUIState {
         fprintf(f, "mfsk_mode=%d\n", mfsk_mode_index);
         fprintf(f, "modulation=%d\n", modulation_index);
         fprintf(f, "code_rate=%d\n", code_rate_index);
-        fprintf(f, "short_frame=%d\n", short_frame ? 1 : 0);
+        fprintf(f, "short_frame=%d\n", frame_size == 0 ? 1 : 0);
+        fprintf(f, "frame_size=%d\n", frame_size);
         fprintf(f, "center_freq=%d\n", center_freq);
         fprintf(f, "csma_enabled=%d\n", csma_enabled ? 1 : 0);
         fprintf(f, "carrier_threshold_db=%.1f\n", carrier_threshold_db);
@@ -500,7 +530,11 @@ struct TNCUIState {
                 else if (strcmp(key, "mfsk_mode") == 0) mfsk_mode_index = atoi(value);
                 else if (strcmp(key, "modulation") == 0) modulation_index = atoi(value);
                 else if (strcmp(key, "code_rate") == 0) code_rate_index = atoi(value);
-                else if (strcmp(key, "short_frame") == 0) short_frame = atoi(value) != 0;
+                else if (strcmp(key, "short_frame") == 0) frame_size = atoi(value) != 0 ? 0 : 1;
+                else if (strcmp(key, "frame_size") == 0) {
+                    int v = atoi(value);
+                    if (v >= 0 && v <= 2) frame_size = v;
+                }
                 else if (strcmp(key, "center_freq") == 0) center_freq = atoi(value);
                 else if (strcmp(key, "csma_enabled") == 0) csma_enabled = atoi(value) != 0;
                 else if (strcmp(key, "carrier_threshold_db") == 0) carrier_threshold_db = atof(value);
@@ -545,11 +579,12 @@ struct TNCUIState {
         fprintf(f, "# MODEM73 Presets \n");
         for (const auto& p : presets) {
             // name,mod,rate,sf,freq,csma,thresh,slot,persist,ptt,vox_freq,vox_lead,vox_tail,modem_type,mfsk_mode
+            // sf field keeps legacy semantics: 1=short, 0=normal, 2=long
             fprintf(f, "preset=%s,%d,%d,%d,%d,%d,%.1f,%d,%d,%d,%d,%d,%d,%d,%d\n",
                     p.name.c_str(),
                     p.modulation_index,
                     p.code_rate_index,
-                    p.short_frame ? 1 : 0,
+                    p.frame_size == 0 ? 1 : p.frame_size == 2 ? 2 : 0,
                     p.center_freq,
                     p.csma_enabled ? 1 : 0,
                     p.carrier_threshold_db,
@@ -597,7 +632,7 @@ struct TNCUIState {
                 p.name = name;
                 p.modulation_index = mod;
                 p.code_rate_index = rate;
-                p.short_frame = sf != 0;
+                p.frame_size = sf == 1 ? 0 : sf == 2 ? 2 : 1;
                 p.center_freq = freq;
                 p.csma_enabled = csma != 0;
                 p.carrier_threshold_db = thresh;
@@ -636,7 +671,7 @@ struct TNCUIState {
         p.mfsk_mode_index = mfsk_mode_index;
         p.modulation_index = modulation_index;
         p.code_rate_index = code_rate_index;
-        p.short_frame = short_frame;
+        p.frame_size = frame_size;
         p.center_freq = center_freq;
         p.csma_enabled = csma_enabled;
         p.carrier_threshold_db = carrier_threshold_db;
@@ -661,7 +696,7 @@ struct TNCUIState {
         mfsk_mode_index = p.mfsk_mode_index;
         modulation_index = p.modulation_index;
         code_rate_index = p.code_rate_index;
-        short_frame = p.short_frame;
+        frame_size = p.frame_size;
         center_freq = p.center_freq;
         csma_enabled = p.csma_enabled;
         carrier_threshold_db = p.carrier_threshold_db;
@@ -711,6 +746,37 @@ struct TNCUIState {
     std::vector<std::string> get_log() {
         std::lock_guard<std::mutex> lock(log_mutex);
         return std::vector<std::string>(log_entries.begin(), log_entries.end());
+    }
+
+    // "M73:<call>:<text>"
+    static constexpr size_t MAX_MESSAGE_CHARS = 150;
+    static constexpr size_t MAX_MESSAGES = 100;
+    struct TextMessage {
+        std::string time;
+        std::string from;
+        std::string text;
+        bool outgoing;
+    };
+    std::mutex messages_mutex;
+    std::deque<TextMessage> messages;
+    std::atomic<int> unread_messages{0};
+
+    void add_message(const std::string& from, const std::string& text, bool outgoing) {
+        auto now = std::chrono::system_clock::now();
+        auto time = std::chrono::system_clock::to_time_t(now);
+        std::stringstream ss;
+        ss << std::put_time(std::localtime(&time), "%H:%M:%S");
+        std::lock_guard<std::mutex> lock(messages_mutex);
+        messages.push_back({ss.str(), from, text, outgoing});
+        while (messages.size() > MAX_MESSAGES)
+            messages.pop_front();
+        if (!outgoing)
+            unread_messages++;
+    }
+
+    std::vector<TextMessage> get_messages() {
+        std::lock_guard<std::mutex> lock(messages_mutex);
+        return std::vector<TextMessage>(messages.begin(), messages.end());
     }
 };
 
@@ -848,7 +914,7 @@ private:
             case '\t':
                 current_tab_ = (current_tab_ + 1) % 5;
                 break;
-                
+
             case KEY_BTAB:  // shift tab prev
                 current_tab_ = (current_tab_ + 4) % 5;
                 break;
@@ -862,7 +928,7 @@ private:
                 } else if (current_tab_ == 2) {
                     if (log_scroll_ > 0) log_scroll_--;
                 } else if (current_tab_ == 3) {
-                    utils_selection_ = (utils_selection_ + 5) % 6;
+                    utils_selection_ = (utils_selection_ + 6) % 7;
                 }
                 break;
                 
@@ -875,7 +941,7 @@ private:
                 } else if (current_tab_ == 2) {
                     log_scroll_++;
                 } else if (current_tab_ == 3) {
-                    utils_selection_ = (utils_selection_ + 1) % 6;
+                    utils_selection_ = (utils_selection_ + 1) % 7;
                 }
                 break;
                 
@@ -990,14 +1056,14 @@ private:
                     }
 
                 } else if (current_tab_ == 3) {
-                    
+
 
                     handle_utils_action();
-                
+
 
                 }
                 break;
-            
+
             // Preset field
             case 's': //
                 if (current_tab_ == 1 && current_field_ == FIELD_PRESET) {
@@ -1072,6 +1138,16 @@ private:
                 if (current_tab_ == 3) {
 
                     utils_selection_ = 5;
+                    handle_utils_action();
+
+                }
+                break;
+
+            case '7':
+
+                if (current_tab_ == 3) {
+
+                    utils_selection_ = 6;
                     handle_utils_action();
 
                 }
@@ -1252,7 +1328,43 @@ private:
         noecho();
         curs_set(0);
     }
-    
+
+    void compose_message() {
+        int rows, cols;
+        getmaxyx(stdscr, rows, cols);
+        (void)cols;
+        curs_set(1);
+        echo();
+        nodelay(stdscr, FALSE);
+
+        move(rows - 3, 0);
+        clrtoeol();
+        attron(A_BOLD);
+        mvaddstr(rows - 3, 2, "Test msg> ");
+        attroff(A_BOLD);
+
+        char buf[TNCUIState::MAX_MESSAGE_CHARS + 1] = {0};
+        mvgetnstr(rows - 3, 12, buf, TNCUIState::MAX_MESSAGE_CHARS);
+
+        nodelay(stdscr, TRUE);
+        noecho();
+        curs_set(0);
+
+        std::string text(buf);
+        if (text.empty()) return;
+
+        std::string payload = "M73:" + state_.callsign + ":" + text;
+        if (!state_.fragmentation_enabled && (int)payload.size() > state_.mtu_bytes) {
+            state_.add_log("MSG too long for mode (" + std::to_string(payload.size()) +
+                           " > " + std::to_string(state_.mtu_bytes) + "B), enable fragmentation");
+            return;
+        }
+        if (state_.on_send_data) {
+            state_.on_send_data(std::vector<uint8_t>(payload.begin(), payload.end()));
+            state_.add_message(state_.callsign, text, true);
+        }
+    }
+
     bool should_skip_field(int field) {
         // Hide OFDM-only fields when in MFSK mode
         if (state_.modem_type_index == 1) {
@@ -1300,7 +1412,7 @@ private:
                 state_.code_rate_index = (state_.code_rate_index + delta + 5) % 5;
                 break;
             case FIELD_FRAMESIZE:
-                state_.short_frame = !state_.short_frame;
+                state_.frame_size = (state_.frame_size + delta + 3) % 3;
                 break;
             case FIELD_CSMA:
                 state_.csma_enabled = !state_.csma_enabled;
@@ -1692,7 +1804,7 @@ private:
             printw("  %s %s %s %dHz",
                    MODULATION_OPTIONS[state_.modulation_index].c_str(),
                    CODE_RATE_OPTIONS[state_.code_rate_index].c_str(),
-                   state_.short_frame ? "S" : "N",
+                   state_.frame_size == 0 ? "S" : state_.frame_size == 2 ? "L" : "N",
                    state_.center_freq);
         }
         
@@ -1723,21 +1835,30 @@ private:
         
 
         // Tabs
-        const char* tabs[] = {"STATUS", "CONFIG", "LOG", "UTILS", "SCOPE"};
+        char utils_tab[24];
+        int unread = state_.unread_messages.load();
+        if (unread > 0)
+            snprintf(utils_tab, sizeof(utils_tab), "UTILS(%d)", unread);
+        else
+
+            snprintf(utils_tab, sizeof(utils_tab), "UTILS");
+        const char* tabs[] = {"STATUS", "CONFIG", "LOG", utils_tab, "SCOPE"};
         int tab_width = (cols - 4) / 5;
-        
+
         for (int i = 0; i < 5; i++) {
             int tx = 2 + i * tab_width;
-            
+
             if (i == current_tab_) {
                 attron(A_BOLD);
                 mvaddch(2, tx, '>');
                 printw(" %s", tabs[i]);
                 attroff(A_BOLD);
             } else {
-                attron(A_DIM);
+                if (i == 3 && unread > 0) attron(COLOR_PAIR(4) | A_BOLD);
+                else attron(A_DIM);
                 mvprintw(2, tx, "  %s", tabs[i]);
-                attroff(A_DIM);
+                if (i == 3 && unread > 0) attroff(COLOR_PAIR(4) | A_BOLD);
+                else attroff(A_DIM);
             }
         }
         
@@ -1771,7 +1892,7 @@ private:
         } else if (current_tab_ == 2) {
             mvaddstr(rows - 1, 2, " ^/v scroll  PgUp/Dn page  F1 help  Q quit ");
         } else if (current_tab_ == 3) {
-            mvaddstr(rows - 1, 2, " 1-6 select  Enter run  F1 help  Q quit ");
+            mvaddstr(rows - 1, 2, " 1-7 select  Enter run  F1 help  Q quit ");
         } else if (current_tab_ == 4) {
             mvaddstr(rows - 1, 2, " Tab switch  F1 help  Q quit ");
         } else {
@@ -2358,7 +2479,7 @@ private:
 
             dy = visible_y(row);
             if (dy >= 0) draw_selector_field(dy, c1, c2, "Frame Size", FIELD_FRAMESIZE,
-                               state_.short_frame ? "SHORT" : "NORMAL");
+                               state_.frame_size == 0 ? "SHORT" : state_.frame_size == 2 ? "LONG" : "NORMAL");
             row++;
         } else {
             // MFSK field
@@ -2778,10 +2899,10 @@ private:
             attroff(A_DIM);
             y++;
             
-            mvprintw(y, c3, "%s %s %s", 
+            mvprintw(y, c3, "%s %s %s",
                      MODULATION_OPTIONS[p.modulation_index].c_str(),
                      CODE_RATE_OPTIONS[p.code_rate_index].c_str(),
-                     p.short_frame ? "S" : "N");
+                     p.frame_size == 0 ? "S" : p.frame_size == 2 ? "L" : "N");
             y++;
             
             mvaddstr(y, c3, "PTT ");
@@ -2946,7 +3067,13 @@ private:
         if (sym_err > 0) attron(COLOR_PAIR(2));
         printw(" %d", sym_err);
         if (sym_err > 0) attroff(COLOR_PAIR(2));
-        
+
+        int erased = state_.erased_symbols.load();
+        addstr("  Erased");
+        if (erased > 0) attron(COLOR_PAIR(3));
+        printw(" %d", erased);
+        if (erased > 0) attroff(COLOR_PAIR(3));
+
         addstr("  Pre Err");
         if (pre_err > 0) attron(COLOR_PAIR(2));
         printw(" %d", pre_err);
@@ -3283,10 +3410,11 @@ private:
             "Send Ping",
             "Clear Stats",
             "Auto Threshold",
-            "Reconnect Audio"
+            "Reconnect Audio",
+            "Compose Message"
         };
-        
-        for (int i = 0; i < 6; i++) {
+
+        for (int i = 0; i < 7; i++) {
             bool sel = (utils_selection_ == i);
             if (sel) {
                 attron(A_BOLD);
@@ -3360,7 +3488,41 @@ private:
         attroff(A_DIM);
         mvprintw(y, c1 + 14, "%d", state_.tx_frame_count.load());
         y++;
-        
+
+        y++;
+        state_.unread_messages = 0;
+        attron(COLOR_PAIR(4) | A_BOLD);
+        mvaddstr(y, c1, "[ MESSAGES ]");
+        attroff(COLOR_PAIR(4) | A_BOLD);
+        y++;
+        attron(A_DIM);
+        mvaddstr(y, c1, "Use this for testing only");
+        y++;
+        mvaddstr(y, c1, "U");
+        attroff(A_DIM);
+        y++;
+        {
+            auto msgs = state_.get_messages();
+            int width = cols / 2 - c1 - 2;
+            if (width < 20) width = 20;
+            int show = std::min((int)msgs.size(), 4);
+            if (msgs.empty()) {
+                attron(A_DIM);
+                mvaddstr(y, c1, "(no messages)");
+                attroff(A_DIM);
+                y++;
+            }
+            for (int i = (int)msgs.size() - show; i < (int)msgs.size(); i++) {
+                const auto& m = msgs[i];
+                std::string line = m.time + " " + (m.outgoing ? "-> " : "<- ") + m.from + ": " + m.text;
+                int pair = m.outgoing ? 2 : 1;
+                attron(COLOR_PAIR(pair));
+                mvaddnstr(y, c1, line.c_str(), width);
+                attroff(COLOR_PAIR(pair));
+                y++;
+            }
+        }
+
         int ry = 4;
         attron(COLOR_PAIR(4) | A_BOLD);
         mvaddstr(ry, c2, "[ RECENT ACTIVITY ]");
@@ -3452,6 +3614,7 @@ private:
                 state_.sync_count = 0;
                 state_.preamble_errors = 0;
                 state_.symbol_errors = 0;
+                state_.erased_symbols = 0;
                 state_.crc_errors = 0;
                 state_.stats_reset_requested = true;
                 state_.total_tx_time = 0;
@@ -3479,6 +3642,10 @@ private:
                         state_.add_log("Audio reconnect FAILED");
                     }
                 }
+                break;
+            }
+            case 6: {
+                compose_message();
                 break;
             }
         }

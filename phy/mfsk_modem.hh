@@ -128,7 +128,8 @@ inline int bit_reverse(int x, int bits) {
     return result;
 }
 
-inline float goertzel_mag2(const float* samples, int N, int bin) {
+// bin may be fractional: the Goertzel recurrence works for any real frequency
+inline float goertzel_mag2(const float* samples, int N, float bin) {
     float w = 2.0f * (float)M_PI * bin / N;
     float coeff = 2.0f * cosf(w);
     float s1 = 0.0f, s2 = 0.0f;
@@ -212,9 +213,11 @@ public:
     }
 
     std::vector<uint8_t> finish(int data_bits) {
+        // tail bits terminate the trellis at state 0
         int best = 0;
-        for (int s = 1; s < STATES; s++)
-            if (metric_[s] > metric_[best]) best = s;
+        if (metric_[0] < -1e29f)
+            for (int s = 1; s < STATES; s++)
+                if (metric_[s] > metric_[best]) best = s;
         std::vector<int> bits(len_);
         int state = best;
         for (int t = len_ - 1; t >= 0; t--) {
@@ -236,16 +239,18 @@ private:
 
 inline void soft_demap(const float* energies, int n_tones, int bps, float* soft_bits) {
     for (int j = 0; j < bps; j++) {
-        float e0 = 0, e1 = 0;
+        float m0 = 0, m1 = 0;
         int bit_pos = bps - 1 - j;
         for (int t = 0; t < n_tones; t++) {
             int sym_val = gray_decode(t);
-            if ((sym_val >> bit_pos) & 1)
-                e1 += energies[t];
-            else
-                e0 += energies[t];
+            float e = energies[t];
+            if ((sym_val >> bit_pos) & 1) {
+                if (e > m1) m1 = e;
+            } else {
+                if (e > m0) m0 = e;
+            }
         }
-        soft_bits[j] = (e0 - e1) / (e0 + e1 + 1e-20f);
+        soft_bits[j] = (m0 - m1) / (m0 + m1 + 1e-20f);
     }
 }
 
@@ -301,7 +306,8 @@ inline std::vector<int> bits_to_gray_symbols(const std::vector<int>& bits, int b
 class MFSKEncoder {
 public:
     std::vector<float> encode(const uint8_t* data, size_t len,
-                              int center_freq, MFSKMode mode) {
+                              int center_freq, MFSKMode mode,
+                              float freq_shift_hz = 0.0f) {
         using namespace mfsk_detail;
 
         int n_tones = MFSKParams::num_tones(mode);
@@ -337,7 +343,7 @@ public:
         frame_tones.push_back(3 * n_tones / 4);
         frame_tones.insert(frame_tones.end(), symbols.begin(), symbols.end());
 
-        return generate_audio(frame_tones, base);
+        return generate_audio(frame_tones, base, freq_shift_hz);
     }
 
     int get_payload_size(MFSKMode mode) {
@@ -347,7 +353,8 @@ public:
 private:
     float phase_ = 0.0f;
 
-    std::vector<float> generate_audio(const std::vector<int>& tones, int base_bin) {
+    std::vector<float> generate_audio(const std::vector<int>& tones, int base_bin,
+                                      float freq_shift_hz = 0.0f) {
         const int N = MFSKParams::SYMBOL_LEN;
         const int G = MFSKParams::GUARD_SAMPLES;
         const float amp = 0.8f;
@@ -355,18 +362,18 @@ private:
         audio.reserve(tones.size() * N);
         phase_ = 0.0f;
         for (int tone : tones) {
-            float freq = (base_bin + tone) * MFSKParams::TONE_SPACING;
+            float freq = (base_bin + tone) * MFSKParams::TONE_SPACING + freq_shift_hz;
             float phase_inc = 2.0f * (float)M_PI * freq / MFSKParams::SAMPLE_RATE;
             for (int i = 0; i < N; i++) {
-                float env = 1.0f;
-                if (i < G)
-                    env = 0.5f * (1.0f - cosf((float)M_PI * i / G));
-                else if (i >= N - G)
-                    env = 0.5f * (1.0f + cosf((float)M_PI * (i - N + G) / G));
-                audio.push_back(amp * env * sinf(phase_));
+                audio.push_back(amp * sinf(phase_));
                 phase_ += phase_inc;
             }
             phase_ = fmodf(phase_, 2.0f * (float)M_PI);
+        }
+        for (int i = 0; i < G && i < (int)audio.size(); i++) {
+            float w = 0.5f * (1.0f - cosf((float)M_PI * i / G));
+            audio[i] *= w;
+            audio[audio.size() - 1 - i] *= w;
         }
         return audio;
     }
@@ -411,28 +418,41 @@ public:
 
                 if (trackers_[p].tstate == TState::READY) {
                     ++stats_sync_count;
-
+                    const float* w1 = buf_pos_ >= (size_t)MFSKParams::SYMBOL_LEN
+                                      ? window - MFSKParams::SYMBOL_LEN : nullptr;
+                    auto sync_energy = [&](float foff) {
+                        float e = mfsk_detail::goertzel_mag2(window, MFSKParams::SYMBOL_LEN,
+                                    base_bin_ + foff + sync3_tone_);
+                        if (w1)
+                            e += mfsk_detail::goertzel_mag2(w1, MFSKParams::SYMBOL_LEN,
+                                    base_bin_ + foff + sync1_tone_);
+                        return e;
+                    };
                     freq_offset_ = 0;
                     float best_afc_e = 0;
                     for (int foff = -3; foff <= 3; foff++) {
-                        float e = mfsk_detail::goertzel_mag2(window, MFSKParams::SYMBOL_LEN,
-                                    base_bin_ + foff + sync3_tone_);
+                        float e = sync_energy((float)foff);
                         if (e > best_afc_e) {
                             best_afc_e = e;
-                            freq_offset_ = foff;
+                            freq_offset_ = (float)foff;
                         }
                     }
 
                     int best_off = 0;
                     float best_e = 0;
-                    int sync_bin = base_bin_ + freq_offset_ + sync3_tone_;
-                    int half_step = MFSKParams::SEARCH_STEP / 2;
-                    for (int off = -half_step; off <= half_step; off += 16) {
+                    float sync3_bin = base_bin_ + freq_offset_ + sync3_tone_;
+                    float sync1_bin = base_bin_ + freq_offset_ + sync1_tone_;
+                    int range = MFSKParams::SYMBOL_LEN * 5 / 8;
+                    for (int off = -range; off <= range; off += 16) {
                         int64_t pos = (int64_t)buf_pos_ + off;
-                        if (pos < 0 || pos + MFSKParams::SYMBOL_LEN > (int64_t)buf_.size())
+                        if (pos < MFSKParams::SYMBOL_LEN ||
+                            pos + MFSKParams::SYMBOL_LEN > (int64_t)buf_.size())
                             continue;
                         float e = mfsk_detail::goertzel_mag2(
-                            buf_.data() + pos, MFSKParams::SYMBOL_LEN, sync_bin);
+                                      buf_.data() + pos, MFSKParams::SYMBOL_LEN, sync3_bin)
+                                + mfsk_detail::goertzel_mag2(
+                                      buf_.data() + pos - MFSKParams::SYMBOL_LEN,
+                                      MFSKParams::SYMBOL_LEN, sync1_bin);
                         if (e > best_e) {
                             best_e = e;
                             best_off = off;
@@ -443,9 +463,39 @@ public:
                     else
                         buf_pos_ -= (size_t)(-best_off);
 
+                    // Fractional AFC refinement AFTER timing alignment: a
+                    // window straddling two symbols smears the tone and
+                    // shifts the sub-bin peak, so it must run on the
+                    // aligned window.
+                    {
+                        const float* wa = buf_.data() + buf_pos_;
+                        const float* w1a = buf_pos_ >= (size_t)MFSKParams::SYMBOL_LEN
+                                           ? wa - MFSKParams::SYMBOL_LEN : nullptr;
+                        auto aligned_energy = [&](float foff) {
+                            float e = mfsk_detail::goertzel_mag2(wa, MFSKParams::SYMBOL_LEN,
+                                        base_bin_ + foff + sync3_tone_);
+                            if (w1a)
+                                e += mfsk_detail::goertzel_mag2(w1a, MFSKParams::SYMBOL_LEN,
+                                        base_bin_ + foff + sync1_tone_);
+                            return e;
+                        };
+                        float coarse = freq_offset_;
+                        float best_fe = aligned_energy(coarse);
+                        for (float foff = coarse - 1.0f; foff <= coarse + 1.0f; foff += 0.125f) {
+                            float e = aligned_energy(foff);
+                            if (e > best_fe) {
+                                best_fe = e;
+                                freq_offset_ = foff;
+                            }
+                        }
+                    }
+
+                    sync_freq_offset_ = freq_offset_;
+
                     std::cerr << "MFSK: Sync (phase " << p
                               << " t=" << best_off
-                              << " f=" << freq_offset_ << ")" << std::endl;
+                              << " f=" << freq_offset_
+                              << " pos=" << buf_pos_ << ")" << std::endl;
 
                     buf_pos_ += MFSKParams::SYMBOL_LEN;
                     state_ = State::COLLECTING;
@@ -488,6 +538,42 @@ public:
                         else buf_pos_ -= (size_t)(-best_adj);
                         window = buf_.data() + buf_pos_;
                     }
+
+                    // Frequency drift nudge: accumulate +-1/8-bin evidence
+                    // over recent confident symbols (strong dominant tone)
+                    // and move only on consistent improvement, clamped to
+                    // +-1 bin around the sync estimate. Single-symbol
+                    // decisions random-walk at low SNR.
+                    {
+                        float em = 0, e0 = 0, ep = 0;
+                        int back = collect_count_ < 4 ? collect_count_ : 4;
+                        for (int k = 1; k <= back; k++) {
+                            if (buf_pos_ < (size_t)k * MFSKParams::SYMBOL_LEN)
+                                break;
+                            const auto& en_vec = collected_[collect_count_ - k];
+                            int best_t = 0;
+                            float best_te = 0, mean = 0;
+                            for (int t = 0; t < n_tones_; t++) {
+                                mean += en_vec[t];
+                                if (en_vec[t] > best_te) { best_te = en_vec[t]; best_t = t; }
+                            }
+                            mean /= n_tones_;
+                            if (best_te < 4.0f * mean)
+                                continue;
+                            const float* w = buf_.data() + buf_pos_ - (size_t)k * MFSKParams::SYMBOL_LEN;
+                            e0 += best_te;
+                            em += mfsk_detail::goertzel_mag2(w, MFSKParams::SYMBOL_LEN,
+                                    base_bin_ + freq_offset_ - 0.125f + best_t);
+                            ep += mfsk_detail::goertzel_mag2(w, MFSKParams::SYMBOL_LEN,
+                                    base_bin_ + freq_offset_ + 0.125f + best_t);
+                        }
+                        if (e0 > 0) {
+                            if (em > e0 * 1.1f && em > ep && freq_offset_ - sync_freq_offset_ > -1.0f)
+                                freq_offset_ -= 0.125f;
+                            else if (ep > e0 * 1.1f && freq_offset_ - sync_freq_offset_ < 1.0f)
+                                freq_offset_ += 0.125f;
+                        }
+                    }
                 }
 
                 std::vector<float> energies(n_tones_);
@@ -501,8 +587,13 @@ public:
                 if (collect_count_ >= MFSKParams::DATA_SYMBOLS) {
                     bool decoded = try_decode_auto(callback);
                     if (!decoded) {
-                        for (int retry_off : {8, -8, 16, -16}) {
-                            if (recompute_with_offset(retry_off) && try_decode_auto(callback)) {
+                        struct Retry { int t; float f; };
+                        static const Retry retries[] = {
+                            {8, 0}, {-8, 0}, {16, 0}, {-16, 0},
+                            {0, -0.5f}, {0, 0.5f}, {0, -1.0f}, {0, 1.0f},
+                        };
+                        for (const auto& r : retries) {
+                            if (recompute_with_offset(r.t, r.f) && try_decode_auto(callback)) {
                                 decoded = true;
                                 break;
                             }
@@ -556,7 +647,8 @@ private:
     int n_tones_ = 16;
     int bps_ = 4;
     int base_bin_ = 40;
-    int freq_offset_ = 0;
+    float freq_offset_ = 0;
+    float sync_freq_offset_ = 0;
     int sync1_tone_ = 4;
     int sync3_tone_ = 12;
 
@@ -576,11 +668,11 @@ private:
     float ber_ema_ = -1;
 
     enum class TState { PREAMBLE, SYNC1, SYNC2, READY };
-    struct Tracker { TState tstate = TState::PREAMBLE; int count = 0; int last_tone = -1; };
+    struct Tracker { TState tstate = TState::PREAMBLE; int count = 0; int last_tone = -1; int misses = 0; };
     Tracker trackers_[4];
 
     void reset_trackers() {
-        for (auto& t : trackers_) { t.tstate = TState::PREAMBLE; t.count = 0; t.last_tone = -1; }
+        for (auto& t : trackers_) { t.tstate = TState::PREAMBLE; t.count = 0; t.last_tone = -1; t.misses = 0; }
     }
 
 
@@ -596,16 +688,26 @@ private:
             bool low_dom  = (e0 / total > 0.4f);
             bool high_dom = (en / total > 0.4f);
             if (low_dom && !high_dom) {
+                if (t.last_tone != 1) t.misses = 0;
                 t.count = (t.last_tone == 1) ? t.count + 1 : 1;
                 t.last_tone = 0;
             } else if (high_dom && !low_dom) {
+                if (t.last_tone != 0) t.misses = 0;
                 t.count = (t.last_tone == 0) ? t.count + 1 : 1;
                 t.last_tone = 1;
+            } else if (t.count > 0 && t.misses == 0) {
+                // forgive ONE flutter-damaged symbol per preamble run;
+                // assume the alternation continued
+                t.misses = 1;
+                t.count++;
+                t.last_tone ^= 1;
             } else {
-                t.count = 0; t.last_tone = -1;
+                t.count = 0; t.last_tone = -1; t.misses = 0;
             }
-            if (t.count >= MFSKParams::PREAMBLE_SYMBOLS)
+            if (t.count >= MFSKParams::PREAMBLE_SYMBOLS) {
                 t.tstate = TState::SYNC1;
+                t.misses = 0;
+            }
             break;
         }
         case TState::SYNC1:
@@ -614,15 +716,19 @@ private:
             } else {
                 bool low_dom  = (e0 / total > 0.4f);
                 bool high_dom = (en / total > 0.4f);
-                if ((low_dom && t.last_tone == 1) || (high_dom && t.last_tone == 0))
+                if ((low_dom && t.last_tone == 1) || (high_dom && t.last_tone == 0)) {
                     t.last_tone = low_dom ? 0 : 1;
-                else { ++stats_preamble_errors; t.tstate = TState::PREAMBLE; t.count = 0; t.last_tone = -1; }
+                    t.misses = 0;
+                } else if (t.misses == 0) {
+                    t.misses = 1;
+                    t.last_tone ^= 1;
+                } else { ++stats_preamble_errors; t.tstate = TState::PREAMBLE; t.count = 0; t.last_tone = -1; t.misses = 0; }
             }
             break;
         case TState::SYNC2:
             if (eq3 / total > 0.25f)
                 t.tstate = TState::READY;
-            else { ++stats_preamble_errors; t.tstate = TState::PREAMBLE; t.count = 0; t.last_tone = -1; }
+            else { ++stats_preamble_errors; t.tstate = TState::PREAMBLE; t.count = 0; t.last_tone = -1; t.misses = 0; }
             break;
         case TState::READY:
             break;
@@ -638,7 +744,7 @@ private:
         return false;
     }
 
-    bool recompute_with_offset(int offset) {
+    bool recompute_with_offset(int offset, float freq_adj = 0.0f) {
         collected_.clear();
         collected_.reserve(MFSKParams::DATA_SYMBOLS);
         int64_t pos = (int64_t)collect_start_pos_ + offset;
@@ -649,7 +755,8 @@ private:
             const float* w = buf_.data() + pos;
             std::vector<float> energies(n_tones_);
             for (int t = 0; t < n_tones_; t++)
-                energies[t] = mfsk_detail::goertzel_mag2(w, MFSKParams::SYMBOL_LEN, base_bin_ + freq_offset_ + t);
+                energies[t] = mfsk_detail::goertzel_mag2(w, MFSKParams::SYMBOL_LEN,
+                                base_bin_ + freq_offset_ + freq_adj + t);
             collected_.push_back(std::move(energies));
             pos += MFSKParams::SYMBOL_LEN;
         }
@@ -704,6 +811,25 @@ private:
             re_coded = puncture_34(re_coded);
         int re_capacity = MFSKParams::DATA_SYMBOLS * bps_;
         while ((int)re_coded.size() < re_capacity) re_coded.push_back(0);
+
+
+
+
+
+
+        int bit_errors = 0;
+        for (int i = 0; i < total_soft; i++)
+            if ((soft_wire[i] < 0) != (re_coded[i] != 0))
+                bit_errors++;
+        float ber = (float)bit_errors / total_soft;
+        if (ber > 0.2f) return false;
+        last_ber_ = ber;
+        if (ber_ema_ < 0)
+            ber_ema_ = ber;
+        else
+            ber_ema_ = 0.3f * ber + 0.7f * ber_ema_;
+
+
         auto expected_tones = bits_to_gray_symbols(re_coded, bps_);
         expected_tones.resize(MFSKParams::DATA_SYMBOLS, 0);
 
