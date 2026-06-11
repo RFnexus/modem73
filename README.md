@@ -56,31 +56,20 @@ sudo apt install libhidapi-dev
 
 
 ```
-# Requires DSP, code, and modem libraries 
-git clone https://github.com/aicodix/dsp.git
-git clone https://github.com/aicodix/code.git
-git clone https://github.com/aicodix/modem.git
-
 # Clone modem73
+
 git clone https://github.com/RFnexus/modem73
 
-# Your folders should look like this:
-#.../
-#├── dsp/           # DSP library (aicodix)
-#│   └── ...
-#├── code/          # Code library (aicodix)
-#│   └── ...
-#├── modem/         # Modem library (aicodix)
-#│   └── ...
-#└── modem73/       # modem73 src
-#    └── ...
-
 # Build
+
 cd modem73
-make AICODIX_DSP=../dsp AICODIX_CODE=../code MODEM_SRC=../modem
+make 
+
 # Optional: move to /usr/local/bin 
 sudo make install 
 ```
+
+and run `./modem73`
 
 ## Running & Operations
 

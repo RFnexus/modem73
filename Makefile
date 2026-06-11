@@ -4,9 +4,9 @@ CXXFLAGS = -std=c++17 -O3 -march=native -Wall -Wextra
 LDFLAGS = -lpthread  -ltinfo -lncurses -ldl -lm
 
 # dependencies
-AICODIX_DSP ?= ../dsp
-AICODIX_CODE ?= ../code
-MODEM_SRC ?= ../modem
+AICODIX_DSP ?= deps/aicodix/dsp
+AICODIX_CODE ?= deps/aicodix/code
+MODEM_SRC ?= deps/aicodix/modem
 
 INCLUDES = -I$(AICODIX_DSP) -I$(AICODIX_CODE) -I$(MODEM_SRC)
 
@@ -88,15 +88,15 @@ help:
 	@echo "  debug    - Build with debug symbols"
 	@echo ""
 	@echo "Variables:"
-	@echo "  AICODIX_DSP  - Path to aicodix/dsp (default: ../dsp)"
-	@echo "  AICODIX_CODE - Path to aicodix/code (default: ../code)"
-	@echo "  MODEM_SRC    - Path to modem source (default: ../modem)"
+	@echo "  AICODIX_DSP  - Path to aicodix/dsp (default: deps/aicodix/dsp)"
+	@echo "  AICODIX_CODE - Path to aicodix/code (default: deps/aicodix/code)"
+	@echo "  MODEM_SRC    - Path to modem source (default: deps/aicodix/modem)"
 	@echo ""
 	@echo "Optional features:"
 	@echo "  CM108 PTT    - Requires libhidapi-dev (auto-detected)"
 	@echo ""
 	@echo "Example:"
-	@echo "  make AICODIX_DSP=~/aicodix/dsp AICODIX_CODE=~/aicodix/code"
+	@echo "  make AICODIX_DSP=../dsp AICODIX_CODE=../code MODEM_SRC=../modem"
 	@echo ""
 	@echo "Runtime options:"
 	@echo "  ./modem73            # Run with UI"

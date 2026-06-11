@@ -33,21 +33,13 @@ sudo apt install -y $PACKAGES
 
 cd "$PARENT_DIR"
 
-for repo in dsp code modem; do
-    if [ -d "$repo" ]; then
-        echo "$repo/ already exists, skipping clone."
-    else
-        git clone "https://github.com/aicodix/${repo}.git"
-    fi
-done
-
 if [ ! -d "modem73" ]; then
     git clone "https://github.com/RFnexus/modem73.git"
 fi
 
 cd modem73
 make clean 2>/dev/null || true
-make -j"$(nproc)" AICODIX_DSP=../dsp AICODIX_CODE=../code MODEM_SRC=../modem
+make -j"$(nproc)"
 
 echo ""
 echo "Build complete."
