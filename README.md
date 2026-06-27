@@ -18,9 +18,12 @@ MODEM73 is a [KISS](https://en.wikipedia.org/wiki/KISS_(amateur_radio_protocol))
 
 ## Installation
 
+Want to try out a demo of modem73 directly from your browser? Try it out here:
+https://rfnexus.github.io/modem73-wasm-demo/
+Hit "Start microphone" to begin decoding
 
 ### Windows?
-Windows fork by SP5LOT https://github.com/SP5LOT/modem73 (out of date)
+Eventually
 
 ## Building from source
 
