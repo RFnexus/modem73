@@ -7,8 +7,8 @@
   </picture>
 </p>
 
-MODEM73 is a [KISS](https://en.wikipedia.org/wiki/KISS_(amateur_radio_protocol)) frontend for the [aicodix](https://github.com/aicodix/modem) OFDM modem that works with any HF/VHF/UHF radio capable of working with 2400 Hz of bandwidth
 
+MODEM73 is an open source software modem that works with any HF, VHF, or UHF radio capable of 2400 Hz of bandwidth. All you need is a sound card and audio cable for your radio.  
 
 ![Screenshot](https://i.ibb.co/4ZhhvcQs/Peek-2026-01-01-10-41.gif)
 <p>
@@ -16,14 +16,29 @@ MODEM73 is a [KISS](https://en.wikipedia.org/wiki/KISS_(amateur_radio_protocol))
 <img width="276.5" height="199" alt="image" src="https://github.com/user-attachments/assets/5ac2a8bd-75a1-48a4-8264-74a851a06767" />
 </p>
 
+
+
+SSB, AM, and FM are all supported. It's plug and play compatible with any KISS application and works with rigctl, CM108 sound devices, and serial PTT out of the box.
+
+There are three modem families each suited for covering any possible RF setup from clean line of sight FM links to poor HF band conditions. The receiver decodes all of them at the same time, so one station can hear anything another station sends without switching modes.
+
+**OFDM**, based on the open source [COFDMTV modem](https://github.com/aicodix/modem) developed by Ahmet Inan / [aicodix GmbH](https://www.aicodix.de/). Modulations from BPSK to QAM4096 with code rates from 1/4 to 5/6 and payloads from 256 to 6144 bytes per frame. Rates run from about 790 bits per second to over 13 kilobits per second in the same 2400 Hz. 
+
+**ROBUST**, a set of slow modes built for fading HF paths such as 40 and 80 meter NVIS.  Five modes from 1150 bps down to 149 bps in either 2400 Hz or a 600 Hz narrow variant
+
+**MFSK**, a non-coherent mode for weak signal propagation and backup links. 
+
+### Features
+
+- KISS over TCP so it works with anything that speaks KISS: APRS clients, HamIRC, packet BBS software, Reticulum, custom applications
+- JSON control port API for status and configuration for writing your own progra,ms
+- lightweight UI that runs straight from the terminal and headless mode for embedded use 
+
 ## Installation
 
 Want to try out a demo of modem73 directly from your browser? Try it out here:
 https://rfnexus.github.io/modem73-wasm-demo/
 Hit "Start microphone" to begin decoding
-
-### Windows?
-Eventually
 
 ## Building from source
 
