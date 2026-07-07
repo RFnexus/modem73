@@ -400,7 +400,8 @@ public:
     void process(const float* samples, size_t count, FrameCallback callback) {
         buf_.insert(buf_.end(), samples, samples + count);
 
-        while (true) {
+        bool stall = false;
+        while (!stall) {
             if (buf_.size() - buf_pos_ < (size_t)MFSKParams::SYMBOL_LEN)
                 break;
 
@@ -408,56 +409,80 @@ public:
 
             switch (state_) {
             case State::SEARCHING: {
-                float e0  = mfsk_detail::goertzel_mag2(window, MFSKParams::SYMBOL_LEN, base_bin_);
-                float en  = mfsk_detail::goertzel_mag2(window, MFSKParams::SYMBOL_LEN, base_bin_ + n_tones_ - 1);
-                float eq1 = mfsk_detail::goertzel_mag2(window, MFSKParams::SYMBOL_LEN, base_bin_ + sync1_tone_);
-                float eq3 = mfsk_detail::goertzel_mag2(window, MFSKParams::SYMBOL_LEN, base_bin_ + sync3_tone_);
+                const int range_back = MFSKParams::SYMBOL_LEN * 5 / 8;
+                const int range_fwd = MFSKParams::SYMBOL_LEN * 13 / 8;
+                if (!pending_sync_) {
+                    int p = step_count_ % 4;
+                    bool ready = false;
+                    for (int h = 0; h < FREQ_HYPS; ++h) {
+                        float fh = (float)(FREQ_HYP_BASE + h);
+                        float e0  = mfsk_detail::goertzel_mag2(window, MFSKParams::SYMBOL_LEN, base_bin_ + fh);
+                        float en  = mfsk_detail::goertzel_mag2(window, MFSKParams::SYMBOL_LEN, base_bin_ + fh + n_tones_ - 1);
+                        float eq1 = mfsk_detail::goertzel_mag2(window, MFSKParams::SYMBOL_LEN, base_bin_ + fh + sync1_tone_);
+                        float eq3 = mfsk_detail::goertzel_mag2(window, MFSKParams::SYMBOL_LEN, base_bin_ + fh + sync3_tone_);
+                        update_tracker(trackers_[p][h], e0, en, eq1, eq3);
+                        if (trackers_[p][h].tstate == TState::READY)
+                            ready = true;
+                    }
+                    if (!ready) {
+                        step_count_++;
+                        buf_pos_ += MFSKParams::SEARCH_STEP;
+                        break;
+                    }
+                    pending_sync_ = true;
+                    pending_phase_ = p;
+                }
 
-                int p = step_count_ % 4;
-                update_tracker(p, e0, en, eq1, eq3);
+                if (buf_.size() < buf_pos_ + (size_t)range_fwd + MFSKParams::SYMBOL_LEN) {
+                    stall = true;
+                    break;
+                }
 
-                if (trackers_[p].tstate == TState::READY) {
+                {
                     ++stats_sync_count;
-                    const float* w1 = buf_pos_ >= (size_t)MFSKParams::SYMBOL_LEN
-                                      ? window - MFSKParams::SYMBOL_LEN : nullptr;
-                    auto sync_energy = [&](float foff) {
-                        float e = mfsk_detail::goertzel_mag2(window, MFSKParams::SYMBOL_LEN,
-                                    base_bin_ + foff + sync3_tone_);
-                        if (w1)
-                            e += mfsk_detail::goertzel_mag2(w1, MFSKParams::SYMBOL_LEN,
-                                    base_bin_ + foff + sync1_tone_);
-                        return e;
-                    };
-                    freq_offset_ = 0;
-                    float best_afc_e = 0;
+                    int best_off = 0, near_off = 0;
+                    float best_e = 0, near_e = 0;
+                    float best_f = 0, near_f = 0;
                     for (int foff = -3; foff <= 3; foff++) {
-                        float e = sync_energy((float)foff);
-                        if (e > best_afc_e) {
-                            best_afc_e = e;
-                            freq_offset_ = (float)foff;
+                        float sync3_bin = base_bin_ + foff + sync3_tone_;
+                        float sync1_bin = base_bin_ + foff + sync1_tone_;
+                        float pre_hi_bin = base_bin_ + foff + n_tones_ - 1;
+                        float pre_lo_bin = base_bin_ + foff;
+                        for (int off = -range_back; off <= range_fwd; off += 16) {
+                            int64_t pos = (int64_t)buf_pos_ + off;
+                            if (pos < MFSKParams::SYMBOL_LEN ||
+                                pos + MFSKParams::SYMBOL_LEN > (int64_t)buf_.size())
+                                continue;
+                            float e = mfsk_detail::goertzel_mag2(
+                                          buf_.data() + pos, MFSKParams::SYMBOL_LEN, sync3_bin)
+                                    + mfsk_detail::goertzel_mag2(
+                                          buf_.data() + pos - MFSKParams::SYMBOL_LEN,
+                                          MFSKParams::SYMBOL_LEN, sync1_bin);
+                            if (pos >= 3 * MFSKParams::SYMBOL_LEN) {
+                                e += mfsk_detail::goertzel_mag2(
+                                         buf_.data() + pos - 2 * MFSKParams::SYMBOL_LEN,
+                                         MFSKParams::SYMBOL_LEN, pre_hi_bin)
+                                   + mfsk_detail::goertzel_mag2(
+                                         buf_.data() + pos - 3 * MFSKParams::SYMBOL_LEN,
+                                         MFSKParams::SYMBOL_LEN, pre_lo_bin);
+                            }
+                            if (e > best_e) {
+                                best_e = e;
+                                best_off = off;
+                                best_f = (float)foff;
+                            }
+                            if (off <= range_back && e > near_e) {
+                                near_e = e;
+                                near_off = off;
+                                near_f = (float)foff;
+                            }
                         }
                     }
-
-                    int best_off = 0;
-                    float best_e = 0;
-                    float sync3_bin = base_bin_ + freq_offset_ + sync3_tone_;
-                    float sync1_bin = base_bin_ + freq_offset_ + sync1_tone_;
-                    int range = MFSKParams::SYMBOL_LEN * 5 / 8;
-                    for (int off = -range; off <= range; off += 16) {
-                        int64_t pos = (int64_t)buf_pos_ + off;
-                        if (pos < MFSKParams::SYMBOL_LEN ||
-                            pos + MFSKParams::SYMBOL_LEN > (int64_t)buf_.size())
-                            continue;
-                        float e = mfsk_detail::goertzel_mag2(
-                                      buf_.data() + pos, MFSKParams::SYMBOL_LEN, sync3_bin)
-                                + mfsk_detail::goertzel_mag2(
-                                      buf_.data() + pos - MFSKParams::SYMBOL_LEN,
-                                      MFSKParams::SYMBOL_LEN, sync1_bin);
-                        if (e > best_e) {
-                            best_e = e;
-                            best_off = off;
-                        }
+                    if (best_off > range_back && best_e < 1.5f * near_e) {
+                        best_off = near_off;
+                        best_f = near_f;
                     }
+                    freq_offset_ = best_f;
                     if (best_off >= 0)
                         buf_pos_ += best_off;
                     else
@@ -492,7 +517,17 @@ public:
 
                     sync_freq_offset_ = freq_offset_;
 
-                    std::cerr << "MFSK: Sync (phase " << p
+                    int64_t abs_start = trim_total_ + (int64_t)buf_pos_ + MFSKParams::SYMBOL_LEN;
+                    if (last_failed_collect_ >= 0 &&
+                        std::llabs(abs_start - last_failed_collect_) < MFSKParams::SYMBOL_LEN / 2) {
+                        pending_sync_ = false;
+                        reset_trackers();
+                        step_count_ = 0;
+                        buf_pos_ += MFSKParams::SEARCH_STEP;
+                        break;
+                    }
+
+                    std::cerr << "MFSK: Sync (phase " << pending_phase_
                               << " t=" << best_off
                               << " f=" << freq_offset_
                               << " pos=" << buf_pos_ << ")" << std::endl;
@@ -503,12 +538,8 @@ public:
                     collected_.clear();
                     collected_.reserve(MFSKParams::DATA_SYMBOLS);
                     reset_trackers();
-                    continue;
                 }
-
-                step_count_++;
-                buf_pos_ += MFSKParams::SEARCH_STEP;
-                break;
+                continue;
             }
 
             case State::COLLECTING: {
@@ -599,7 +630,11 @@ public:
                             }
                         }
                     }
-                    if (!decoded) ++stats_crc_errors;
+                    if (!decoded) {
+                        ++stats_crc_errors;
+                        last_failed_collect_ = trim_total_ + (int64_t)collect_start_pos_;
+                        buf_pos_ = collect_start_pos_ + MFSKParams::SYMBOL_LEN;
+                    }
                     state_ = State::SEARCHING;
                     step_count_ = 0;
                 }
@@ -608,15 +643,20 @@ public:
             }
         }
 
-        if (buf_pos_ > 8192 && state_ == State::SEARCHING) {
-            buf_.erase(buf_.begin(), buf_.begin() + buf_pos_);
-            buf_pos_ = 0;
+        const size_t keep_back = 4 * MFSKParams::SYMBOL_LEN + MFSKParams::SYMBOL_LEN * 5 / 8;
+        if (state_ == State::SEARCHING && buf_pos_ > keep_back + 8192) {
+            size_t cut = buf_pos_ - keep_back;
+            buf_.erase(buf_.begin(), buf_.begin() + cut);
+            buf_pos_ -= cut;
+            trim_total_ += (int64_t)cut;
         }
     }
 
     void reset() {
         buf_.clear();
         buf_pos_ = 0;
+        trim_total_ = 0;
+        last_failed_collect_ = -1;
         state_ = State::SEARCHING;
         step_count_ = 0;
         collect_count_ = 0;
@@ -626,6 +666,7 @@ public:
     }
 
     float get_last_snr() const { return last_snr_; }
+    MFSKMode get_last_decoded_mode() const { return last_decoded_mode_; }
     float get_last_ber() const { return last_ber_; }
     float get_ber_ema() const { return ber_ema_; }
 
@@ -663,24 +704,36 @@ private:
     size_t collect_start_pos_ = 0;
     std::vector<std::vector<float>> collected_;
 
+    int64_t trim_total_ = 0;
+    int64_t last_failed_collect_ = -1;
+    MFSKMode last_decoded_mode_ = MFSKMode::MFSK_16;
     float last_snr_ = 0;
     float last_ber_ = -1;
     float ber_ema_ = -1;
 
     enum class TState { PREAMBLE, SYNC1, SYNC2, READY };
     struct Tracker { TState tstate = TState::PREAMBLE; int count = 0; int last_tone = -1; int misses = 0; };
-    Tracker trackers_[4];
+    // 4 timing phases x 7 coarse frequency hypotheses (+-3 bins). the
+    // preamble tracker must search frequency as well as time: beyond about
+    // half a tone spacing of mistuning the nominal bins see nothing, so the
+    // downstream +-3 bin afc never gets a chance to run.
+    static constexpr int FREQ_HYPS = 7;
+    static constexpr int FREQ_HYP_BASE = -3;
+    Tracker trackers_[4][FREQ_HYPS];
+    bool pending_sync_ = false;
+    int pending_phase_ = 0;
 
     void reset_trackers() {
-        for (auto& t : trackers_) { t.tstate = TState::PREAMBLE; t.count = 0; t.last_tone = -1; t.misses = 0; }
+        for (auto& ph : trackers_)
+            for (auto& t : ph) { t.tstate = TState::PREAMBLE; t.count = 0; t.last_tone = -1; t.misses = 0; }
+        pending_sync_ = false;
     }
 
 
 
 
 
-    void update_tracker(int p, float e0, float en, float eq1, float eq3) { 
-        auto& t = trackers_[p];
+    void update_tracker(Tracker& t, float e0, float en, float eq1, float eq3) {
         float total = e0 + en + eq1 + eq3 + 1e-20f;
 
         switch (t.tstate) {
@@ -824,6 +877,7 @@ private:
         float ber = (float)bit_errors / total_soft;
         if (ber > 0.2f) return false;
         last_ber_ = ber;
+        last_decoded_mode_ = decode_mode;
         if (ber_ema_ < 0)
             ber_ema_ = ber;
         else

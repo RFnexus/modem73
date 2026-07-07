@@ -53,13 +53,15 @@ struct TNCConfig {
     int sample_rate = 48000;
     
     // Modem settings
-    int modem_type = 0;         // 0=OFDM, 1=MFSK
+    int modem_type = 0;         // 0=OFDM, 1=MFSK, 2=ROBUST 
     int mfsk_mode = 1;          // 0=MFSK-8, 1=MFSK-16, 2=MFSK-32, 3=MFSK-32R
+    int robust_mode = 0;
     int center_freq = 1500;
     std::string callsign = "N0CALL";
     std::string modulation = "QPSK";
     std::string code_rate = "1/2";
     int frame_size = 1;         // 0=short, 1=normal, 2=long
+    bool postamble = false;
     bool rx_filter_enabled = true;  // RX bandpass in front of the OFDM decoder
     
     // PTT settings
@@ -110,6 +112,8 @@ struct TNCConfig {
     
     // Control port
     int control_port = 8073;
+
+    bool perf_log = true;
 
     // Settings file path
     std::string config_file = "";

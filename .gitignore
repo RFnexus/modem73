@@ -14,4 +14,10 @@ test_awgn.cc
 test_mfsk
 test_mfsk.cc
 test_watterson
-test_watterson.cc
+test_watterson.cctest_robust
+test_robust.cc
+test_e2e
+test_e2e.cc
+test_suite/
+__pycache__
+audio_samples/

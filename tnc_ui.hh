@@ -26,13 +26,42 @@
 
 #include "kiss_tnc.hh"
 #include "phy/mfsk_modem.hh"
+#include "phy/robust_modem.hh"
+#include "perf_log.hh"
 #ifdef WITH_CM108
 #include "cm108_ptt.hh"
 #endif
 
 constexpr size_t MAX_LOG_ENTRIES = 500;
 
-const std::vector<std::string> MODEM_TYPE_OPTIONS = {"OFDM", "MFSK"};
+const std::vector<std::string> MODEM_TYPE_OPTIONS = {"OFDM", "MFSK", "ROBUST"};
+const std::vector<std::string> ROBUST_MODE_OPTIONS = {"RDM-1200", "RDM-600", "RDM-300", "RDMN-300", "RDMN-150"};
+const std::vector<std::string> ROBUST_MTU_OPTIONS = {"510 B", "170 B (short)"};
+
+struct AltMode {
+    const char* label;
+    int modem_type;
+    int modulation;
+    int code_rate;
+    int frame_size;
+    int robust_mode;
+    int mfsk_mode;
+};
+static const AltMode ALT_MODES[] = {
+    {"BPSK 1/2 N",   0, 0, 0, 1, 0, 1},
+    {"QPSK 1/2 N",   0, 1, 0, 1, 0, 1},
+    {"QPSK 1/2x2 N", 0, 1, 5, 1, 0, 1},
+    {"QPSK 1/4x2 N", 0, 1, 6, 1, 0, 1},
+    {"QAM16 3/4 N",  0, 3, 2, 1, 0, 1},
+    {"RDM-1200",     2, 1, 0, 1, 0, 1},
+    {"RDM-600",      2, 1, 0, 1, 1, 1},
+    {"RDM-300",      2, 1, 0, 1, 2, 1},
+    {"RDMN-300",     2, 1, 0, 1, 3, 1},
+    {"MFSK-16",      1, 1, 0, 1, 0, 1},
+    {"RDM-1200S",    2, 1, 0, 1, 5, 1},
+    {"RDMN-300S",    2, 1, 0, 1, 8, 1},
+};
+constexpr int ALT_MODE_COUNT = 12;
 const std::vector<std::string> MFSK_MODE_OPTIONS = {"MFSK-8", "MFSK-16", "MFSK-32", "MFSK-32R"};
 
 const std::vector<std::string> MODULATION_OPTIONS = {
@@ -40,7 +69,7 @@ const std::vector<std::string> MODULATION_OPTIONS = {
 };
 
 const std::vector<std::string> CODE_RATE_OPTIONS = {
-    "1/2", "2/3", "3/4", "5/6", "1/4"
+    "1/2", "2/3", "3/4", "5/6", "1/4", "1/2x2", "1/4x2"
 };
 
 const std::vector<std::string> PTT_TYPE_OPTIONS = {
@@ -54,15 +83,52 @@ const std::vector<std::string> PTT_LINE_OPTIONS = {
     "DTR", "RTS", "BOTH"
 };
 
+const std::vector<std::string> RIG_MODE_OPTIONS = {
+    "USB", "LSB", "CW", "CWR", "RTTY", "AM", "FM", "PKTUSB", "PKTLSB"
+};
+
+constexpr int RIG_STEP_COUNT = 7;
+const long long RIG_STEP_HZ[RIG_STEP_COUNT] = {10, 100, 1000, 5000, 10000, 100000, 1000000};
+const char* const RIG_STEP_LABELS[RIG_STEP_COUNT] = {
+    "10 Hz", "100 Hz", "1 kHz", "5 kHz", "10 kHz", "100 kHz", "1 MHz"
+};
+
+struct RigMeterDef {
+    const char* label;
+    const char* level;
+    float min;
+    float max;
+};
+constexpr int RIG_METER_COUNT = 5;
+const RigMeterDef RIG_METERS[RIG_METER_COUNT] = {
+    {"S-Meter", "STRENGTH",            -54.0f, 60.0f},
+    {"SWR",     "SWR",                   1.0f,  5.0f},
+    {"Power",   "RFPOWER_METER_WATTS",   0.0f, 100.0f},
+    {"ALC",     "ALC",                   0.0f,  1.0f},
+    {"Temp",    "TEMP_METER",            0.0f, 100.0f},
+};
+
+constexpr int UTILS_ACTION_COUNT = 11 + ALT_MODE_COUNT;
+
+
+
+extern std::atomic<bool> g_running;
+
+
 struct TNCUIState {
     std::string callsign = "N0CALL";
-    int modem_type_index = 0;  // 0=OFDM, 1=MFSK
+    int modem_type_index = 0;
     int mfsk_mode_index = 1;   // 0=MFSK-8, 1=MFSK-16, 2=MFSK-32, 3=MFSK-32R
+    int robust_mode_index = 0;
+    bool utils_testing_open = false;
+    PerfLogger* perf_logger = nullptr;
+    int alt_mode_mask = 0;
     int modulation_index = 1;  // default QPSK N 1/2
     int code_rate_index = 0;
     int frame_size = 1;        // 0=short, 1=normal, 2=long
     int center_freq = 1500;
-    
+    bool postamble = false;
+
     bool csma_enabled = true;
     float carrier_threshold_db = -30.0f;
     int slot_time_ms = 500;
@@ -89,6 +155,20 @@ struct TNCUIState {
     int rigctl_port = 4532;
     std::atomic<bool> rigctl_connected{false};
     std::atomic<bool> audio_connected{true};  // Track audio device health
+
+    std::function<std::string(const std::string&)> on_rigctl_command;
+    std::atomic<bool> rig_poll_enabled{false};
+    std::atomic<bool> rig_refresh_requested{false};
+    std::atomic<long long> rig_freq_hz{0};
+    std::atomic<float> rig_power_level{-1.0f};
+    std::atomic<int> rig_tuner_on{-1};
+    std::atomic<int> rig_tuner_supported{-1};
+    std::atomic<bool> rig_data_valid{false};
+    std::atomic<int64_t> rig_last_update_ms{0};
+    int64_t rig_last_poll_ms = 0;
+    std::array<std::atomic<float>, RIG_METER_COUNT> rig_meter_values;
+    std::mutex rig_mode_mutex;
+    std::string rig_mode;
     
     // VOX settings (PTT type 2)
     int vox_tone_freq = 1200;   // Hz
@@ -125,8 +205,10 @@ struct TNCUIState {
     struct Preset {
         std::string name;
         // Modem type
-        int modem_type_index = 0;  // 0=OFDM, 1=MFSK
+        int modem_type_index = 0;
         int mfsk_mode_index = 1;   // 0=MFSK-8, 1=MFSK-16, 2=MFSK-32, 3=MFSK-32R
+        int robust_mode_index = 0;
+        bool postamble = false;
         // OFDM modem
         int modulation_index;
         int code_rate_index;
@@ -293,11 +375,23 @@ struct TNCUIState {
         for (int i = 0; i < SNR_HISTORY_SIZE; i++) {
             snr_history[i] = 0.0f;
         }
+        for (auto& v : rig_meter_values) {
+            v = NAN;
+        }
         update_modem_info();
     }
     
     // TEMP modem tables
     void update_modem_info() {
+        if (modem_type_index == 2) {
+            RobustMode rmode = (RobustMode)robust_mode_index;
+            mtu_bytes = RobustParams::data_bytes(rmode) - 2;
+            bitrate_bps = RobustParams::bitrate(rmode);
+            airtime_seconds = RobustParams::frame_duration(rmode);
+            if (random_data_size == 0 || (!fragmentation_enabled && random_data_size > mtu_bytes))
+                random_data_size = mtu_bytes;
+            return;
+        }
         // MFSK mode
         if (modem_type_index == 1) {
             MFSKMode mmode = (MFSKMode)mfsk_mode_index;
@@ -388,9 +482,21 @@ struct TNCUIState {
         int rate = code_rate_index;
 
         if (mod < 0 || mod > 7) mod = 1;
-        if (rate < 0 || rate > 4) rate = 0;
+        if (rate < 0 || rate > 5) rate = 0;
 
-        if (frame_size == 0) {
+        if (rate == 5) {
+            static const int payload_rep_short[8]  = {128, 256, 512, 512, 1024, 1024, 2048, 2048};
+            static const int payload_rep_normal[8] = {256, 512, 1024, 1024, 2048, 0, 0, 0};
+            static const int duration_rep_short[8]  = {2600, 1500, 3400, 1500, 3400, 2600, 4000, 3400};
+            static const int duration_rep_normal[8] = {4800, 4800, 6400, 4800, 6400, 0, 0, 0};
+            int pl = frame_size == 0 ? payload_rep_short[mod]
+                   : frame_size == 1 ? payload_rep_normal[mod] : 0;
+            int du = frame_size == 0 ? duration_rep_short[mod]
+                   : frame_size == 1 ? duration_rep_normal[mod] : 0;
+            mtu_bytes = pl > 0 ? pl - 2 : 0;
+            airtime_seconds = du / 1000.0f;
+            bitrate_bps = du > 0 ? (int)(pl * 8000.0f / du) : 0;
+        } else if (frame_size == 0) {
             mtu_bytes = payload_short[mod][rate] - 2;
             bitrate_bps = bitrate_short[mod][rate];
             airtime_seconds = duration_short[mod] / 1000.0f;
@@ -485,6 +591,9 @@ struct TNCUIState {
         fprintf(f, "short_frame=%d\n", frame_size == 0 ? 1 : 0);
         fprintf(f, "frame_size=%d\n", frame_size);
         fprintf(f, "center_freq=%d\n", center_freq);
+        fprintf(f, "postamble=%d\n", postamble ? 1 : 0);
+        fprintf(f, "robust_mode=%d\n", robust_mode_index);
+        fprintf(f, "alt_mode_mask=%d\n", alt_mode_mask);
         fprintf(f, "csma_enabled=%d\n", csma_enabled ? 1 : 0);
         fprintf(f, "carrier_threshold_db=%.1f\n", carrier_threshold_db);
         fprintf(f, "slot_time_ms=%d\n", slot_time_ms);
@@ -512,6 +621,7 @@ struct TNCUIState {
         fprintf(f, "port=%d\n", port);
         fprintf(f, "# Utils\n");
         fprintf(f, "random_data_size=%d\n", random_data_size);
+        fprintf(f, "utils_testing=%d\n", utils_testing_open ? 1 : 0);
         
         fclose(f);
         return true;
@@ -531,16 +641,35 @@ struct TNCUIState {
             char key[64], value[192];
             if (sscanf(line, "%63[^=]=%191[^\n]", key, value) == 2) {
                 if (strcmp(key, "callsign") == 0) callsign = value;
-                else if (strcmp(key, "modem_type") == 0) modem_type_index = atoi(value);
-                else if (strcmp(key, "mfsk_mode") == 0) mfsk_mode_index = atoi(value);
-                else if (strcmp(key, "modulation") == 0) modulation_index = atoi(value);
-                else if (strcmp(key, "code_rate") == 0) code_rate_index = atoi(value);
+                else if (strcmp(key, "modem_type") == 0) {
+                    int v = atoi(value);
+                    if (v >= 0 && v <= 2) modem_type_index = v;
+                }
+                else if (strcmp(key, "mfsk_mode") == 0) {
+                    int v = atoi(value);
+                    if (v >= 0 && v <= 3) mfsk_mode_index = v;
+                }
+                else if (strcmp(key, "robust_mode") == 0) {
+                    int v = atoi(value);
+                    if (v >= 0 && v < ROBUST_MODE_COUNT) robust_mode_index = v;
+                }
+                else if (strcmp(key, "alt_mode_mask") == 0)
+                    alt_mode_mask = atoi(value) & ((1 << ALT_MODE_COUNT) - 1);
+                else if (strcmp(key, "modulation") == 0) {
+                    int v = atoi(value);
+                    if (v >= 0 && v <= 7) modulation_index = v;
+                }
+                else if (strcmp(key, "code_rate") == 0) {
+                    int v = atoi(value);
+                    if (v >= 0 && v <= 6) code_rate_index = v;
+                }
                 else if (strcmp(key, "short_frame") == 0) frame_size = atoi(value) != 0 ? 0 : 1;
                 else if (strcmp(key, "frame_size") == 0) {
                     int v = atoi(value);
                     if (v >= 0 && v <= 2) frame_size = v;
                 }
                 else if (strcmp(key, "center_freq") == 0) center_freq = atoi(value);
+                else if (strcmp(key, "postamble") == 0) postamble = atoi(value) != 0;
                 else if (strcmp(key, "csma_enabled") == 0) csma_enabled = atoi(value) != 0;
                 else if (strcmp(key, "carrier_threshold_db") == 0) carrier_threshold_db = atof(value);
                 else if (strcmp(key, "slot_time_ms") == 0) slot_time_ms = atoi(value);
@@ -567,6 +696,7 @@ struct TNCUIState {
 #endif
                 else if (strcmp(key, "port") == 0) port = atoi(value);
                 else if (strcmp(key, "random_data_size") == 0) random_data_size = atoi(value);
+                else if (strcmp(key, "utils_testing") == 0) utils_testing_open = atoi(value) != 0;
             }
         }
         
@@ -584,9 +714,8 @@ struct TNCUIState {
         
         fprintf(f, "# MODEM73 Presets \n");
         for (const auto& p : presets) {
-            // name,mod,rate,sf,freq,csma,thresh,slot,persist,ptt,vox_freq,vox_lead,vox_tail,modem_type,mfsk_mode
             // sf field keeps legacy semantics: 1=short, 0=normal, 2=long
-            fprintf(f, "preset=%s,%d,%d,%d,%d,%d,%.1f,%d,%d,%d,%d,%d,%d,%d,%d\n",
+            fprintf(f, "preset=%s,%d,%d,%d,%d,%d,%.1f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
                     p.name.c_str(),
                     p.modulation_index,
                     p.code_rate_index,
@@ -601,7 +730,9 @@ struct TNCUIState {
                     p.vox_lead_ms,
                     p.vox_tail_ms,
                     p.modem_type_index,
-                    p.mfsk_mode_index);
+                    p.mfsk_mode_index,
+                    p.robust_mode_index,
+                    p.postamble ? 1 : 0);
         }
         
         fclose(f);
@@ -626,12 +757,13 @@ struct TNCUIState {
             int mod, rate, sf, freq, csma, slot, persist;
             int ptt_type = 1, vox_freq = 1200, vox_lead = 150, vox_tail = 100;
             int modem_type = 0, mfsk_mode = 1;
+            int robust_mode = 0, postamble = 0;
             float thresh;
 
-            int n = sscanf(line + 7, "%63[^,],%d,%d,%d,%d,%d,%f,%d,%d,%d,%d,%d,%d,%d,%d",
+            int n = sscanf(line + 7, "%63[^,],%d,%d,%d,%d,%d,%f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
                        name, &mod, &rate, &sf, &freq, &csma, &thresh, &slot, &persist,
                        &ptt_type, &vox_freq, &vox_lead, &vox_tail,
-                       &modem_type, &mfsk_mode);
+                       &modem_type, &mfsk_mode, &robust_mode, &postamble);
 
             if (n >= 9) {
                 Preset p;
@@ -653,6 +785,9 @@ struct TNCUIState {
 
                 p.modem_type_index = (n >= 14) ? modem_type : 0;
                 p.mfsk_mode_index = (n >= 15) ? mfsk_mode : 1;
+                p.robust_mode_index = (n >= 16 && robust_mode >= 0 &&
+                                       robust_mode < ROBUST_MODE_COUNT) ? robust_mode : 0;
+                p.postamble = (n >= 17) && postamble != 0;
                 presets.push_back(p);
             }
         }
@@ -675,6 +810,8 @@ struct TNCUIState {
         p.name = name;
         p.modem_type_index = modem_type_index;
         p.mfsk_mode_index = mfsk_mode_index;
+        p.robust_mode_index = robust_mode_index;
+        p.postamble = postamble;
         p.modulation_index = modulation_index;
         p.code_rate_index = code_rate_index;
         p.frame_size = frame_size;
@@ -700,6 +837,8 @@ struct TNCUIState {
         const Preset& p = presets[index];
         modem_type_index = p.modem_type_index;
         mfsk_mode_index = p.mfsk_mode_index;
+        robust_mode_index = p.robust_mode_index;
+        postamble = p.postamble;
         modulation_index = p.modulation_index;
         code_rate_index = p.code_rate_index;
         frame_size = p.frame_size;
@@ -784,6 +923,99 @@ struct TNCUIState {
         std::lock_guard<std::mutex> lock(messages_mutex);
         return std::vector<TextMessage>(messages.begin(), messages.end());
     }
+
+    // rig control via rigctld. commands use the extended response protocol
+    // ('+' prefix) so every reply is terminated by an rprt line.
+    static bool rig_ok(const std::string& resp) {
+        return resp.find("RPRT 0") != std::string::npos;
+    }
+
+    static std::string rig_value(const std::string& resp, const char* key) {
+        std::string k = std::string(key) + ":";
+        size_t p = resp.find(k);
+        if (p != std::string::npos) {
+            p += k.size();
+            while (p < resp.size() && resp[p] == ' ') p++;
+            size_t e = resp.find('\n', p);
+            return resp.substr(p, e == std::string::npos ? std::string::npos : e - p);
+        }
+        std::string bare;
+        size_t pos = 0;
+        while (pos < resp.size()) {
+            size_t e = resp.find('\n', pos);
+            std::string line = resp.substr(pos, e == std::string::npos ? std::string::npos : e - pos);
+            if (line.rfind("RPRT", 0) == 0) break;
+            if (!line.empty() && line.find(':') == std::string::npos) bare = line;
+            if (e == std::string::npos) break;
+            pos = e + 1;
+        }
+        return bare;
+    }
+
+    std::string get_rig_mode() {
+        std::lock_guard<std::mutex> lock(rig_mode_mutex);
+        return rig_mode;
+    }
+
+    void set_rig_mode_cache(const std::string& m) {
+        std::lock_guard<std::mutex> lock(rig_mode_mutex);
+        rig_mode = m;
+    }
+
+    void poll_rig() {
+        if (!on_rigctl_command) return;
+        int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        bool refresh = rig_refresh_requested.exchange(false);
+        if (!refresh && now - rig_last_poll_ms < 1000) return;
+        rig_last_poll_ms = now;
+
+        bool any = false;
+        std::string r = on_rigctl_command("+f");
+        if (rig_ok(r)) {
+            std::string v = rig_value(r, "Frequency");
+            if (!v.empty()) {
+                rig_freq_hz = atoll(v.c_str());
+                any = true;
+            }
+        }
+
+        r = on_rigctl_command("+m");
+        if (rig_ok(r)) {
+            std::string v = rig_value(r, "Mode");
+            if (!v.empty()) {
+                set_rig_mode_cache(v);
+                any = true;
+            }
+        }
+
+        for (int i = 0; i < RIG_METER_COUNT; i++) {
+            r = on_rigctl_command(std::string("+l ") + RIG_METERS[i].level);
+            std::string v = rig_ok(r) ? rig_value(r, "Level Value") : "";
+            rig_meter_values[i] = v.empty() ? NAN : strtof(v.c_str(), nullptr);
+        }
+
+        r = on_rigctl_command("+l RFPOWER");
+        if (rig_ok(r)) {
+            std::string v = rig_value(r, "Level Value");
+            rig_power_level = v.empty() ? -1.0f : strtof(v.c_str(), nullptr);
+        } else {
+            rig_power_level = -1.0f;
+        }
+
+        r = on_rigctl_command("+u TUNER");
+        if (rig_ok(r)) {
+            std::string v = rig_value(r, "Func Status");
+            rig_tuner_on = v.empty() ? -1 : atoi(v.c_str());
+            rig_tuner_supported = 1;
+        } else {
+            rig_tuner_on = -1;
+            if (any) rig_tuner_supported = 0;
+        }
+
+        rig_data_valid = any;
+        if (any) rig_last_update_ms = now;
+    }
 };
 
 class TNCUI {
@@ -820,6 +1052,7 @@ public:
         keypad(stdscr, TRUE);
         nodelay(stdscr, TRUE);
         curs_set(0);
+        set_escdelay(25);
         
         mousemask(ALL_MOUSE_EVENTS | REPORT_MOUSE_POSITION, NULL);
         mouseinterval(0);
@@ -837,14 +1070,15 @@ public:
         
         running_ = true;
         
-        while (running_) {
+        while (running_ && g_running) {
             int ch = getch();
             if (ch != ERR) {
                 handle_input(ch);
             }
+            tick_auto_send();
             draw();
             refresh();
-            std::this_thread::sleep_for(std::chrono::milliseconds(33)); 
+            std::this_thread::sleep_for(std::chrono::milliseconds(33));
         }
         
         endwin();
@@ -865,11 +1099,15 @@ private:
         FIELD_MODULATION,
         FIELD_CODERATE,
         FIELD_FRAMESIZE,
+        FIELD_POSTAMBLE,
         FIELD_MFSK_MODE,
+        FIELD_ROBUST_MODE,
+        FIELD_ROBUST_MTU,
         FIELD_FREQ,
         FIELD_CSMA,
         FIELD_THRESHOLD,
         FIELD_PERSISTENCE,
+        FIELD_CSMA_INFO,
         FIELD_FRAGMENTATION,
         FIELD_TX_BLANKING,
         FIELD_AUDIO_INPUT,
@@ -886,10 +1124,31 @@ private:
         FIELD_CM108_DEVICE,
 #endif
         FIELD_NET_PORT,
-        FIELD_PRESET,      
+        FIELD_PRESET,
         FIELD_COUNT
     };
-    
+
+    enum RigField {
+        RIG_FIELD_FREQ = 0,
+        RIG_FIELD_STEP,
+        RIG_FIELD_MODE,
+        RIG_FIELD_POWER,
+        RIG_FIELD_TUNER,
+        RIG_FIELD_TUNE,
+        RIG_FIELD_COUNT
+    };
+
+    int tab_count() const {
+        return state_.ptt_type_index == 1 ? 6 : 5;
+    }
+
+    bool rig_should_skip(int field) const {
+        if (state_.rig_tuner_supported.load() == 0) {
+            if (field == RIG_FIELD_TUNER || field == RIG_FIELD_TUNE) return true;
+        }
+        return false;
+    }
+
     void handle_input(int ch) {
         if (ch == KEY_MOUSE) {
             MEVENT event;
@@ -908,6 +1167,10 @@ private:
             show_help_ = false;
             return;
         }
+        if (show_csma_help_) {
+            show_csma_help_ = false;
+            return;
+        }
         
         switch (ch) {
             case 'q':
@@ -919,11 +1182,11 @@ private:
                 break;
                 
             case '\t':
-                current_tab_ = (current_tab_ + 1) % 5;
+                current_tab_ = (current_tab_ + 1) % tab_count();
                 break;
 
             case KEY_BTAB:  // shift tab prev
-                current_tab_ = (current_tab_ + 4) % 5;
+                current_tab_ = (current_tab_ + tab_count() - 1) % tab_count();
                 break;
                 
             case KEY_UP:
@@ -935,7 +1198,17 @@ private:
                 } else if (current_tab_ == 2) {
                     if (log_scroll_ > 0) log_scroll_--;
                 } else if (current_tab_ == 3) {
-                    utils_selection_ = (utils_selection_ + 6) % 7;
+                    if (utils_selection_ == 0 && utils_scroll_ > 0) {
+                        utils_scroll_--;
+                    } else {
+                        utils_selection_ = (utils_selection_ + utils_visible_slots() - 1)
+                                         % utils_visible_slots();
+                        utils_ensure_visible();
+                    }
+                } else if (current_tab_ == 5) {
+                    do {
+                        rig_field_ = (rig_field_ + RIG_FIELD_COUNT - 1) % RIG_FIELD_COUNT;
+                    } while (rig_should_skip(rig_field_));
                 }
                 break;
                 
@@ -948,7 +1221,17 @@ private:
                 } else if (current_tab_ == 2) {
                     log_scroll_++;
                 } else if (current_tab_ == 3) {
-                    utils_selection_ = (utils_selection_ + 1) % 7;
+                    if (utils_selection_ == utils_visible_slots() - 1 &&
+                        utils_scroll_ < utils_max_scroll_) {
+                        utils_scroll_++;
+                    } else {
+                        utils_selection_ = (utils_selection_ + 1) % utils_visible_slots();
+                        utils_ensure_visible();
+                    }
+                } else if (current_tab_ == 5) {
+                    do {
+                        rig_field_ = (rig_field_ + 1) % RIG_FIELD_COUNT;
+                    } while (rig_should_skip(rig_field_));
                 }
                 break;
                 
@@ -970,6 +1253,8 @@ private:
                     if (state_.random_data_size >= 1000) step = 100;
                     else if (state_.random_data_size >= 100) step = 10;
                     state_.random_data_size = std::max(1, state_.random_data_size - step);
+                } else if (current_tab_ == 5) {
+                    adjust_rig_field(-1);
                 }
                 break;
                 
@@ -992,15 +1277,19 @@ private:
                     else if (state_.random_data_size >= 100) step = 10;
                     int max_size = state_.fragmentation_enabled ? 65535 : state_.mtu_bytes;
                     state_.random_data_size = std::min(max_size, state_.random_data_size + step);
+                } else if (current_tab_ == 5) {
+                    adjust_rig_field(1);
                 }
                 break;
                 
             case KEY_PPAGE:
                 if (current_tab_ == 2) log_scroll_ = std::max(0, log_scroll_ - 10);
+                else if (current_tab_ == 3) utils_scroll_ = std::max(0, utils_scroll_ - 5);
                 break;
-                
+
             case KEY_NPAGE:
                 if (current_tab_ == 2) log_scroll_ += 10;
+                else if (current_tab_ == 3) utils_scroll_ += 5;
                 break;
                 
             case KEY_HOME:
@@ -1014,7 +1303,9 @@ private:
             case '\n':
             case KEY_ENTER:
                 if (current_tab_ == 1) {
-                    if (current_field_ == FIELD_CALLSIGN) {
+                    if (current_field_ == FIELD_CSMA_INFO) {
+                        show_csma_help_ = true;
+                    } else if (current_field_ == FIELD_CALLSIGN) {
 
 
                         edit_text_field(FIELD_CALLSIGN);
@@ -1072,6 +1363,10 @@ private:
 
                     handle_utils_action();
 
+
+                } else if (current_tab_ == 5) {
+
+                    rig_enter_action();
 
                 }
                 break;
@@ -1165,6 +1460,17 @@ private:
                 }
                 break;
 
+            case '8':
+
+                if (current_tab_ == 3) {
+
+                    state_.utils_testing_open = true;
+                    utils_selection_ = UTILS_TOP_ACTIONS + 1;
+                    handle_utils_action();
+
+                }
+                break;
+
         }
     }
     
@@ -1174,37 +1480,26 @@ private:
         (void)rows;  
         
         if (event.bstate & BUTTON1_CLICKED || event.bstate & BUTTON1_PRESSED) {
-            // Tab clicks 
+            // Tab clicks
             if (event.y == 2) {
-                int tab_width = (cols - 4) / 5;
-                if (event.x >= 2 && event.x < 2 + tab_width) {
-                    current_tab_ = 0;
-                } else if (event.x >= 2 + tab_width && event.x < 2 + tab_width * 2) {
-                    current_tab_ = 1;
-                } else if (event.x >= 2 + tab_width * 2 && event.x < 2 + tab_width * 3) {
-                    current_tab_ = 2;
-                } else if (event.x >= 2 + tab_width * 3 && event.x < 2 + tab_width * 4) {
-                    current_tab_ = 3;
-                } else if (event.x >= 2 + tab_width * 4) {
-                    current_tab_ = 4;
+                int ntabs = tab_count();
+                int tab_width = (cols - 4) / ntabs;
+                if (event.x >= 2 && tab_width > 0) {
+                    int idx = (event.x - 2) / tab_width;
+                    if (idx >= ntabs) idx = ntabs - 1;
+                    current_tab_ = idx;
                 }
             }
             
-            if (current_tab_ == 1 && event.x < cols/2 - 2) {  
+            if (current_tab_ == 1 && event.x < cols/2 - 2) {
+                int logical = event.y - 4 + config_scroll_;
                 int field = -1;
-                
-                // MODEM section 
-                if (event.y >= 5 && event.y <= 9) {
-                    field = FIELD_CALLSIGN + (event.y - 5);
+                for (int f = 0; f < FIELD_COUNT; f++) {
+                    if (should_skip_field(f)) continue;
+                    if (config_field_row(f) == logical) { field = f; break; }
                 }
-                // CSMA section 
-                else if (event.y >= 12 && event.y <= 15) {
-                    field = FIELD_CSMA + (event.y - 12);
-                }
-                // PRESET row 
-                else if (event.y == 18) {
-                    field = FIELD_PRESET;
-                }
+                if (field == FIELD_CSMA_INFO)
+                    show_csma_help_ = true;
                 
                 if (field >= 0 && field < FIELD_COUNT) {
                     current_field_ = field;
@@ -1247,8 +1542,50 @@ private:
                 log_scroll_++;
             }
         }
+
+        if (current_tab_ == 3) {
+            if (event.bstate & BUTTON4_PRESSED) {
+                if (utils_scroll_ > 0) utils_scroll_--;
+            } else if (event.bstate & BUTTON5_PRESSED) {
+                utils_scroll_++;
+            }
+        }
     }
     
+    // line input at (y, x). returns true on enter, false if cancelled with esc.
+    // buf must hold at least max_len + 1 bytes.
+    bool prompt_input(int y, int x, char* buf, int max_len) {
+        curs_set(1);
+        nodelay(stdscr, FALSE);
+
+        int len = (int)strlen(buf);
+        bool accepted = false;
+
+        while (true) {
+            mvhline(y, x, ' ', max_len);
+            mvaddnstr(y, x, buf, len);
+            move(y, x + len);
+            refresh();
+
+            int ch = getch();
+            if (ch == 27) {
+                break;
+            } else if (ch == '\n' || ch == KEY_ENTER) {
+                accepted = true;
+                break;
+            } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+                if (len > 0) buf[--len] = '\0';
+            } else if (ch >= 32 && ch < 127 && len < max_len) {
+                buf[len++] = (char)ch;
+                buf[len] = '\0';
+            }
+        }
+
+        nodelay(stdscr, TRUE);
+        curs_set(0);
+        return accepted;
+    }
+
     void edit_text_field(int field) {
         // MODEM:4, Callsign:5, Mod:6, Rate:7, Frame:8, Freq:9
         // CSMA:11, Enabled:12, Thresh:13, Persist:14
@@ -1286,17 +1623,13 @@ private:
             return; // not text editable
         }
         
-        curs_set(1);
-        echo();
-        nodelay(stdscr, FALSE);
-        
         // Clear the value area
         move(row, col);
         for (int i = 0; i < 20; i++) addch(' ');
-        
+
         char buf[64] = {0};
-        mvgetnstr(row, col, buf, max_len);
-        
+        if (!prompt_input(row, col, buf, max_len)) return;
+
         if (strlen(buf) > 0) {
             if (field == FIELD_CALLSIGN) {
                 for (char* p = buf; *p; p++) *p = toupper(*p);
@@ -1335,19 +1668,12 @@ private:
                 } catch (...) {}
             }
         }
-        
-        nodelay(stdscr, TRUE);
-        noecho();
-        curs_set(0);
     }
 
     void compose_message() {
         int rows, cols;
         getmaxyx(stdscr, rows, cols);
         (void)cols;
-        curs_set(1);
-        echo();
-        nodelay(stdscr, FALSE);
 
         move(rows - 3, 0);
         clrtoeol();
@@ -1356,11 +1682,7 @@ private:
         attroff(A_BOLD);
 
         char buf[TNCUIState::MAX_MESSAGE_CHARS + 1] = {0};
-        mvgetnstr(rows - 3, 12, buf, TNCUIState::MAX_MESSAGE_CHARS);
-
-        nodelay(stdscr, TRUE);
-        noecho();
-        curs_set(0);
+        if (!prompt_input(rows - 3, 12, buf, TNCUIState::MAX_MESSAGE_CHARS)) return;
 
         std::string text(buf);
         if (text.empty()) return;
@@ -1379,14 +1701,14 @@ private:
 
     bool should_skip_field(int field) {
         // Hide OFDM-only fields when in MFSK mode
-        if (state_.modem_type_index == 1) {
-            if (field == FIELD_MODULATION || field == FIELD_CODERATE || field == FIELD_FRAMESIZE)
+        if (state_.modem_type_index != 0) {
+            if (field == FIELD_MODULATION || field == FIELD_CODERATE ||
+                field == FIELD_FRAMESIZE || field == FIELD_POSTAMBLE)
                 return true;
         }
-        // Hide MFSK-only fields when in OFDM mode
-        if (state_.modem_type_index == 0) {
-            if (field == FIELD_MFSK_MODE) return true;
-        }
+        if (state_.modem_type_index != 1 && field == FIELD_MFSK_MODE) return true;
+        if (state_.modem_type_index != 2 &&
+            (field == FIELD_ROBUST_MODE || field == FIELD_ROBUST_MTU)) return true;
         if (state_.ptt_type_index != 2) {  // not VOX
             if (field == FIELD_VOX_FREQ || field == FIELD_VOX_LEAD || field == FIELD_VOX_TAIL) {
                 return true;
@@ -1407,10 +1729,106 @@ private:
         return false;
     }
     
+
+    // must mirror draw_config's order/spacing exactly -- a drifted map
+    // scrolls the selection off-screen and breaks mouse click mapping
+    int config_field_row(int field) const {
+        int row = 0;
+        row++;
+        if (field == FIELD_CALLSIGN) return row;
+        row++;
+        if (field == FIELD_MODEM_TYPE) return row;
+        row++;
+        if (state_.modem_type_index == 0) {
+            if (field == FIELD_MODULATION) return row;
+            row++;
+            if (field == FIELD_CODERATE) return row;
+            row++;
+            if (field == FIELD_FRAMESIZE) return row;
+            row++;
+            if (field == FIELD_POSTAMBLE) return row;
+            row++;
+        } else if (state_.modem_type_index == 1) {
+            if (field == FIELD_MFSK_MODE) return row;
+            row++;
+        } else {
+            if (field == FIELD_ROBUST_MODE) return row;
+            row++;
+            if (field == FIELD_ROBUST_MTU) return row;
+            row++;
+        }
+        if (field == FIELD_FREQ) return row;
+        row += 2;
+        row++;
+        if (field == FIELD_CSMA) return row;
+        row++;
+        if (field == FIELD_THRESHOLD) return row;
+        row++;
+        row++;
+        if (field == FIELD_PERSISTENCE) return row;
+        row++;
+        if (field == FIELD_CSMA_INFO) return row;
+        row += 2;
+        row += 2;
+        if (field == FIELD_FRAGMENTATION) return row;
+        row += 2;
+        row++;
+        if (field == FIELD_TX_BLANKING) return row;
+        row += 2;
+        row++;
+        if (field == FIELD_AUDIO_INPUT) return row;
+        row++;
+        if (field == FIELD_AUDIO_OUTPUT) return row;
+        row++;
+        if (field == FIELD_PTT_TYPE) return row;
+        row++;
+        if (state_.ptt_type_index == 2) {
+            if (field == FIELD_VOX_FREQ) return row;
+            row++;
+            if (field == FIELD_VOX_LEAD) return row;
+            row++;
+            if (field == FIELD_VOX_TAIL) return row;
+            row++;
+        }
+        if (state_.ptt_type_index == 3) {
+            if (field == FIELD_COM_PORT) return row;
+            row++;
+            if (field == FIELD_COM_LINE) return row;
+            row++;
+            if (field == FIELD_COM_INVERT) return row;
+            row++;
+        }
+#ifdef WITH_CM108
+        if (state_.ptt_type_index == 4) {
+            if (field == FIELD_CM108_GPIO) return row;
+            row++;
+            if (field == FIELD_CM108_DEVICE) return row;
+            row++;
+        }
+#endif
+        row++;
+        row++;
+        if (field == FIELD_NET_PORT) return row;
+        row += 2;
+        row++;
+        if (field == FIELD_PRESET) return row;
+        return row;
+    }
+
     void adjust_field(int delta) {
         switch (current_field_) {
             case FIELD_MODEM_TYPE:
-                state_.modem_type_index = (state_.modem_type_index + delta + 2) % 2;
+                state_.modem_type_index = (state_.modem_type_index + delta + 3) % 3;
+                state_.update_modem_info();
+                break;
+            case FIELD_ROBUST_MODE:
+                state_.robust_mode_index = (state_.robust_mode_index % 5 + delta + 5) % 5
+                                         + 5 * (state_.robust_mode_index / 5);
+                state_.update_modem_info();
+                break;
+            case FIELD_ROBUST_MTU:
+                state_.robust_mode_index = state_.robust_mode_index % 5
+                                         + (state_.robust_mode_index < 5 ? 5 : 0);
                 state_.update_modem_info();
                 break;
             case FIELD_MFSK_MODE:
@@ -1421,10 +1839,16 @@ private:
                 state_.modulation_index = (state_.modulation_index + delta + 8) % 8;
                 break;
             case FIELD_CODERATE:
-                state_.code_rate_index = (state_.code_rate_index + delta + 5) % 5;
+                do {
+                    state_.code_rate_index = (state_.code_rate_index + delta +
+                        (int)CODE_RATE_OPTIONS.size()) % (int)CODE_RATE_OPTIONS.size();
+                } while (state_.code_rate_index >= 5);
                 break;
             case FIELD_FRAMESIZE:
                 state_.frame_size = (state_.frame_size + delta + 3) % 3;
+                break;
+            case FIELD_POSTAMBLE:
+                state_.postamble = !state_.postamble;
                 break;
             case FIELD_CSMA:
                 state_.csma_enabled = !state_.csma_enabled;
@@ -1837,18 +2261,10 @@ private:
         
         mvaddstr(dialog_y, dialog_x + 2, " Save Preset ");
         mvaddstr(dialog_y + 2, dialog_x + 2, "Name: ");
-        
-        curs_set(1);
-        echo();
-        nodelay(stdscr, FALSE);
-        
+
         char buf[32] = {0};
-        mvgetnstr(dialog_y + 2, dialog_x + 8, buf, 24);
-        
-        nodelay(stdscr, TRUE);
-        noecho();
-        curs_set(0);
-        
+        if (!prompt_input(dialog_y + 2, dialog_x + 8, buf, 24)) return;
+
         if (strlen(buf) > 0) {
             // replace any commas with underscores, commas are the delimiter
             for (char* p = buf; *p; p++) {
@@ -1918,9 +2334,13 @@ private:
     }
     
     void draw() {
-        frame_counter_++;  
-        update_calibration();  
-        
+        frame_counter_++;
+        update_calibration();
+
+        if (current_tab_ >= tab_count()) current_tab_ = 0;
+        state_.rig_poll_enabled = (current_tab_ == 5);
+        if (current_tab_ == 5 && rig_should_skip(rig_field_)) rig_field_ = RIG_FIELD_FREQ;
+
         int rows, cols;
         getmaxyx(stdscr, rows, cols);
         erase();
@@ -1966,6 +2386,11 @@ private:
             printw("  %s %dHz",
                    MFSK_MODE_OPTIONS[state_.mfsk_mode_index].c_str(),
                    state_.center_freq);
+        } else if (state_.modem_type_index == 2) {
+            printw("  %s %s %dHz",
+                   ROBUST_MODE_OPTIONS[state_.robust_mode_index % 5].c_str(),
+                   state_.robust_mode_index >= 5 ? "170B" : "510B",
+                   state_.center_freq);
         } else {
             printw("  %s %s %s %dHz",
                    MODULATION_OPTIONS[state_.modulation_index].c_str(),
@@ -2008,10 +2433,11 @@ private:
         else
 
             snprintf(utils_tab, sizeof(utils_tab), "UTILS");
-        const char* tabs[] = {"STATUS", "CONFIG", "LOG", utils_tab, "SCOPE"};
-        int tab_width = (cols - 4) / 5;
+        const char* tabs[] = {"STATUS", "CONFIG", "LOG", utils_tab, "SCOPE", "RIG"};
+        int ntabs = tab_count();
+        int tab_width = (cols - 4) / ntabs;
 
-        for (int i = 0; i < 5; i++) {
+        for (int i = 0; i < ntabs; i++) {
             int tx = 2 + i * tab_width;
 
             if (i == current_tab_) {
@@ -2045,8 +2471,10 @@ private:
             draw_log(content_y, content_h, cols);
         } else if (current_tab_ == 3) {
             draw_utils(content_y, content_h, cols);
-        } else {
+        } else if (current_tab_ == 4) {
             draw_scope(content_y, content_h, cols);
+        } else {
+            draw_rig(content_y, content_h, cols);
         }
         
         // Footer
@@ -2059,6 +2487,8 @@ private:
             mvaddstr(rows - 1, 2, " ^/v scroll  PgUp/Dn page  F1 help  Q quit ");
         } else if (current_tab_ == 3) {
             mvaddstr(rows - 1, 2, " 1-7 select  Enter run  F1 help  Q quit ");
+        } else if (current_tab_ == 5) {
+            mvaddstr(rows - 1, 2, " ^/v nav  </> adjust  Enter set/tune  F1 help  Q quit ");
         } else if (current_tab_ == 4) {
             mvaddstr(rows - 1, 2, " Tab switch  F1 help  Q quit ");
         } else {
@@ -2068,6 +2498,9 @@ private:
         
         if (show_help_) {
             draw_help(rows, cols);
+        }
+        if (show_csma_help_) {
+            draw_csma_help(rows, cols);
         }
     }
     
@@ -2134,11 +2567,11 @@ private:
                 attron(A_DIM);
                 mvaddstr(y, c2, "  ---");
                 attroff(A_DIM);
-            } else if (ber_pct < 1.0f) {
+            } else if (ber_pct < 3.0f) {
                 attron(COLOR_PAIR(1) | A_BOLD);
                 mvprintw(y, c2, "%5.2f%%", ber_pct);
                 attroff(COLOR_PAIR(1) | A_BOLD);
-            } else if (ber_pct < 5.0f) {
+            } else if (ber_pct < 13.0f) {
                 attron(COLOR_PAIR(3) | A_BOLD);
                 mvprintw(y, c2, "%5.2f%%", ber_pct);
                 attroff(COLOR_PAIR(3) | A_BOLD);
@@ -2218,7 +2651,8 @@ private:
                           state_.symbol_errors.load() + 
                           state_.crc_errors.load() +
                           state_.rx_error_count.load();
-        if (syncs > 0) {
+        if (state_.modem_type_index == 1) {
+        } else if (syncs > 0) {
             float err_pct = 100.0f * total_errors / syncs;
             addstr("Err");
             if (total_errors == 0) {
@@ -2513,84 +2947,12 @@ private:
         int start_y = y;
         int visible_rows = h - 2;  
         
-        auto get_field_row = [this](int field) -> int {
-            int row = 0;
-            row++; // header
-            if (field == FIELD_CALLSIGN) return row;
-            row++;
-            if (field == FIELD_MODEM_TYPE) return row;
-            row++;
-            if (state_.modem_type_index == 0) {
-                if (field == FIELD_MODULATION) return row;
-                row++;
-                if (field == FIELD_CODERATE) return row;
-                row++;
-                if (field == FIELD_FRAMESIZE) return row;
-                row++;
-            } else {
-                // MFSK field
-                if (field == FIELD_MFSK_MODE) return row;
-                row++;
-            }
-            if (field == FIELD_FREQ) return row;
-            row += 2;
-            // CSMA section
-            row++; // header
-            if (field == FIELD_CSMA) return row;
-            row++;
-            if (field == FIELD_THRESHOLD) return row;
-            row++;
-            row++; // 
-            if (field == FIELD_PERSISTENCE) return row;
-            row += 2;
-            // AUDIO/PTT section
-            row++; // header
-            if (field == FIELD_AUDIO_INPUT) return row;
-            row++;
-            if (field == FIELD_AUDIO_OUTPUT) return row;
-            row++;
-            if (field == FIELD_PTT_TYPE) return row;
-            row++;
-            // VOX fields 
-            if (state_.ptt_type_index == 2) {
-                if (field == FIELD_VOX_FREQ) return row;
-                row++;
-                if (field == FIELD_VOX_LEAD) return row;
-                row++;
-            }
-            // COM fields, only when com selected as ptt
-            if (state_.ptt_type_index == 3) {
-                if (field == FIELD_COM_PORT) return row;
-                row++;
-                if (field == FIELD_COM_LINE) return row;
-                row++;
-                if (field == FIELD_COM_INVERT) return row;
-                row++;
-            }
-#ifdef WITH_CM108
-            // CM108 fields, only when CM108 selected as PTT
-            if (state_.ptt_type_index == 4) {
-                if (field == FIELD_CM108_GPIO) return row;
-                row++;
-                if (field == FIELD_CM108_DEVICE) return row;
-                row++;
-            }
-#endif
-            row++;
-            // NETWORK section
-            row++; // header
-            if (field == FIELD_NET_PORT) return row;
-            row += 2;
-            // PRESET section
-            row++; // header
-            if (field == FIELD_PRESET) return row;
-            return row;
-        };
+
         
 
 
         if (current_tab_ == 1) {
-            int field_row = get_field_row(current_field_);
+            int field_row = config_field_row(current_field_);
             if (field_row < config_scroll_ + 2) {
                 config_scroll_ = std::max(0, field_row - 2);
             } else if (field_row > config_scroll_ + visible_rows - 3) {
@@ -2649,11 +3011,24 @@ private:
             if (dy >= 0) draw_selector_field(dy, c1, c2, "Frame Size", FIELD_FRAMESIZE,
                                state_.frame_size == 0 ? "SHORT" : state_.frame_size == 2 ? "LONG" : "NORMAL");
             row++;
-        } else {
+
+            dy = visible_y(row);
+            if (dy >= 0) draw_toggle_field(dy, c1, c2, "Postamble", FIELD_POSTAMBLE, state_.postamble);
+            row++;
+        } else if (state_.modem_type_index == 1) {
             // MFSK field
             dy = visible_y(row);
             if (dy >= 0) draw_selector_field(dy, c1, c2, "MFSK Mode", FIELD_MFSK_MODE,
                                MFSK_MODE_OPTIONS[state_.mfsk_mode_index]);
+            row++;
+        } else {
+            dy = visible_y(row);
+            if (dy >= 0) draw_selector_field(dy, c1, c2, "RDM Mode", FIELD_ROBUST_MODE,
+                               ROBUST_MODE_OPTIONS[state_.robust_mode_index % 5]);
+            row++;
+            dy = visible_y(row);
+            if (dy >= 0) draw_selector_field(dy, c1, c2, "Frame", FIELD_ROBUST_MTU,
+                               ROBUST_MTU_OPTIONS[state_.robust_mode_index / 5]);
             row++;
         }
 
@@ -2669,6 +3044,8 @@ private:
         if (dy >= 0) {
             attron(A_DIM);
             mvaddstr(dy, c1, "CSMA");
+            mvaddnstr(dy, c1 + 6, "waits for a clear channel before transmitting",
+                      std::max(0, divider - (c1 + 6) - 1));
             attroff(A_DIM);
         }
         row++;
@@ -2712,6 +3089,15 @@ private:
             char slot_buf[32];
             snprintf(slot_buf, sizeof(slot_buf), "%dms", state_.slot_time_ms);
             mvaddstr(dy, c2 + 6, slot_buf);
+        }
+        row++;
+
+        dy = visible_y(row);
+        if (dy >= 0) {
+            bool sel_info = (current_field_ == FIELD_CSMA_INFO);
+            if (sel_info) attron(A_BOLD); else attron(A_DIM);
+            mvprintw(dy, c1, "%s[?] Info", sel_info ? "> " : "  ");
+            if (sel_info) attroff(A_BOLD); else attroff(A_DIM);
         }
         row += 2;
         
@@ -2796,9 +3182,14 @@ private:
                 char vox_lead_buf[32];
                 snprintf(vox_lead_buf, sizeof(vox_lead_buf), "%d ms", state_.vox_lead_ms);
                 draw_selector_field(dy, c1, c2, "VOX Lead", FIELD_VOX_LEAD, vox_lead_buf);
+            }
+            row++;
+
+            dy = visible_y(row);
+            if (dy >= 0) {
                 char vox_tail_buf[32];
-                snprintf(vox_tail_buf, sizeof(vox_tail_buf), "%dms", state_.vox_tail_ms);
-                mvaddstr(dy, c2 + 8, vox_tail_buf);
+                snprintf(vox_tail_buf, sizeof(vox_tail_buf), "%d ms", state_.vox_tail_ms);
+                draw_selector_field(dy, c1, c2, "VOX Tail", FIELD_VOX_TAIL, vox_tail_buf);
             }
             row++;
         }
@@ -3117,10 +3508,14 @@ private:
         }
     }
     
-    void draw_field(int y, int c1, int c2, const char* label, int field, 
+    void draw_field(int y, int c1, int c2, const char* label, int field,
                     const std::string& value, bool editable) {
-        bool sel = (field == current_field_);
-        
+        draw_field_ex(y, c1, c2, label, field == current_field_, value, editable);
+    }
+
+    void draw_field_ex(int y, int c1, int c2, const char* label, bool sel,
+                       const std::string& value, bool editable) {
+
         if (sel) {
             attron(A_BOLD);
             mvaddch(y, c1 - 2, '>');
@@ -3145,8 +3540,12 @@ private:
     
     void draw_selector_field(int y, int c1, int c2, const char* label, int field,
                              const std::string& value) {
-        bool sel = (field == current_field_);
-        
+        draw_selector_field_ex(y, c1, c2, label, field == current_field_, value);
+    }
+
+    void draw_selector_field_ex(int y, int c1, int c2, const char* label, bool sel,
+                                const std::string& value) {
+
         if (sel) {
             attron(A_BOLD);
             mvaddch(y, c1 - 2, '>');
@@ -3576,12 +3975,89 @@ private:
     void draw_utils(int y, int h, int cols) {
         int c1 = 3;
         int c2 = cols / 2 + 2;
-        
-        attron(COLOR_PAIR(4) | A_BOLD);
-        mvaddstr(y, c1, "[ ACTIONS ]");
-        attroff(COLOR_PAIR(4) | A_BOLD);
-        y++;
-        
+        int start_y = y;
+
+        auto msgs = state_.get_messages();
+        int show = std::min((int)msgs.size(), 4);
+
+        int total_rows = 10 + utils_visible_slots() + std::max(1, show);
+        if (state_.perf_logger) {
+            int right_rows = 4 + std::max(1, (int)state_.perf_logger->snapshot().size());
+            total_rows = std::max(total_rows, right_rows);
+        }
+        int max_scroll = std::max(0, total_rows - h);
+        utils_max_scroll_ = max_scroll;
+        if (utils_scroll_ > max_scroll) utils_scroll_ = max_scroll;
+        if (utils_scroll_ < 0) utils_scroll_ = 0;
+        int row = 0;
+        auto vy = [&](int logical_row) -> int {
+            int screen_row = logical_row - utils_scroll_;
+            if (screen_row < 0 || screen_row >= h) return -1;
+            return start_y + screen_row;
+        };
+
+        if (state_.perf_logger) {
+            int ry = start_y;
+            auto rrow = [&](int r) -> int {
+                int screen_row = r - utils_scroll_;
+                if (screen_row < 0 || screen_row >= h) return -1;
+                return start_y + screen_row;
+            };
+            int r = 0, dy2;
+            if ((dy2 = rrow(r++)) >= 0) {
+                attron(COLOR_PAIR(4) | A_BOLD);
+                mvaddstr(dy2, c2, "[ RX PERFORMANCE ]");
+                attroff(COLOR_PAIR(4) | A_BOLD);
+            }
+            if ((dy2 = rrow(r++)) >= 0) {
+                attron(A_DIM);
+                mvprintw(dy2, c2, "%-13s %4s %4s %6s %6s %6s %6s",
+                         "MODE", "N", "LOST", "SNRav", "SNRmn", "SNRmx", "BERav");
+                attroff(A_DIM);
+            }
+            auto rows = state_.perf_logger->snapshot();
+            for (const auto& a : rows) {
+                if ((dy2 = rrow(r++)) < 0)
+                    break;
+                char mode[14];
+                snprintf(mode, sizeof(mode), "%s", a.mode.c_str());
+                if (a.ber_avg() >= 0)
+                    mvprintw(dy2, c2, "%-13s %4d %4d %5.1f  %5.1f  %5.1f  %5.2f%%",
+                             mode, a.frames, a.lost, a.snr_avg(), a.snr_min,
+                             a.snr_max, a.ber_avg());
+                else
+                    mvprintw(dy2, c2, "%-13s %4d %4d %5.1f  %5.1f  %5.1f      -",
+                             mode, a.frames, a.lost, a.snr_avg(), a.snr_min,
+                             a.snr_max);
+            }
+            if (rows.empty() && (dy2 = rrow(r++)) >= 0) {
+                attron(A_DIM);
+                mvaddstr(dy2, c2, "(no frames decoded yet)");
+                attroff(A_DIM);
+            }
+            r++;
+            if ((dy2 = rrow(r++)) >= 0) {
+                attron(A_DIM);
+                if (state_.perf_logger->csv_enabled())
+                    mvprintw(dy2, c2, "CSV: ON  %d rows  %s",
+                             state_.perf_logger->total(),
+                             state_.perf_logger->csv_path().c_str());
+                else
+                    mvprintw(dy2, c2, "CSV: OFF (%d frames tracked)",
+                             state_.perf_logger->total());
+                attroff(A_DIM);
+            }
+            (void)ry;
+        }
+
+        int dy = vy(row);
+        if (dy >= 0) {
+            attron(COLOR_PAIR(4) | A_BOLD);
+            mvaddstr(dy, c1, "[ ACTIONS ]");
+            attroff(COLOR_PAIR(4) | A_BOLD);
+        }
+        row++;
+
         const char* actions[] = {
             "Send Test Pattern",
             "Send Random Data",
@@ -3589,115 +4065,221 @@ private:
             "Clear Stats",
             "Auto Threshold",
             "Reconnect Audio",
-            "Compose Message"
+            "Compose Message",
+            "Auto Send",
+            "Perf Log CSV",
+            "Reset Perf Stats",
+            "Auto Alternate"
         };
 
-        for (int i = 0; i < 7; i++) {
-            bool sel = (utils_selection_ == i);
+        int nslots = utils_visible_slots();
+        for (int slot = 0; slot < nslots; slot++) {
+            dy = vy(row);
+            row++;
+            if (dy < 0) continue;
+            bool sel = (utils_selection_ == slot);
+            if (slot == UTILS_TOP_ACTIONS) {
+                if (sel) attron(A_BOLD); else attron(A_DIM);
+                mvprintw(dy, c1, "%s[%c] TESTING", sel ? "> " : "  ",
+                         state_.utils_testing_open ? '-' : '+');
+                if (sel) attroff(A_BOLD); else attroff(A_DIM);
+                if (!state_.utils_testing_open) {
+                    attron(A_DIM);
+                    printw("  send tools and mode roster");
+                    attroff(A_DIM);
+                }
+                continue;
+            }
+            int i = utils_slot_action(slot);
+            const char* label = i >= 11 ? ALT_MODES[i - 11].label : actions[i];
+            const char* indent = i >= 11 ? "   " : "";
             if (sel) {
                 attron(A_BOLD);
-                mvprintw(y, c1, "> %d. %s", i + 1, actions[i]);
+                mvprintw(dy, c1, "> %d. %s%s", i + 1, indent, label);
                 attroff(A_BOLD);
-                
-                if (i == 4 && calibrating_threshold_) {
-                    int elapsed = (frame_counter_ - calibration_start_frame_) / 30;
-                    attron(COLOR_PAIR(4) | A_BOLD);
-                    printw("  [%ds...]", 3 - elapsed);
-                    attroff(COLOR_PAIR(4) | A_BOLD);
-                }
             } else {
                 attron(A_DIM);
-                mvprintw(y, c1, "  %d. %s", i + 1, actions[i]);
+                mvprintw(dy, c1, "  %d. %s%s", i + 1, indent, label);
                 attroff(A_DIM);
             }
-            y++;
+            if (i >= 11) {
+                bool on = (state_.alt_mode_mask >> (i - 11)) & 1;
+                if (on) {
+                    attron(COLOR_PAIR(1) | A_BOLD);
+                    printw("  [x]");
+                    attroff(COLOR_PAIR(1) | A_BOLD);
+                } else {
+                    printw("  [ ]");
+                }
+                if (auto_alt_enabled_ && alt_index_ == i - 11) {
+                    attron(COLOR_PAIR(4) | A_BOLD);
+                    printw("  <TX");
+                    attroff(COLOR_PAIR(4) | A_BOLD);
+                }
+            }
+            if (i == 10) {
+                if (auto_alt_enabled_) {
+                    attron(COLOR_PAIR(1) | A_BOLD);
+                    printw("  [x]");
+                    attroff(COLOR_PAIR(1) | A_BOLD);
+                    attron(A_DIM);
+                    printw(" cycling %d modes @ 25%% duty", __builtin_popcount(state_.alt_mode_mask));
+                    attroff(A_DIM);
+                } else {
+                    printw("  [ ]");
+                    attron(A_DIM);
+                    printw(" cycle the checked modes below");
+                    attroff(A_DIM);
+                }
+            }
+            if (i == 4 && calibrating_threshold_ && sel) {
+                int elapsed = (frame_counter_ - calibration_start_frame_) / 30;
+                attron(COLOR_PAIR(4) | A_BOLD);
+                printw("  [%ds...]", 3 - elapsed);
+                attroff(COLOR_PAIR(4) | A_BOLD);
+            }
+            if (i == 8 && state_.perf_logger) {
+                if (state_.perf_logger->csv_enabled()) {
+                    attron(COLOR_PAIR(1) | A_BOLD);
+                    printw("  [x]");
+                    attroff(COLOR_PAIR(1) | A_BOLD);
+                } else {
+                    printw("  [ ]");
+                }
+            }
+            if (i == 7) {
+                if (auto_send_enabled_) {
+                    attron(COLOR_PAIR(1) | A_BOLD);
+                    printw("  [x]");
+                    attroff(COLOR_PAIR(1) | A_BOLD);
+                    attron(A_DIM);
+                    if (state_.transmitting.load()) {
+                        printw(" lorem %dB, TX...", state_.mtu_bytes);
+                    } else {
+                        float period = auto_send_period();
+                        float wait = period - std::chrono::duration<float>(
+                            std::chrono::steady_clock::now() - auto_send_last_).count();
+                        if (wait < 0) wait = 0;
+                        printw(" lorem %dB, next in %.0fs", state_.mtu_bytes, wait);
+                    }
+                    attroff(A_DIM);
+                } else {
+                    if (sel) attron(A_BOLD); else attron(A_DIM);
+                    printw("  [ ]");
+                    if (sel) attroff(A_BOLD); else attroff(A_DIM);
+                    attron(A_DIM);
+                    printw(" lorem %dB @ 25%% duty", state_.mtu_bytes);
+                    attroff(A_DIM);
+                }
+            }
         }
-        
-        y++;
-        
-        attron(COLOR_PAIR(4) | A_BOLD);
-        mvaddstr(y, c1, "[ TEST INFO ]");
-        attroff(COLOR_PAIR(4) | A_BOLD);
-        y++;
-        
-        attron(A_DIM);
-        mvaddstr(y, c1, "MTU");
-        attroff(A_DIM);
-        mvprintw(y, c1 + 14, "%d bytes", state_.mtu_bytes);
-        if (state_.fragmentation_enabled) {
-            attron(COLOR_PAIR(4));
-            printw(" [FRAG]");
-            attroff(COLOR_PAIR(4));
-        }
-        y++;
-        
-        bool size_selected = (utils_selection_ == 0 || utils_selection_ == 1);
-        if (size_selected) {
-            attron(A_BOLD | COLOR_PAIR(4));
-        } else {
-            attron(A_DIM);
-        }
-        mvaddstr(y, c1, "Test Size");
-        if (size_selected) {
-            attroff(A_BOLD | COLOR_PAIR(4));
-            mvprintw(y, c1 + 14, "< %d bytes >", state_.random_data_size);
-        } else {
-            attroff(A_DIM);
-            mvprintw(y, c1 + 14, "%d bytes", state_.random_data_size);
-        }
-        
-        if (state_.fragmentation_enabled && state_.random_data_size > state_.mtu_bytes) {
-            int data_per_frag = state_.mtu_bytes - 5;  // 5-byte fragment header
-            int num_frags = (state_.random_data_size + data_per_frag - 1) / data_per_frag;
-            attron(COLOR_PAIR(3));
-            printw(" (%d frags)", num_frags);
-            attroff(COLOR_PAIR(3));
-        }
-        y++;
-        
-        attron(A_DIM);
-        mvaddstr(y, c1, "Pattern");
-        attroff(A_DIM);
-        mvaddstr(y, c1 + 14, "0x55 (alternating)");
-        y++;
-        
-        attron(A_DIM);
-        mvaddstr(y, c1, "Frames Sent");
-        attroff(A_DIM);
-        mvprintw(y, c1 + 14, "%d", state_.tx_frame_count.load());
-        y++;
 
-        y++;
+        row++;
+
+        dy = vy(row);
+        if (dy >= 0) {
+            attron(COLOR_PAIR(4) | A_BOLD);
+            mvaddstr(dy, c1, "[ TEST INFO ]");
+            attroff(COLOR_PAIR(4) | A_BOLD);
+        }
+        row++;
+
+        dy = vy(row);
+        if (dy >= 0) {
+            attron(A_DIM);
+            mvaddstr(dy, c1, "MTU");
+            attroff(A_DIM);
+            mvprintw(dy, c1 + 14, "%d bytes", state_.mtu_bytes);
+            if (state_.fragmentation_enabled) {
+                attron(COLOR_PAIR(4));
+                printw(" [FRAG]");
+                attroff(COLOR_PAIR(4));
+            }
+        }
+        row++;
+
+        dy = vy(row);
+        if (dy >= 0) {
+            bool size_selected = (utils_selection_ == 0 || utils_selection_ == 1);
+            if (size_selected) {
+                attron(A_BOLD | COLOR_PAIR(4));
+            } else {
+                attron(A_DIM);
+            }
+            mvaddstr(dy, c1, "Test Size");
+            if (size_selected) {
+                attroff(A_BOLD | COLOR_PAIR(4));
+                mvprintw(dy, c1 + 14, "< %d bytes >", state_.random_data_size);
+            } else {
+                attroff(A_DIM);
+                mvprintw(dy, c1 + 14, "%d bytes", state_.random_data_size);
+            }
+            if (state_.fragmentation_enabled && state_.random_data_size > state_.mtu_bytes) {
+                int data_per_frag = state_.mtu_bytes - 5;  // 5-byte fragment header
+                int num_frags = (state_.random_data_size + data_per_frag - 1) / data_per_frag;
+                attron(COLOR_PAIR(3));
+                printw(" (%d frags)", num_frags);
+                attroff(COLOR_PAIR(3));
+            }
+        }
+        row++;
+
+        dy = vy(row);
+        if (dy >= 0) {
+            attron(A_DIM);
+            mvaddstr(dy, c1, "Pattern");
+            attroff(A_DIM);
+            mvaddstr(dy, c1 + 14, "0x55 (alternating)");
+        }
+        row++;
+
+        dy = vy(row);
+        if (dy >= 0) {
+            attron(A_DIM);
+            mvaddstr(dy, c1, "Frames Sent");
+            attroff(A_DIM);
+            mvprintw(dy, c1 + 14, "%d", state_.tx_frame_count.load());
+        }
+        row++;
+
+        row++;
         state_.unread_messages = 0;
-        attron(COLOR_PAIR(4) | A_BOLD);
-        mvaddstr(y, c1, "[ MESSAGES ]");
-        attroff(COLOR_PAIR(4) | A_BOLD);
-        y++;
-        attron(A_DIM);
-        mvaddstr(y, c1, "Use this for testing only");
-        y++;
-        mvaddstr(y, c1, "U");
-        attroff(A_DIM);
-        y++;
+        dy = vy(row);
+        if (dy >= 0) {
+            attron(COLOR_PAIR(4) | A_BOLD);
+            mvaddstr(dy, c1, "[ MESSAGES ]");
+            attroff(COLOR_PAIR(4) | A_BOLD);
+        }
+        row++;
+        dy = vy(row);
+        if (dy >= 0) {
+            attron(A_DIM);
+            mvaddstr(dy, c1, "Use this for testing only");
+            attroff(A_DIM);
+        }
+        row++;
         {
-            auto msgs = state_.get_messages();
             int width = cols / 2 - c1 - 2;
             if (width < 20) width = 20;
-            int show = std::min((int)msgs.size(), 4);
             if (msgs.empty()) {
-                attron(A_DIM);
-                mvaddstr(y, c1, "(no messages)");
-                attroff(A_DIM);
-                y++;
+                dy = vy(row);
+                row++;
+                if (dy >= 0) {
+                    attron(A_DIM);
+                    mvaddstr(dy, c1, "(no messages)");
+                    attroff(A_DIM);
+                }
             }
             for (int i = (int)msgs.size() - show; i < (int)msgs.size(); i++) {
+                dy = vy(row);
+                row++;
+                if (dy < 0) continue;
                 const auto& m = msgs[i];
                 std::string line = m.time + " " + (m.outgoing ? "-> " : "<- ") + m.from + ": " + m.text;
                 int pair = m.outgoing ? 2 : 1;
                 attron(COLOR_PAIR(pair));
-                mvaddnstr(y, c1, line.c_str(), width);
+                mvaddnstr(dy, c1, line.c_str(), width);
                 attroff(COLOR_PAIR(pair));
-                y++;
             }
         }
 
@@ -3754,7 +4336,12 @@ private:
     }
     
     void handle_utils_action() {
-        switch (utils_selection_) {
+        int action = utils_slot_action(utils_selection_);
+        if (action < 0) {
+            state_.utils_testing_open = !state_.utils_testing_open;
+            return;
+        }
+        switch (action) {
             case 0: {
                 if (state_.on_send_data) {
                     std::vector<uint8_t> data(state_.random_data_size, 0x55);
@@ -3796,7 +4383,7 @@ private:
                 state_.crc_errors = 0;
                 state_.stats_reset_requested = true;
                 state_.total_tx_time = 0;
-                state_.add_log("S");
+                state_.add_log("Stats cleared");
                 break;
             }
             case 4: {
@@ -3826,9 +4413,521 @@ private:
                 compose_message();
                 break;
             }
+            case 7: {
+                auto_send_enabled_ = !auto_send_enabled_;
+                if (auto_send_enabled_) {
+                    auto_alt_enabled_ = false;
+                    auto_send_last_ = std::chrono::steady_clock::now() -
+                        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                            std::chrono::duration<float>(auto_send_period()));
+                    state_.add_log("Auto send ON (lorem, 25% duty)");
+                } else {
+                    state_.add_log("Auto send OFF");
+                }
+                break;
+            }
+            case 8: {
+                if (state_.perf_logger) {
+                    bool on = !state_.perf_logger->csv_enabled();
+                    state_.perf_logger->set_csv_enabled(on);
+                    state_.add_log(on ? "Perf CSV log ON: " + state_.perf_logger->csv_path()
+                                      : "Perf CSV log OFF");
+                }
+                break;
+            }
+            case 9: {
+                if (state_.perf_logger) {
+                    state_.perf_logger->reset();
+                    state_.add_log("Perf stats reset");
+                }
+                break;
+            }
+            case 10: {
+                if (!auto_alt_enabled_ && state_.alt_mode_mask == 0) {
+                    state_.add_log("Auto alternate: check some modes below first");
+                    break;
+                }
+                auto_alt_enabled_ = !auto_alt_enabled_;
+                if (auto_alt_enabled_) {
+                    auto_send_enabled_ = false;
+                    auto_send_last_ = std::chrono::steady_clock::now() -
+                        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                            std::chrono::duration<float>(auto_send_period()));
+                    state_.add_log("Auto alternate ON (" +
+                        std::to_string(__builtin_popcount(state_.alt_mode_mask)) +
+                        " modes, 25% duty)");
+                } else {
+                    state_.add_log("Auto alternate OFF");
+                }
+                break;
+            }
+            default: {
+                if (action >= 11 &&
+                    action < 11 + ALT_MODE_COUNT) {
+                    int bit = action - 11;
+                    state_.alt_mode_mask ^= 1 << bit;
+                    state_.save_settings();
+                }
+                break;
+            }
         }
     }
-    
+
+    void apply_alt_mode(int idx) {
+        const AltMode& m = ALT_MODES[idx];
+        state_.modem_type_index = m.modem_type;
+        if (m.modem_type == 0) {
+            state_.modulation_index = m.modulation;
+            state_.code_rate_index = m.code_rate;
+            state_.frame_size = m.frame_size;
+        } else if (m.modem_type == 1) {
+            state_.mfsk_mode_index = m.mfsk_mode;
+        } else {
+            state_.robust_mode_index = m.robust_mode;
+        }
+        state_.update_modem_info();
+        if (state_.on_settings_changed)
+            state_.on_settings_changed(state_);
+    }
+
+    // one frame on air, three frame-times idle: 25% duty cycle keeps the
+    // finals safe on rigs rated for 50% digital operation.
+    float auto_send_period() const {
+        float p = state_.airtime_seconds * 4.0f;
+        return p > 4.0f ? p : 4.0f;
+    }
+
+    std::vector<uint8_t> lorem_payload(int n) {
+        static const char LOREM[] =
+            "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do "
+            "eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut "
+            "enim ad minim veniam, quis nostrud exercitation ullamco laboris "
+            "nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor "
+            "in reprehenderit in voluptate velit esse cillum dolore eu "
+            "fugiat nulla pariatur. ";
+        const int L = (int)sizeof(LOREM) - 1;
+        if (n < 1) n = 1;
+        int off = std::uniform_int_distribution<int>(0, L - 1)(auto_send_rng_);
+        std::vector<uint8_t> out(n);
+        for (int i = 0; i < n; i++)
+            out[i] = (uint8_t)LOREM[(off + i) % L];
+        return out;
+    }
+
+    static constexpr int UTILS_TOP_ACTIONS = 7;
+    int utils_visible_slots() const {
+        return state_.utils_testing_open ? UTILS_ACTION_COUNT + 1
+                                         : UTILS_TOP_ACTIONS + 1;
+    }
+    static int utils_slot_action(int slot) {
+        if (slot < UTILS_TOP_ACTIONS) return slot;
+        if (slot == UTILS_TOP_ACTIONS) return -1;
+        return slot - 1;
+    }
+
+    void utils_ensure_visible() {
+        int rows, cols;
+        getmaxyx(stdscr, rows, cols);
+        (void)cols;
+        int vis = rows - 6;
+        if (vis < 1) vis = 1;
+        int sel_row = 1 + utils_selection_;
+        if (sel_row < utils_scroll_)
+            utils_scroll_ = sel_row;
+        else if (sel_row >= utils_scroll_ + vis)
+            utils_scroll_ = sel_row - vis + 1;
+    }
+
+    void tick_auto_send() {
+        if ((!auto_send_enabled_ && !auto_alt_enabled_) || !state_.on_send_data)
+            return;
+        if (state_.transmitting.load() || state_.ptt_on.load() ||
+            state_.tx_queue_size.load() > 0) return;
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration<float>(now - auto_send_last_).count() < auto_send_period())
+            return;
+        auto_send_last_ = now;
+        unsigned seq;
+        if (auto_alt_enabled_) {
+            if (state_.alt_mode_mask == 0)
+                return;
+            do {
+                alt_index_ = (alt_index_ + 1) % ALT_MODE_COUNT;
+            } while (!((state_.alt_mode_mask >> alt_index_) & 1));
+            apply_alt_mode(alt_index_);
+            seq = alt_seqs_[alt_index_]++ % 100000;
+        } else {
+            seq = auto_send_seq_++ % 100000;
+        }
+        auto payload = lorem_payload(state_.mtu_bytes);
+        char hdr[16];
+        int hn = snprintf(hdr, sizeof(hdr), "SEQ:%05u:", seq);
+        for (int i = 0; i < hn && i < (int)payload.size(); i++)
+            payload[i] = (uint8_t)hdr[i];
+        state_.on_send_data(payload);
+    }
+
+
+    std::string rig_cmd(const std::string& cmd) {
+        if (!state_.on_rigctl_command) return "";
+        return state_.on_rigctl_command(cmd);
+    }
+
+    static std::string format_freq(long long hz) {
+        if (hz <= 0) return "---";
+        char buf[32];
+        if (hz >= 1000000) {
+            snprintf(buf, sizeof(buf), "%lld.%03lld.%03lld", hz / 1000000, (hz / 1000) % 1000, hz % 1000);
+        } else {
+            snprintf(buf, sizeof(buf), "%lld.%03lld", hz / 1000, hz % 1000);
+        }
+        return buf;
+    }
+
+    void set_rig_freq(long long hz) {
+        char cmd[48];
+        snprintf(cmd, sizeof(cmd), "+F %lld", hz);
+        if (TNCUIState::rig_ok(rig_cmd(cmd))) {
+            state_.rig_freq_hz = hz;
+            state_.add_log("Rig: freq set to " + format_freq(hz));
+        } else {
+            state_.add_log("Rig: set freq failed");
+        }
+        state_.rig_refresh_requested = true;
+    }
+
+    void adjust_rig_field(int delta) {
+        switch (rig_field_) {
+            case RIG_FIELD_FREQ: {
+                long long f = state_.rig_freq_hz.load();
+                if (f <= 0) {
+                    state_.add_log("Rig: no frequency data yet");
+                    break;
+                }
+                long long nf = f + delta * RIG_STEP_HZ[rig_step_index_];
+                if (nf < 0) nf = 0;
+                set_rig_freq(nf);
+                break;
+            }
+            case RIG_FIELD_STEP:
+                rig_step_index_ = (rig_step_index_ + delta + RIG_STEP_COUNT) % RIG_STEP_COUNT;
+                break;
+            case RIG_FIELD_MODE: {
+                std::string cur = state_.get_rig_mode();
+                int n = (int)RIG_MODE_OPTIONS.size();
+                int idx = -1;
+                for (int i = 0; i < n; i++) {
+                    if (RIG_MODE_OPTIONS[i] == cur) { idx = i; break; }
+                }
+                idx = idx < 0 ? (delta > 0 ? 0 : n - 1) : (idx + delta + n) % n;
+                const std::string& m = RIG_MODE_OPTIONS[idx];
+                if (TNCUIState::rig_ok(rig_cmd("+M " + m + " 0"))) {
+                    state_.set_rig_mode_cache(m);
+                    state_.add_log("Rig: mode set to " + m);
+                } else {
+                    state_.add_log("Rig: set mode " + m + " failed");
+                }
+                state_.rig_refresh_requested = true;
+                break;
+            }
+            case RIG_FIELD_POWER: {
+                float p = state_.rig_power_level.load();
+                if (p < 0) {
+                    state_.add_log("Rig: no power data yet");
+                    break;
+                }
+                p = std::max(0.0f, std::min(1.0f, p + delta * 0.05f));
+                char cmd[48];
+                snprintf(cmd, sizeof(cmd), "+L RFPOWER %.2f", p);
+                if (TNCUIState::rig_ok(rig_cmd(cmd))) {
+                    state_.rig_power_level = p;
+                } else {
+                    state_.add_log("Rig: set power failed");
+                }
+                state_.rig_refresh_requested = true;
+                break;
+            }
+            case RIG_FIELD_TUNER: {
+                int nv = state_.rig_tuner_on.load() == 1 ? 0 : 1;
+                char cmd[32];
+                snprintf(cmd, sizeof(cmd), "+U TUNER %d", nv);
+                if (TNCUIState::rig_ok(rig_cmd(cmd))) {
+                    state_.rig_tuner_on = nv;
+                    state_.add_log(std::string("Rig: tuner ") + (nv ? "ON" : "OFF"));
+                } else {
+                    state_.add_log("Rig: tuner toggle failed");
+                }
+                state_.rig_refresh_requested = true;
+                break;
+            }
+        }
+    }
+
+    void rig_enter_action() {
+        if (rig_field_ == RIG_FIELD_FREQ) {
+            edit_rig_freq();
+        } else if (rig_field_ == RIG_FIELD_TUNER) {
+            adjust_rig_field(1);
+        } else if (rig_field_ == RIG_FIELD_TUNE) {
+            state_.add_log("Rig: starting tune cycle...");
+            if (TNCUIState::rig_ok(rig_cmd("+G TUNE"))) {
+                state_.add_log("Rig: tune cycle started");
+            } else {
+                state_.add_log("Rig: tune failed (not supported?)");
+            }
+            state_.rig_refresh_requested = true;
+        }
+    }
+
+    void edit_rig_freq() {
+        int rows, cols;
+        getmaxyx(stdscr, rows, cols);
+
+        int dialog_w = 44;
+        int dialog_h = 5;
+        int dialog_x = (cols - dialog_w) / 2;
+        int dialog_y = (rows - dialog_h) / 2;
+
+        for (int y = dialog_y; y < dialog_y + dialog_h; y++) {
+            move(y, dialog_x);
+            for (int x = 0; x < dialog_w; x++) addch(' ');
+        }
+
+        attron(A_BOLD);
+        draw_box(dialog_y, dialog_x, dialog_h, dialog_w);
+        attroff(A_BOLD);
+        mvaddstr(dialog_y, dialog_x + 2, " Set Frequency ");
+        attron(A_DIM);
+        mvaddstr(dialog_y + 3, dialog_x + 2, "e.g. 7074 (kHz) or 14.074 (MHz)");
+        attroff(A_DIM);
+        mvaddstr(dialog_y + 2, dialog_x + 2, "Freq: ");
+
+        char buf[24] = {0};
+        if (!prompt_input(dialog_y + 2, dialog_x + 8, buf, 15)) return;
+
+        if (strlen(buf) == 0) return;
+
+        long long hz;
+        if (strchr(buf, '.')) {
+            hz = (long long)llround(atof(buf) * 1e6);
+        } else {
+            long long v = atoll(buf);
+            hz = v < 100000 ? v * 1000 : v;
+        }
+        if (hz < 10000 || hz > 470000000LL) {
+            state_.add_log("Rig: invalid frequency");
+            return;
+        }
+        set_rig_freq(hz);
+    }
+
+    void draw_rig_meter_bar(float value, float minv, float maxv, int width, int color_pair) {
+        attron(A_DIM);
+        addch('[');
+        attroff(A_DIM);
+
+        if (std::isnan(value)) {
+            attron(A_DIM);
+            for (int i = 0; i < width; i++) addch('-');
+            attroff(A_DIM);
+        } else {
+            float frac = (value - minv) / (maxv - minv);
+            frac = std::max(0.0f, std::min(1.0f, frac));
+            int filled = (int)(frac * width + 0.5f);
+            attron(COLOR_PAIR(color_pair) | A_BOLD);
+            for (int i = 0; i < filled; i++) addch('=');
+            attroff(COLOR_PAIR(color_pair) | A_BOLD);
+            for (int i = filled; i < width; i++) addch(' ');
+        }
+
+        attron(A_DIM);
+        addch(']');
+        attroff(A_DIM);
+    }
+
+    void draw_rig(int y, int h, int cols) {
+        (void)h;
+        int c1 = 3;
+        int c2 = 16;
+        int c3 = cols / 2 + 2;
+        int top = y;
+
+        attron(COLOR_PAIR(4) | A_BOLD);
+        mvaddstr(y, c1, "[ RIG CONTROL ]");
+        attroff(COLOR_PAIR(4) | A_BOLD);
+        attron(A_DIM);
+        printw("  rigctld %s:%d", state_.rigctl_host.c_str(), state_.rigctl_port);
+        attroff(A_DIM);
+        if (state_.rigctl_connected.load()) {
+            attron(COLOR_PAIR(1) | A_BOLD);
+            addstr("  OK");
+            attroff(COLOR_PAIR(1) | A_BOLD);
+        } else {
+            attron(COLOR_PAIR(2) | A_BOLD);
+            addstr("  --");
+            attroff(COLOR_PAIR(2) | A_BOLD);
+        }
+        y += 2;
+
+        attron(A_DIM);
+        mvaddstr(y, c1, "FREQUENCY");
+        attroff(A_DIM);
+        y++;
+
+        draw_field_ex(y, c1, c2, "Freq", rig_field_ == RIG_FIELD_FREQ,
+                      format_freq(state_.rig_freq_hz.load()), true);
+        y++;
+
+        draw_selector_field_ex(y, c1, c2, "Step", rig_field_ == RIG_FIELD_STEP,
+                               RIG_STEP_LABELS[rig_step_index_]);
+        y++;
+
+        std::string mode = state_.get_rig_mode();
+        draw_selector_field_ex(y, c1, c2, "Mode", rig_field_ == RIG_FIELD_MODE,
+                               mode.empty() ? "---" : mode);
+        y++;
+
+        float pwr = state_.rig_power_level.load();
+        char pwr_buf[16];
+        if (pwr >= 0) {
+            snprintf(pwr_buf, sizeof(pwr_buf), "%d%%", (int)lround(pwr * 100));
+        } else {
+            snprintf(pwr_buf, sizeof(pwr_buf), "---");
+        }
+        draw_selector_field_ex(y, c1, c2, "RF Power", rig_field_ == RIG_FIELD_POWER, pwr_buf);
+        y += 2;
+
+        attron(A_DIM);
+        mvaddstr(y, c1, "ANTENNA TUNER");
+        attroff(A_DIM);
+        if (state_.rig_tuner_supported.load() == 0) {
+            attron(A_DIM);
+            mvaddstr(y + 1, c1, "(not supported by rig)");
+            attroff(A_DIM);
+            y += 3;
+        } else {
+            y++;
+
+            int tuner = state_.rig_tuner_on.load();
+            draw_selector_field_ex(y, c1, c2, "Tuner", rig_field_ == RIG_FIELD_TUNER,
+                                   tuner < 0 ? "---" : (tuner ? "ON" : "OFF"));
+            y++;
+
+            bool sel = (rig_field_ == RIG_FIELD_TUNE);
+            if (sel) {
+                attron(A_BOLD);
+                mvaddch(y, c1 - 2, '>');
+                mvaddstr(y, c1, "Tune");
+                attroff(A_BOLD);
+                attron(COLOR_PAIR(4) | A_BOLD);
+                mvaddstr(y, c2, "[ START TUNE ]");
+                attroff(COLOR_PAIR(4) | A_BOLD);
+                attron(A_DIM);
+                addstr("  [enter]");
+                attroff(A_DIM);
+            } else {
+                attron(A_DIM);
+                mvaddstr(y, c1, "Tune");
+                mvaddstr(y, c2, "[ START TUNE ]");
+                attroff(A_DIM);
+            }
+            y += 2;
+        }
+
+        attron(A_DIM);
+        mvaddstr(y, c1, "Freq: Enter=type, </> step");
+        attroff(A_DIM);
+
+        int ry = top;
+        attron(COLOR_PAIR(4) | A_BOLD);
+        mvaddstr(ry, c3, "[ METERS ]");
+        attroff(COLOR_PAIR(4) | A_BOLD);
+
+        int64_t last = state_.rig_last_update_ms.load();
+        if (last > 0) {
+            int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            attron(A_DIM);
+            printw("  %.0fs ago", (now - last) / 1000.0f);
+            attroff(A_DIM);
+        }
+        ry += 2;
+
+        int bar_w = std::min(24, cols - c3 - 22);
+        if (bar_w < 10) bar_w = 10;
+
+        for (int i = 0; i < RIG_METER_COUNT; i++) {
+            float v = state_.rig_meter_values[i].load();
+            bool is_temp = strcmp(RIG_METERS[i].level, "TEMP_METER") == 0;
+            if (is_temp && std::isnan(v))
+                continue;
+
+            attron(A_DIM);
+            mvaddstr(ry, c3, RIG_METERS[i].label);
+            attroff(A_DIM);
+            move(ry, c3 + 9);
+
+            int pair = 1;
+            if (strcmp(RIG_METERS[i].level, "SWR") == 0 && !std::isnan(v)) {
+                pair = v < 1.5f ? 1 : v < 3.0f ? 3 : 2;
+            } else if (is_temp) {
+                pair = v < 60.0f ? 1 : v < 80.0f ? 3 : 2;
+            }
+            draw_rig_meter_bar(v, RIG_METERS[i].min, RIG_METERS[i].max, bar_w, pair);
+
+            if (std::isnan(v)) {
+                attron(A_DIM);
+                addstr(" ---");
+                attroff(A_DIM);
+            } else if (strcmp(RIG_METERS[i].level, "STRENGTH") == 0) {
+                // strength is db relative to s9, ~6 db per s-unit
+                if (v <= 0) {
+                    float s = std::max(0.0f, 9.0f + v / 6.0f);
+                    printw(" S%.0f", s);
+                } else {
+                    printw(" S9+%.0f", v);
+                }
+            } else if (strcmp(RIG_METERS[i].level, "SWR") == 0) {
+                if (pair != 1) attron(COLOR_PAIR(pair) | A_BOLD);
+                printw(" %.1f", v);
+                if (pair != 1) attroff(COLOR_PAIR(pair) | A_BOLD);
+            } else if (is_temp) {
+                if (pair != 1) attron(COLOR_PAIR(pair) | A_BOLD);
+                printw(" %.0fC", v);
+                if (pair != 1) attroff(COLOR_PAIR(pair) | A_BOLD);
+            } else if (strstr(RIG_METERS[i].level, "WATTS") != nullptr) {
+                printw(" %.0fW", v);
+            } else {
+                printw(" %.2f", v);
+            }
+            ry++;
+        }
+        ry++;
+
+        mvaddstr(ry, c3, "PTT ");
+        if (state_.ptt_on.load()) {
+            attron(COLOR_PAIR(2) | A_BOLD);
+            addstr("TX");
+            attroff(COLOR_PAIR(2) | A_BOLD);
+        } else {
+            attron(COLOR_PAIR(1) | A_BOLD);
+            addstr("RX");
+            attroff(COLOR_PAIR(1) | A_BOLD);
+        }
+        ry++;
+
+        attron(A_DIM);
+        mvaddstr(ry, c3, "SWR/Power/ALC valid during TX");
+        attroff(A_DIM);
+
+        if (!state_.rig_data_valid.load()) {
+            ry += 2;
+            attron(COLOR_PAIR(3));
+            mvaddstr(ry, c3, "No data from rigctld yet...");
+            attroff(COLOR_PAIR(3));
+        }
+    }
+
     void update_calibration() {
         if (!calibrating_threshold_) return;
         
@@ -3856,6 +4955,43 @@ private:
         }
     }
     
+    void draw_csma_help(int rows, int cols) {
+        int w = 56, h = 13;
+        int x0 = (cols - w) / 2, y0 = (rows - h) / 2;
+        attron(COLOR_PAIR(4));
+        for (int y = y0; y < y0 + h && y < rows; y++)
+            mvhline(y, x0, ' ', w);
+        mvhline(y0, x0, ACS_HLINE, w);
+        mvhline(y0 + h - 1, x0, ACS_HLINE, w);
+        mvvline(y0, x0, ACS_VLINE, h);
+        mvvline(y0, x0 + w - 1, ACS_VLINE, h);
+        mvaddch(y0, x0, ACS_ULCORNER);
+        mvaddch(y0, x0 + w - 1, ACS_URCORNER);
+        mvaddch(y0 + h - 1, x0, ACS_LLCORNER);
+        mvaddch(y0 + h - 1, x0 + w - 1, ACS_LRCORNER);
+        attron(A_BOLD);
+        mvaddstr(y0, x0 + 3, " CSMA ");
+        attroff(A_BOLD);
+        attroff(COLOR_PAIR(4));
+        int y = y0 + 2, lx = x0 + 2, rx = x0 + 14;
+        mvaddstr(y++, lx, "Listens before transmitting so stations");
+        mvaddstr(y++, lx, "do not talk over each other.");
+        y++;
+        auto item = [&](const char* k, const char* v) {
+            attron(A_BOLD); mvaddstr(y, lx, k); attroff(A_BOLD);
+            mvaddstr(y, rx, v); y++;
+        };
+        item("Enabled",   "turn channel checking on or off");
+        item("Threshold", "level above this counts as busy");
+        item("Level",     "what the channel measures right now");
+        item("Persist",   "chance out of 255 to send each slot");
+        item("Slot",      "wait between send attempts when busy");
+        y++;
+        attron(A_DIM);
+        mvaddstr(y, lx, "any key to close");
+        attroff(A_DIM);
+    }
+
     void draw_help(int rows, int cols) {
         int help_w = 48;
         int help_h = 19;
@@ -3917,6 +5053,9 @@ private:
         mvaddstr(y, lx, "General");
         attroff(A_BOLD);
         y++;
+        mvaddstr(y, lx, "Esc");
+        mvaddstr(y, rx, "Cancel text input");
+        y++;
         mvaddstr(y, lx, "F1");
         mvaddstr(y, rx, "Toggle this help");
         y++;
@@ -3933,12 +5072,24 @@ private:
     std::atomic<bool> running_{false};
     int current_tab_ = 0;
     int current_field_ = 0;
-    int config_scroll_ = 0;  
+    int config_scroll_ = 0;
     int log_scroll_ = 0;
     int utils_selection_ = 0;
+    int utils_scroll_ = 0;
+    int utils_max_scroll_ = 0;
+    bool auto_send_enabled_ = false;
+    std::chrono::steady_clock::time_point auto_send_last_{};
+    std::mt19937 auto_send_rng_{std::random_device{}()};
+    unsigned auto_send_seq_ = 0;
+    bool auto_alt_enabled_ = false;
+    int alt_index_ = -1;
+    unsigned alt_seqs_[ALT_MODE_COUNT] = {0};
+    int rig_field_ = 0;
+    int rig_step_index_ = 2;
     int saved_stderr_ = -1;
     int frame_counter_ = 0;  
     bool show_help_ = false;  
+    bool show_csma_help_ = false;
     
     bool calibrating_threshold_ = false;
     int calibration_start_frame_ = 0;

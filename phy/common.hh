@@ -29,8 +29,8 @@ struct Common
 	static const int code_max = 16;
 	static const int bits_max = 1 << code_max;
 	static const int data_max = 8192;
-	// largest frame: 8PSK/QAM64 long = 44 data symbols, plus meta
-	static const int symbols_max = 44 + 1;
+	static const int symbols_max = 2 * 44 + 1;
+	static const int64_t postamble_call = 0xF0F0F0F0F0F0LL;
 	static const int mls0_poly = 0x331;
 	static const int mls0_seed = 214;
 	static const int mls1_poly = 0x43;
@@ -55,6 +55,11 @@ struct Common
 	int tone_off;
 	int seed_off;
 	int symbol_count;
+	// code_rate 5 (1/2) and 6 (1/4): the codeword is transmitted twice
+	// and the receiver combines llrs (chase combining) for time diversity
+	// on fading channels; every code bit airs at t and t + t/2. legacy
+	// receivers reject code_rate 5/6 cleanly.
+	bool repeat2;
 
 	Common() : crc0(0xA8F4), crc1(0x8F6E37A0) {}
 
@@ -139,9 +144,15 @@ struct Common
 			++code_order;
 		}
 		int code_rate = (mode >> 1) & 7;
+		repeat2 = (code_rate == 5 || code_rate == 6);
+		if (repeat2) {
+			if (code_order > 15)
+				return false;
+			symbol_count *= 2;
+		}
 		std::cerr << "code rate: ";
-		if (code_rate == 0) {
-			std::cerr << "1/2";
+		if (code_rate == 0 || code_rate == 5) {
+			std::cerr << (repeat2 ? "1/2 x2" : "1/2");
 			switch (code_order) {
 			case 11:
 				data_bits = 1024;
@@ -260,9 +271,9 @@ struct Common
 			default:
 				return false;
 			}
-		} else if (code_rate == 4) {
+		} else if (code_rate == 4 || code_rate == 6) {
 			// 1/4 rate
-			std::cerr << "1/4";
+			std::cerr << (repeat2 ? "1/4 x2" : "1/4");
 			switch (code_order) {
 			case 11:
 				data_bits = 512;
