@@ -38,6 +38,8 @@
 #endif
 #include "modem.hh"
 #include "phy/mfsk_modem.hh"
+#include "phy/robust_modem.hh"
+#include "perf_log.hh"
 #include "control_port.hh"
 
 #ifdef WITH_UI
@@ -133,8 +135,38 @@ public:
 
 
 // TNC
+static int parse_seq(const std::vector<uint8_t>& p) {
+    if (p.size() < 10 || memcmp(p.data(), "SEQ:", 4) != 0 || p[9] != ':')
+        return -1;
+    int v = 0;
+    for (int i = 4; i < 9; ++i) {
+        if (p[i] < '0' || p[i] > '9')
+            return -1;
+        v = v * 10 + (p[i] - '0');
+    }
+    return v;
+}
+
+// human-readable name for a decoded OFDM operating-mode byte
+static std::string ofdm_mode_name(int m) {
+    static const char* mods[] = {"BPSK", "QPSK", "8PSK", "QAM16",
+                                 "QAM64", "QAM256", "QAM1024", "QAM4096"};
+    static const char* rates[] = {"1/2", "2/3", "3/4", "5/6", "1/4",
+                                  "1/2x2", "1/4x2", "?"};
+
+    std::string s = mods[(m >> 4) & 7];
+
+
+    s += " ";
+    s += rates[(m >> 1) & 7];
+    s += (m & 128) ? " L" : (m & 1) ? " N" : " S";
+    return s;
+}
+
 class KISSTNC {
 public:
+    PerfLogger perf_log_;
+
     KISSTNC(const TNCConfig& config) : config_(config) {
         // Allocate OFDM encoder/decoder
         std::cerr << "  Creating OFDM encoder/decoder" << std::endl;
@@ -145,10 +177,23 @@ public:
         // Allocate MFSK encoder/decoder
         std::cerr << "  Creating MFSK encoder/decoder" << std::endl;
         mfsk_encoder_ = std::make_unique<MFSKEncoder>();
-        mfsk_decoder_ = std::make_unique<MFSKDecoder>(
-            (MFSKMode)config.mfsk_mode, config.center_freq);
+        // one rx instance per tone family so every mfsk mode decodes 
+
+
+        for (int i = 0; i < 3; ++i)
+            mfsk_decoders_[i] = std::make_unique<MFSKDecoder>(
+                MFSK_RX_MODES[i], config.center_freq);
+
+        if (config.perf_log)
+            perf_log_.set_csv_enabled(true);
+
+        std::cerr << "  Creating RDM encoder/decoder" << std::endl;
+        robust_encoder_ = std::make_unique<RobustEncoder>();
+        robust_decoder_ = std::make_unique<RobustDecoder>(config.center_freq);
+        robust_decoder_n_ = std::make_unique<RobustDecoder>(config.center_freq, true);
 
         std::cerr << "  All encoders/decoders created" << std::endl;
+
 
         // Set up constellation callback for UI display
 #ifdef WITH_UI
@@ -184,6 +229,8 @@ public:
 
         if (config.modem_type == 1) {
             payload_size_ = mfsk_encoder_->get_payload_size((MFSKMode)config.mfsk_mode);
+        } else if (config.modem_type == 2) {
+            payload_size_ = robust_encoder_->get_payload_size((RobustMode)config.robust_mode);
         } else {
             payload_size_ = encoder_->get_payload_size(modem_config_.oper_mode);
         }
@@ -580,12 +627,19 @@ private:
                 modem_config_.center_freq,
                 (MFSKMode)config_.mfsk_mode
             );
+        } else if (config_.modem_type == 2) {
+            samples = robust_encoder_->encode(
+                framed_data.data(), framed_data.size(),
+                modem_config_.center_freq,
+                (RobustMode)config_.robust_mode
+            );
         } else {
             samples = encoder_->encode(
                 framed_data.data(), framed_data.size(),
                 modem_config_.center_freq,
                 modem_config_.call_sign,
-                tx_mode
+                tx_mode,
+                config_.postamble
             );
         }
         
@@ -791,6 +845,8 @@ private:
 #endif
 
             auto payload = unframe_length(data, len);
+            perf_log_.record(ofdm_mode_name(decoder_->oper_mode), snr, ber_pct,
+                             (int)len, parse_seq(payload));
 
             if (payload.empty()) {
                 ui_log("RX: Empty payload after unframing");
@@ -815,30 +871,101 @@ private:
             }
         };
 
-        // MFSK frame callback
-        auto mfsk_frame_callback = [this, &deliver_to_clients](const uint8_t* data, size_t len) {
+        auto robust_frame_callback = [this, &deliver_to_clients](const uint8_t* data, size_t len) {
             set_tx_lockout(RX_LOCKOUT_SECONDS);
-
-            float snr = mfsk_decoder_->get_last_snr();
-            float ber_pct = -1.0f;
-
+            float snr = robust_decoder_->get_last_snr();
+            float ber_pct = 100.0f * robust_decoder_->get_last_ber();
 #ifdef WITH_UI
             if (g_ui_state) {
                 g_ui_state->rx_frame_count++;
                 g_ui_state->receiving = false;
                 g_ui_state->last_rx_snr = snr;
+                g_ui_state->last_rx_ber = ber_pct >= 0 ? ber_pct / 100.0f : -1.0f;
             }
 #endif
-
             auto payload = unframe_length(data, len);
-
+            perf_log_.record(ROBUST_MODE_NAMES[(int)robust_decoder_->get_last_mode()],
+                             snr, ber_pct, (int)len, parse_seq(payload));
             if (payload.empty()) {
-                ui_log("MFSK RX: Empty payload after unframing");
+                ui_log("RDM RX: Empty payload after unframing");
 #ifdef WITH_UI
                 if (g_ui_state) g_ui_state->rx_error_count++;
 #endif
                 return;
             }
+            if (reassembler_.is_fragment(payload)) {
+                auto reassembled = reassembler_.process(payload);
+                if (!reassembled.empty()) {
+                    ui_log("RDM RX: Reassembled " + std::to_string(reassembled.size()) + " bytes");
+                    deliver_to_clients(reassembled, snr, ber_pct, true);
+                }
+            } else {
+                deliver_to_clients(payload, snr, ber_pct, false);
+            }
+        };
+
+        auto robust_n_frame_callback = [this, &deliver_to_clients](const uint8_t* data, size_t len) {
+            set_tx_lockout(RX_LOCKOUT_SECONDS);
+            float snr = robust_decoder_n_->get_last_snr();
+            float ber_pct = 100.0f * robust_decoder_n_->get_last_ber();
+#ifdef WITH_UI
+            if (g_ui_state) {
+                g_ui_state->rx_frame_count++;
+                g_ui_state->receiving = false;
+                g_ui_state->last_rx_snr = snr;
+                g_ui_state->last_rx_ber = ber_pct >= 0 ? ber_pct / 100.0f : -1.0f;
+            }
+#endif
+            auto payload = unframe_length(data, len);
+            perf_log_.record(ROBUST_MODE_NAMES[(int)robust_decoder_n_->get_last_mode()],
+                             snr, ber_pct, (int)len, parse_seq(payload));
+            if (payload.empty()) {
+                ui_log("RDMn RX: Empty payload after unframing");
+#ifdef WITH_UI
+                if (g_ui_state) g_ui_state->rx_error_count++;
+#endif
+                return;
+            }
+            if (reassembler_.is_fragment(payload)) {
+                auto reassembled = reassembler_.process(payload);
+                if (!reassembled.empty()) {
+                    ui_log("RDMn RX: Reassembled " + std::to_string(reassembled.size()) + " bytes");
+                    deliver_to_clients(reassembled, snr, ber_pct, true);
+                }
+            } else {
+                deliver_to_clients(payload, snr, ber_pct, false);
+            }
+        };
+
+        auto make_mfsk_callback = [this, &deliver_to_clients](MFSKDecoder* dec) {
+          return [this, &deliver_to_clients, dec](const uint8_t* data, size_t len) {
+            set_tx_lockout(RX_LOCKOUT_SECONDS);
+
+            float snr = dec->get_last_snr();
+            float last_ber = dec->get_last_ber();
+            float ber_pct = (last_ber >= 0) ? last_ber * 100.0f : -1.0f;
+
+#ifdef WITH_UI
+            if (g_ui_state)
+                g_ui_state->receiving = false;
+#endif
+
+            auto payload = unframe_length(data, len);
+            if (payload.empty()) {
+                ++mfsk_soft_errors_;
+                if (g_verbose)
+                    std::cerr << "MFSK RX: empty payload (soft error "
+                              << mfsk_soft_errors_ << ")" << std::endl;
+                return;
+            }
+#ifdef WITH_UI
+            if (g_ui_state) {
+                g_ui_state->rx_frame_count++;
+                g_ui_state->last_rx_snr = snr;
+            }
+#endif
+            perf_log_.record(MFSK_MODE_NAMES[(int)dec->get_last_decoded_mode()],
+                             snr, ber_pct, (int)len, parse_seq(payload));
 
             if (reassembler_.is_fragment(payload)) {
                 auto reassembled = reassembler_.process(payload);
@@ -849,7 +976,11 @@ private:
             } else {
                 deliver_to_clients(payload, snr, ber_pct, false);
             }
+          };
         };
+        MFSKDecoder::FrameCallback mfsk_callbacks[3];
+        for (int i = 0; i < 3; ++i)
+            mfsk_callbacks[i] = make_mfsk_callback(mfsk_decoders_[i].get());
 
         bool was_blanking = false;
 
@@ -863,12 +994,16 @@ private:
                 } else {
                     if (was_blanking) {
                         decoder_->reset();
-                        mfsk_decoder_->reset();
+                        for (auto& d : mfsk_decoders_) d->reset();
+                        robust_decoder_->reset();
+                        robust_decoder_n_->reset();
                         was_blanking = false;
                     }
-                    // Feed same audio to both decod,ers
                     decoder_->process(buffer.data(), n, frame_callback);
-                    mfsk_decoder_->process(buffer.data(), n, mfsk_frame_callback);
+                    for (int i = 0; i < 3; ++i)
+                        mfsk_decoders_[i]->process(buffer.data(), n, mfsk_callbacks[i]);
+                    robust_decoder_->process(buffer.data(), n, robust_frame_callback);
+                    robust_decoder_n_->process(buffer.data(), n, robust_n_frame_callback);
                 }
 
 #ifdef WITH_UI
@@ -893,15 +1028,26 @@ private:
                         decoder_->stats_erased_symbols = 0;
                         decoder_->stats_crc_errors = 0;
                         decoder_->reset_ber();
-                        mfsk_decoder_->reset_stats();
+                        for (auto& d : mfsk_decoders_) d->reset_stats();
+                        robust_decoder_->reset_stats();
+                        robust_decoder_n_->reset_stats();
                         g_ui_state->last_rx_ber = -1.0f;
                     }
-                    if (config_.modem_type == 1) {
-                        g_ui_state->sync_count = mfsk_decoder_->stats_sync_count;
-                        g_ui_state->preamble_errors = mfsk_decoder_->stats_preamble_errors;
+                    if (config_.modem_type == 2) {
+                        auto& rd = RobustParams::is_narrow((RobustMode)config_.robust_mode)
+                                 ? robust_decoder_n_ : robust_decoder_;
+                        g_ui_state->sync_count = rd->stats_sync_count;
+                        g_ui_state->preamble_errors = rd->stats_preamble_errors;
+                        g_ui_state->symbol_errors = 0;
+                        g_ui_state->erased_symbols = rd->stats_rescues;
+                        g_ui_state->crc_errors = rd->stats_crc_errors;
+                    } else if (config_.modem_type == 1) {
+                        g_ui_state->sync_count = cur_mfsk()->stats_sync_count;
+                        g_ui_state->preamble_errors = cur_mfsk()->stats_preamble_errors;
                         g_ui_state->symbol_errors = 0;
                         g_ui_state->erased_symbols = 0;
-                        g_ui_state->crc_errors = mfsk_decoder_->stats_crc_errors;
+                        g_ui_state->preamble_errors = 0;
+                        g_ui_state->crc_errors = 0;
                     } else {
                         g_ui_state->sync_count = decoder_->stats_sync_count;
                         g_ui_state->preamble_errors = decoder_->stats_preamble_errors;
@@ -978,7 +1124,15 @@ private:
     std::unique_ptr<Encoder48k> encoder_;
     std::unique_ptr<Decoder48k> decoder_;
     std::unique_ptr<MFSKEncoder> mfsk_encoder_;
-    std::unique_ptr<MFSKDecoder> mfsk_decoder_;
+    static constexpr MFSKMode MFSK_RX_MODES[3] = {
+        MFSKMode::MFSK_8, MFSKMode::MFSK_16, MFSKMode::MFSK_32};
+    std::unique_ptr<MFSKDecoder> mfsk_decoders_[3];
+    MFSKDecoder* cur_mfsk() const {
+        return mfsk_decoders_[config_.mfsk_mode <= 1 ? config_.mfsk_mode : 2].get();
+    }
+    std::unique_ptr<RobustEncoder> robust_encoder_;
+    std::unique_ptr<RobustDecoder> robust_decoder_;
+    std::unique_ptr<RobustDecoder> robust_decoder_n_;
 
     std::unique_ptr<MiniAudio> audio_;
     std::unique_ptr<RigctlPTT> rigctl_;
@@ -994,6 +1148,7 @@ private:
     
     PacketQueue<TxPacket> tx_queue_;
     std::atomic<bool> tx_running_{false};
+    std::atomic<int> mfsk_soft_errors_{0};
     std::atomic<bool> rx_running_{false};
     
     Fragmenter fragmenter_;
@@ -1012,6 +1167,7 @@ public:
     void update_config(const TNCConfig& new_config) {
         // Update CSMA settings (safe to change at runtime)
         config_.csma_enabled = new_config.csma_enabled;
+        config_.postamble = new_config.postamble;
         config_.carrier_threshold_db = new_config.carrier_threshold_db;
         config_.p_persistence = new_config.p_persistence;
         config_.slot_time_ms = new_config.slot_time_ms;
@@ -1031,21 +1187,34 @@ public:
             config_.center_freq = new_config.center_freq;
             modem_config_.center_freq = config_.center_freq;
             decoder_->configure_frontend(config_.center_freq, config_.rx_filter_enabled);
-            // Reconfigure MFSK decoder with new center freq
-            mfsk_decoder_->configure((MFSKMode)config_.mfsk_mode, config_.center_freq);
+            for (int i = 0; i < 3; ++i)
+                mfsk_decoders_[i]->configure(MFSK_RX_MODES[i], config_.center_freq);
+            robust_decoder_->configure(config_.center_freq);
+            robust_decoder_n_->configure(config_.center_freq);
             ui_log("Center frequency changed to " + std::to_string(config_.center_freq) + " Hz");
         }
 
         // Update modem type and sub-mode
+        if (config_.robust_mode != new_config.robust_mode ||
+            (config_.modem_type != new_config.modem_type && new_config.modem_type == 2)) {
+            config_.robust_mode = new_config.robust_mode;
+            if (new_config.modem_type == 2) {
+                RobustMode rmode = (RobustMode)config_.robust_mode;
+                payload_size_ = robust_encoder_->get_payload_size(rmode);
+                ui_log("Mode changed to " + std::string(ROBUST_MODE_NAMES[(int)rmode]) +
+                       " (" + std::to_string(RobustParams::bitrate(rmode)) + " bps)");
+            }
+        }
         if (config_.modem_type != new_config.modem_type || config_.mfsk_mode != new_config.mfsk_mode) {
             config_.modem_type = new_config.modem_type;
             config_.mfsk_mode = new_config.mfsk_mode;
             if (config_.modem_type == 1) {
                 MFSKMode mmode = (MFSKMode)config_.mfsk_mode;
-                mfsk_decoder_->configure(mmode, config_.center_freq);
                 payload_size_ = mfsk_encoder_->get_payload_size(mmode);
                 ui_log("Mode changed to " + std::string(MFSK_MODE_NAMES[(int)mmode]) +
                        " (" + std::to_string(MFSKParams::max_payload(mmode)) + " bytes)");
+            } else if (config_.modem_type == 2) {
+                payload_size_ = robust_encoder_->get_payload_size((RobustMode)config_.robust_mode);
             } else {
                 payload_size_ = encoder_->get_payload_size(modem_config_.oper_mode);
             }
@@ -1092,16 +1261,30 @@ public:
     };
 
     DecoderStats get_decoder_stats() const {
+        if (config_.modem_type == 2) {
+            auto& rd = RobustParams::is_narrow((RobustMode)config_.robust_mode)
+                     ? robust_decoder_n_ : robust_decoder_;
+            return {
+                rd->stats_sync_count,
+                rd->stats_preamble_errors,
+                0,
+                rd->stats_rescues,
+                rd->stats_crc_errors,
+                rd->get_last_snr(),
+                rd->get_last_ber(),
+                rd->get_ber_ema()
+            };
+        }
         if (config_.modem_type == 1) {
             return {
-                mfsk_decoder_->stats_sync_count,
-                mfsk_decoder_->stats_preamble_errors,
+                cur_mfsk()->stats_sync_count,
+                cur_mfsk()->stats_preamble_errors,
                 0, // MFSK has no symbol errors stat
                 0, // MFSK has no symbol errors stat
-                mfsk_decoder_->stats_crc_errors,
-                mfsk_decoder_->get_last_snr(),
-                mfsk_decoder_->get_last_ber(),
-                mfsk_decoder_->get_ber_ema()
+                cur_mfsk()->stats_crc_errors,
+                cur_mfsk()->get_last_snr(),
+                cur_mfsk()->get_last_ber(),
+                cur_mfsk()->get_ber_ema()
             };
         }
         return {
@@ -1197,7 +1380,7 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
         "BPSK", "QPSK", "8PSK", "QAM16", "QAM64", "QAM256", "QAM1024", "QAM4096"
     };
     static const int N_MOD = sizeof(MOD_OPTS) / sizeof(*MOD_OPTS);
-    static const char* RATE_OPTS[] = {"1/2", "2/3", "3/4", "5/6", "1/4"};
+    static const char* RATE_OPTS[] = {"1/2", "2/3", "3/4", "5/6", "1/4", "1/2x2", "1/4x2"};
     static const int N_RATE = sizeof(RATE_OPTS) / sizeof(*RATE_OPTS);
 
     FILE* f = fopen(path.c_str(), "r");
@@ -1214,8 +1397,19 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
         if (sscanf(line, "%63[^=]=%191[^\n]", key, value) != 2) continue;
 
         if (!strcmp(key, "callsign") && take(key)) config.callsign = value;
-        else if (!strcmp(key, "modem_type") && take(key)) config.modem_type = atoi(value);
-        else if (!strcmp(key, "mfsk_mode") && take(key)) config.mfsk_mode = atoi(value);
+        else if (!strcmp(key, "modem_type") && take(key)) {
+            int v = atoi(value);
+            if (v >= 0 && v <= 2) config.modem_type = v;
+        }
+        else if (!strcmp(key, "mfsk_mode") && take(key)) {
+            int v = atoi(value);
+            if (v >= 0 && v <= 3) config.mfsk_mode = v;
+        }
+        else if (!strcmp(key, "robust_mode") && take(key)) {
+            int v = atoi(value);
+            if (v >= 0 && v < ROBUST_MODE_COUNT) config.robust_mode = v;
+        }
+        else if (!strcmp(key, "perf_log") && take(key)) config.perf_log = atoi(value) != 0;
         else if (!strcmp(key, "modulation") && take(key)) {
             int idx = atoi(value);
             if (idx >= 0 && idx < N_MOD) config.modulation = MOD_OPTS[idx];
@@ -1231,6 +1425,7 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
         }
         else if (!strcmp(key, "center_freq") && take(key)) config.center_freq = atoi(value);
         else if (!strcmp(key, "rx_filter_enabled") && take(key)) config.rx_filter_enabled = atoi(value) != 0;
+        else if (!strcmp(key, "postamble") && take(key)) config.postamble = atoi(value) != 0;
         else if (!strcmp(key, "csma_enabled") && take(key)) config.csma_enabled = atoi(value) != 0;
         else if (!strcmp(key, "carrier_threshold_db") && take(key)) config.carrier_threshold_db = atof(value);
         else if (!strcmp(key, "slot_time_ms") && take(key)) config.slot_time_ms = atoi(value);
@@ -1324,6 +1519,8 @@ void print_help(const char* prog) {
 }
 
 int main(int argc, char** argv) {
+    std::cerr << "MODEM73 build " << __DATE__ << " " << __TIME__ << std::endl;
+
     TNCConfig config;
 
     // Track which settings were explicitly set on CLI
@@ -1600,10 +1797,12 @@ int main(int argc, char** argv) {
                     config.callsign = ui_state.callsign;
                 config.modem_type = ui_state.modem_type_index;
                 config.mfsk_mode = ui_state.mfsk_mode_index;
+                config.robust_mode = ui_state.robust_mode_index;
                 config.center_freq = ui_state.center_freq;
                 config.modulation = MODULATION_OPTIONS[ui_state.modulation_index];
                 config.code_rate = CODE_RATE_OPTIONS[ui_state.code_rate_index];
                 config.frame_size = ui_state.frame_size;
+                config.postamble = ui_state.postamble;
                 config.csma_enabled = ui_state.csma_enabled;
                 config.carrier_threshold_db = ui_state.carrier_threshold_db;
                 config.slot_time_ms = ui_state.slot_time_ms;
@@ -1665,6 +1864,7 @@ int main(int argc, char** argv) {
                 ui_state.slot_time_ms = config.slot_time_ms;
                 ui_state.p_persistence = config.p_persistence;
                 ui_state.frame_size = config.frame_size;
+                ui_state.postamble = config.postamble;
                 ui_state.fragmentation_enabled = config.fragmentation_enabled;
                 ui_state.tx_blanking_enabled = config.tx_blanking_enabled;
                 // Audio devices
@@ -1845,15 +2045,21 @@ int main(int argc, char** argv) {
                 cJSON_AddStringToObject(j, "callsign", cfg.callsign.c_str());
                 cJSON_AddNumberToObject(j, "modem_type", cfg.modem_type);
                 cJSON_AddNumberToObject(j, "mfsk_mode", cfg.mfsk_mode);
+                cJSON_AddNumberToObject(j, "robust_mode", cfg.robust_mode);
                 if (cfg.modem_type == 1) {
                     cJSON_AddStringToObject(j, "modulation",
                         MFSK_MODE_NAMES[cfg.mfsk_mode < 4 ? cfg.mfsk_mode : 0]);
+                } else if (cfg.modem_type == 2) {
+                    cJSON_AddStringToObject(j, "modulation",
+                        ROBUST_MODE_NAMES[cfg.robust_mode >= 0 &&
+                            cfg.robust_mode < ROBUST_MODE_COUNT ? cfg.robust_mode : 0]);
                 } else {
                     cJSON_AddStringToObject(j, "modulation", cfg.modulation.c_str());
                 }
                 cJSON_AddStringToObject(j, "code_rate", cfg.code_rate.c_str());
                 cJSON_AddBoolToObject(j, "short_frame", cfg.frame_size == 0);
                 cJSON_AddNumberToObject(j, "frame_size", cfg.frame_size);
+                cJSON_AddBoolToObject(j, "postamble", cfg.postamble);
                 cJSON_AddNumberToObject(j, "center_freq", cfg.center_freq);
                 cJSON_AddNumberToObject(j, "payload_size", tnc.get_payload_size());
                 cJSON_AddBoolToObject(j, "csma_enabled", cfg.csma_enabled);
@@ -1870,10 +2076,15 @@ int main(int argc, char** argv) {
                 TNCConfig new_config = tnc.get_config();
 
                 cJSON* item;
-                if ((item = cJSON_GetObjectItemCaseSensitive(params, "modem_type")) && cJSON_IsNumber(item))
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "modem_type")) && cJSON_IsNumber(item)
+                    && item->valueint >= 0 && item->valueint <= 2)
                     new_config.modem_type = item->valueint;
-                if ((item = cJSON_GetObjectItemCaseSensitive(params, "mfsk_mode")) && cJSON_IsNumber(item))
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "mfsk_mode")) && cJSON_IsNumber(item)
+                    && item->valueint >= 0 && item->valueint <= 3)
                     new_config.mfsk_mode = item->valueint;
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "robust_mode")) && cJSON_IsNumber(item)
+                    && item->valueint >= 0 && item->valueint < ROBUST_MODE_COUNT)
+                    new_config.robust_mode = item->valueint;
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "callsign")) && cJSON_IsString(item))
                     new_config.callsign = item->valuestring;
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "modulation")) && cJSON_IsString(item))
@@ -1887,6 +2098,8 @@ int main(int argc, char** argv) {
                     new_config.frame_size = item->valueint;
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "center_freq")) && cJSON_IsNumber(item))
                     new_config.center_freq = item->valueint;
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "postamble")) && cJSON_IsBool(item))
+                    new_config.postamble = cJSON_IsTrue(item);
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "csma_enabled")) && cJSON_IsBool(item))
                     new_config.csma_enabled = cJSON_IsTrue(item);
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "carrier_threshold_db")) && cJSON_IsNumber(item))
@@ -1908,8 +2121,10 @@ int main(int argc, char** argv) {
                     g_ui_state->callsign = new_config.callsign;
                     g_ui_state->modem_type_index = new_config.modem_type;
                     g_ui_state->mfsk_mode_index = new_config.mfsk_mode;
+                    g_ui_state->robust_mode_index = new_config.robust_mode;
                     g_ui_state->center_freq = new_config.center_freq;
                     g_ui_state->frame_size = new_config.frame_size;
+                    g_ui_state->postamble = new_config.postamble;
                     g_ui_state->csma_enabled = new_config.csma_enabled;
                     g_ui_state->carrier_threshold_db = new_config.carrier_threshold_db;
                     g_ui_state->p_persistence = new_config.p_persistence;
@@ -1953,15 +2168,18 @@ int main(int argc, char** argv) {
 
 #ifdef WITH_UI
         if (g_use_ui) {
+            ui_state.perf_logger = &tnc.perf_log_;
             ui_state.on_settings_changed = [&tnc, &ctrl](TNCUIState& state) {
                 TNCConfig new_config = tnc.get_config();
                 new_config.modem_type = state.modem_type_index;
                 new_config.mfsk_mode = state.mfsk_mode_index;
+                new_config.robust_mode = state.robust_mode_index;
                 new_config.callsign = state.callsign;
                 new_config.center_freq = state.center_freq;
                 new_config.modulation = MODULATION_OPTIONS[state.modulation_index];
                 new_config.code_rate = CODE_RATE_OPTIONS[state.code_rate_index];
                 new_config.frame_size = state.frame_size;
+                new_config.postamble = state.postamble;
                 new_config.csma_enabled = state.csma_enabled;
                 new_config.carrier_threshold_db = state.carrier_threshold_db;
                 new_config.p_persistence = state.p_persistence;
@@ -1994,7 +2212,11 @@ int main(int argc, char** argv) {
             ui_state.on_reconnect_audio = [&tnc]() -> bool {
                 return tnc.reconnect_audio();
             };
-            
+
+            ui_state.on_rigctl_command = [&tnc](const std::string& cmd) -> std::string {
+                return tnc.rigctl_command(cmd);
+            };
+
             // Run TNC in background thread
             std::thread tnc_thread([&tnc]() {
                 tnc.run();
@@ -2005,6 +2227,9 @@ int main(int argc, char** argv) {
                 while (g_running) {
                     ui_state.rigctl_connected = tnc.is_rigctl_connected();
                     ui_state.audio_connected = tnc.is_audio_healthy();
+                    if (ui_state.rig_poll_enabled.load()) {
+                        ui_state.poll_rig();
+                    }
                     std::this_thread::sleep_for(std::chrono::milliseconds(500));
                 }
             });

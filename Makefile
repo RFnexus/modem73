@@ -53,7 +53,7 @@ ifneq ($(HIDAPI_LIBS),)
 endif
 
 clean:
-	rm -f $(TARGET) $(OBJS) test_fade test_awgn test_mfsk
+	rm -f $(TARGET) $(OBJS) test_fade test_awgn test_mfsk test_robust test_e2e
 
 install: $(TARGET)
 	install -m 755 $(TARGET) /usr/local/bin/
@@ -76,6 +76,12 @@ test_awgn: test_awgn.cc modem.hh phy/common.hh
 
 test_mfsk: test_mfsk.cc phy/mfsk_modem.hh
 	$(CXX) $(CXXFLAGS) -o $@ test_mfsk.cc -lm
+
+test_robust: test_robust.cc phy/robust_modem.hh phy/common.hh
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -Iphy -o $@ test_robust.cc -lm
+
+test_e2e: test_e2e.cc modem.hh phy/robust_modem.hh phy/mfsk_modem.hh
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -Iphy -o $@ test_e2e.cc -lm
 
 # Help
 help:

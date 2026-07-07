@@ -40,7 +40,7 @@ Wire format: 4-byte big-endian length prefix + JSON payload.
 | `rigctl_connected` | bool | rigctld connection status |
 | `audio_connected` | bool | Audio device health |
 
-Stats switch between OFDM and MFSK decoder based on active `modem_type`.
+Stats switch between the OFDM, MFSK and RDM decoders based on active `modem_type`.
 
 ---
 
@@ -53,10 +53,12 @@ Stats switch between OFDM and MFSK decoder based on active `modem_type`.
 | Field | Type | Description |
 |---|---|---|
 | `callsign` | string | Station callsign |
-| `modem_type` | int | `0` = OFDM, `1` = MFSK |
+| `modem_type` | int | `0` = OFDM, `1` = MFSK, `2` = ROBUST (RDM) |
+| `robust_mode` | int | `0` = RDM-1200 (~1150 bps), `1` = RDM-600 (~585 bps), `2` = RDM-300 (~296 bps, codeword sent twice with chase combining — survives 4 s complete dropouts and dropout+disturbed-fading), `3` = RDMN-300 (~296 bps in 600 Hz), `4` = RDMN-150 (~149 bps in 600 Hz). Add 5 for short framing (a 172-byte frame, 170 B MTU): `5`-`9` are the same five modes with the short frame, e.g. `5` = RDM-1200S (~732 bps, 1.9 s/frame), `6` = RDM-600S (~378 bps), `7` = RDM-300S (~194 bps, chase x2), `8` = RDMN-300S (~197 bps), `9` = RDMN-150S (~99 bps). DATAC1-style fading-resistant OFDM, 512-byte frames (510 B MTU; the -S modes carry 172-byte frames / 170 B MTU for chat- and ACK-sized traffic), every frame carries leading and trailing sync anchors so a fade over either one still decodes. Wide modes (0-2) span 2400 Hz for frequency diversity; narrow modes (3-4) concentrate power into 600 Hz (~6 dB/Hz denser, fits between QRM). RX runs both families in parallel and auto-detects the mode. |
 | `mfsk_mode` | int | `0` = MFSK-8, `1` = MFSK-16, `2` = MFSK-32, `3` = MFSK-32R |
-| `modulation` | string | OFDM: `"BPSK"`..`"QAM4096"`. MFSK: `"MFSK-8"`..`"MFSK-32R"` |
-| `code_rate` | string | `"1/2"`, `"2/3"`, `"3/4"`, `"5/6"`, `"1/4"` (OFDM only) |
+| `modulation` | string | OFDM: `"BPSK"`..`"QAM4096"`. MFSK: `"MFSK-8"`..`"MFSK-32R"`. ROBUST: `"RDM-1200"`..`"RDMN-150S"` |
+| `code_rate` | string | `"1/2"`, `"2/3"`, `"3/4"`, `"5/6"`, `"1/4"`, `"1/2x2"`, `"1/4x2"` (OFDM only; the `x2` rates send the codeword twice for time diversity on fading paths — every code bit airs twice, half the frame duration apart. Valid with long frames up to QAM16; not valid with QAM64+ long or QAM256+ normal frames) |
+| `postamble` | bool | OFDM only. Append a trailing sync anchor (~0.4 s of extra airtime) to each transmitted frame. An aware receiver uses it to rescue frames whose preamble/meta was fade-clipped; legacy receivers reject it cleanly (invalid-callsign marker) with no interop impact. |
 | `short_frame` | bool | Short frame mode (OFDM only) |
 | `center_freq` | int | Center frequency in Hz |
 | `payload_size` | int | Current PHY payload capacity in bytes |

@@ -128,12 +128,32 @@ private:
         memcpy(&addr.sin_addr.s_addr, server->h_addr, server->h_length);
         addr.sin_port = htons(port_);
 
-        if (::connect(sock_, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+
+        int flags = fcntl(sock_, F_GETFL, 0);
+        fcntl(sock_, F_SETFL, flags | O_NONBLOCK);
+        int rc = ::connect(sock_, (struct sockaddr*)&addr, sizeof(addr));
+        if (rc < 0 && errno == EINPROGRESS) {
+            fd_set wf;
+            FD_ZERO(&wf);
+            FD_SET(sock_, &wf);
+            struct timeval tv = {2, 0};
+            rc = (select(sock_ + 1, nullptr, &wf, nullptr, &tv) == 1) ? 0 : -1;
+            if (rc == 0) {
+                int err = 0;
+                socklen_t elen = sizeof(err);
+                getsockopt(sock_, SOL_SOCKET, SO_ERROR, &err, &elen);
+                if (err) rc = -1;
+            }
+        }
+        if (rc < 0) {
             std::cerr << "rigctl: Can't connect to " << host_ << ":" << port_ << std::endl;
             close(sock_);
             sock_ = -1;
             return false;
         }
+        fcntl(sock_, F_SETFL, flags);
+        struct timeval rto = {2, 0};
+        setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, &rto, sizeof(rto));
 
         connected_ = true;
         std::cerr << "rigctl: Connected to " << host_ << ":" << port_ << std::endl;
