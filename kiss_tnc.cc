@@ -628,10 +628,14 @@ private:
                 (MFSKMode)config_.mfsk_mode
             );
         } else if (config_.modem_type == 2) {
+            RobustMode tx_rmode = (oper_mode_override >= 0 &&
+                                   oper_mode_override <= (int)RobustMode::RDMN_150S)
+                ? (RobustMode)oper_mode_override
+                : (RobustMode)config_.robust_mode;
             samples = robust_encoder_->encode(
                 framed_data.data(), framed_data.size(),
                 modem_config_.center_freq,
-                (RobustMode)config_.robust_mode
+                tx_rmode
             );
         } else {
             samples = encoder_->encode(
@@ -1341,7 +1345,10 @@ public:
     void queue_data_ex(const std::vector<uint8_t>& data, int oper_mode) {
         size_t effective_payload;
         if (oper_mode >= 0) {
-            effective_payload = encoder_->get_payload_size(oper_mode) - 2;
+            if (config_.modem_type == 2 && oper_mode <= (int)RobustMode::RDMN_150S)
+                effective_payload = robust_encoder_->get_payload_size((RobustMode)oper_mode) - 2;
+            else
+                effective_payload = encoder_->get_payload_size(oper_mode) - 2;
         } else {
             effective_payload = payload_size_ - 2;
         }
