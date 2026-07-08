@@ -104,6 +104,9 @@ struct TNCConfig {
     int carrier_sense_ms = 100;
     int max_backoff_slots = 10;
     
+    // RX decoder settings
+    bool mfsk_rx_enabled = true;
+
     // Fragmentation settings
     bool fragmentation_enabled = false;
     

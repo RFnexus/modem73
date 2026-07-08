@@ -315,6 +315,7 @@ public:
             std::cerr << "CSMA: disabled" << std::endl;
         }
         
+        std::cerr << "MFSK RX decoders: " << (config_.mfsk_rx_enabled ? "enabled" : "disabled") << std::endl;
         std::cerr << "Fragmentation: " << (config_.fragmentation_enabled ? "enabled" : "disabled") << std::endl;
         std::cerr << "TX Blanking: " << (config_.tx_blanking_enabled ? "enabled" : "disabled") << std::endl;
         
@@ -1016,15 +1017,19 @@ private:
                         robust_decoder_n_->reset();
                         was_blanking = false;
                     }
+                    bool mfsk_rx = config_.mfsk_rx_enabled || config_.modem_type == 1;
                     decoder_->process(buffer.data(), n, frame_callback);
-                    for (int i = 0; i < 3; ++i)
-                        mfsk_decoders_[i]->process(buffer.data(), n, mfsk_callbacks[i]);
+                    if (mfsk_rx)
+                        for (int i = 0; i < 3; ++i)
+                            mfsk_decoders_[i]->process(buffer.data(), n, mfsk_callbacks[i]);
                     robust_decoder_->process(buffer.data(), n, robust_frame_callback);
                     robust_decoder_n_->process(buffer.data(), n, robust_n_frame_callback);
 
                     if (decoder_->in_frame() || robust_decoder_->in_frame() ||
-                        robust_decoder_n_->in_frame() || mfsk_decoders_[0]->in_frame() ||
-                        mfsk_decoders_[1]->in_frame() || mfsk_decoders_[2]->in_frame()) {
+                        robust_decoder_n_->in_frame() ||
+                        (mfsk_rx && (mfsk_decoders_[0]->in_frame() ||
+                                     mfsk_decoders_[1]->in_frame() ||
+                                     mfsk_decoders_[2]->in_frame()))) {
                         set_tx_lockout(RX_LOCKOUT_SECONDS);
                     }
                 }
@@ -1455,6 +1460,7 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
         else if (!strcmp(key, "center_freq") && take(key)) config.center_freq = atoi(value);
         else if (!strcmp(key, "rx_filter_enabled") && take(key)) config.rx_filter_enabled = atoi(value) != 0;
         else if (!strcmp(key, "postamble") && take(key)) config.postamble = atoi(value) != 0;
+        else if (!strcmp(key, "mfsk_rx_enabled") && take(key)) config.mfsk_rx_enabled = atoi(value) != 0;
         else if (!strcmp(key, "csma_enabled") && take(key)) config.csma_enabled = atoi(value) != 0;
         else if (!strcmp(key, "carrier_threshold_db") && take(key)) config.carrier_threshold_db = atof(value);
         else if (!strcmp(key, "slot_time_ms") && take(key)) config.slot_time_ms = atoi(value);
@@ -1525,6 +1531,9 @@ void print_help(const char* prog) {
 #endif
               << "  --ptt-delay MS          PTT delay before TX (default: 50)\n"
               << "  --ptt-tail MS           PTT tail after TX (default: 50)\n"
+              << "\nRX decoder options:\n"
+              << "  --no-mfsk-rx            Disable the 3 always-on MFSK RX decoders to save CPU\n"
+              << "                          (ignored while an MFSK mode is selected for TX)\n"
               << "\nCSMA options:\n"
               << "  --no-csma               Disable CSMA carrier sense\n"
               << "  --csma-threshold DB     Carrier sense threshold (default: -30)\n"
@@ -1740,6 +1749,9 @@ int main(int argc, char** argv) {
         } else if (arg == "--no-rigctl") {
             config.ptt_type = PTTType::NONE;
             cli_set.insert("ptt_type");
+        } else if (arg == "--no-mfsk-rx") {
+            config.mfsk_rx_enabled = false;
+            cli_set.insert("mfsk_rx_enabled");
         } else if (arg == "--no-csma") {
             config.csma_enabled = false;
             cli_set.insert("csma_enabled");
@@ -2097,6 +2109,7 @@ int main(int argc, char** argv) {
                 cJSON_AddNumberToObject(j, "slot_time_ms", cfg.slot_time_ms);
                 cJSON_AddBoolToObject(j, "tx_blanking_enabled", cfg.tx_blanking_enabled);
                 cJSON_AddBoolToObject(j, "fragmentation_enabled", cfg.fragmentation_enabled);
+                cJSON_AddBoolToObject(j, "mfsk_rx_enabled", cfg.mfsk_rx_enabled);
 
                 return j;
             };
