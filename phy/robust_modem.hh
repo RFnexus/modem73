@@ -514,6 +514,8 @@ public:
     float get_ber_ema() const { return ber_ema_; }
     RobustMode get_last_mode() const { return last_mode_; }
 
+    bool in_frame() const { return state_ != State::SEARCH; }
+
     int stats_sync_count = 0;
     int stats_preamble_errors = 0;
     int stats_false_locks = 0;

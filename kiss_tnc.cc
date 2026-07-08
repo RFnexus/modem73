@@ -474,6 +474,7 @@ private:
 #endif
             }
         } else {
+            std::lock_guard<std::mutex> lock(config_mutex_);
             switch (cmd) {
             case KISS::CMD_TXDELAY:
                 if (!data.empty()) {
@@ -539,48 +540,60 @@ private:
                 }
                 
                 // CSMA
-                if (config_.csma_enabled) {
+                bool csma_enabled;
+                int max_backoff_slots, carrier_sense_ms, slot_time_ms, p_persistence;
+                float carrier_threshold_db;
+                {
+                    std::lock_guard<std::mutex> lock(config_mutex_);
+                    csma_enabled = config_.csma_enabled;
+                    max_backoff_slots = config_.max_backoff_slots;
+                    carrier_sense_ms = config_.carrier_sense_ms;
+                    carrier_threshold_db = config_.carrier_threshold_db;
+                    slot_time_ms = config_.slot_time_ms;
+                    p_persistence = config_.p_persistence;
+                }
+                if (csma_enabled) {
                     int backoff_count = 0;
-                    
-                    while (backoff_count < config_.max_backoff_slots) {
+
+                    while (backoff_count < max_backoff_slots) {
                         // Re-check lockout after backoff
                         if (!is_tx_allowed()) {
                             wait_for_tx_allowed();
                         }
-                        
+
                         // Check carrier
-                        float level_db = audio_->measure_level(config_.carrier_sense_ms);
-                        bool is_busy = (level_db > config_.carrier_threshold_db);
-                        
+                        float level_db = audio_->measure_level(carrier_sense_ms);
+                        bool is_busy = (level_db > carrier_threshold_db);
+
                         if (is_busy) {
                             // Channel busy - wait
-                            std::uniform_int_distribution<> slots_dist(1, 
-                                std::min(1 << backoff_count, config_.max_backoff_slots));
+                            std::uniform_int_distribution<> slots_dist(1,
+                                std::min(1 << backoff_count, max_backoff_slots));
                             int slots = slots_dist(gen);
-                            int wait_ms = slots * config_.slot_time_ms;
-                            
-                            std::cerr << "CSMA: Channel busy (" << level_db << " dB > " 
-                                      << config_.carrier_threshold_db << " dB), backing off " 
+                            int wait_ms = slots * slot_time_ms;
+
+                            std::cerr << "CSMA: Channel busy (" << level_db << " dB > "
+                                      << carrier_threshold_db << " dB), backing off "
                                       << slots << " slots (" << wait_ms << " ms)" << std::endl;
-                            
+
                             std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
                             backoff_count++;
                         } else {
                             // Channel clear - apply p-persistence
                             std::uniform_int_distribution<> p_dist(0, 255);
-                            if (p_dist(gen) < config_.p_persistence) {
+                            if (p_dist(gen) <= p_persistence) {
                                 std::cerr << "CSMA: Channel clear (" << level_db << " dB), transmitting" << std::endl;
                                 break;
                             } else {
-                                std::cerr << "CSMA: Channel clear but deferring (p=" 
-                                          << config_.p_persistence << "/255)" << std::endl;
+                                std::cerr << "CSMA: Channel clear but deferring (p="
+                                          << p_persistence << "/255)" << std::endl;
                                 std::this_thread::sleep_for(
-                                    std::chrono::milliseconds(config_.slot_time_ms));
+                                    std::chrono::milliseconds(slot_time_ms));
                             }
                         }
                     }
-                    
-                    if (backoff_count >= config_.max_backoff_slots) {
+
+                    if (backoff_count >= max_backoff_slots) {
                         std::cerr << "CSMA: Max backoff reached, transmitting anyway" << std::endl;
                     }
                 }
@@ -1008,6 +1021,12 @@ private:
                         mfsk_decoders_[i]->process(buffer.data(), n, mfsk_callbacks[i]);
                     robust_decoder_->process(buffer.data(), n, robust_frame_callback);
                     robust_decoder_n_->process(buffer.data(), n, robust_n_frame_callback);
+
+                    if (decoder_->in_frame() || robust_decoder_->in_frame() ||
+                        robust_decoder_n_->in_frame() || mfsk_decoders_[0]->in_frame() ||
+                        mfsk_decoders_[1]->in_frame() || mfsk_decoders_[2]->in_frame()) {
+                        set_tx_lockout(RX_LOCKOUT_SECONDS);
+                    }
                 }
 
 #ifdef WITH_UI
@@ -1158,6 +1177,8 @@ private:
     Fragmenter fragmenter_;
     Reassembler reassembler_;
     
+    mutable std::mutex config_mutex_;
+
     // TX lockout - prevents TX while receiving
     mutable std::mutex lockout_mutex_;
     std::chrono::steady_clock::time_point tx_lockout_until_;
@@ -1170,14 +1191,15 @@ public:
     // Update config at runtime (called from UI)
     void update_config(const TNCConfig& new_config) {
         // Update CSMA settings (safe to change at runtime)
-        config_.csma_enabled = new_config.csma_enabled;
-        config_.postamble = new_config.postamble;
-        config_.carrier_threshold_db = new_config.carrier_threshold_db;
-        config_.p_persistence = new_config.p_persistence;
-        config_.slot_time_ms = new_config.slot_time_ms;
-        
-        // TX blanking
-        config_.tx_blanking_enabled = new_config.tx_blanking_enabled;
+        {
+            std::lock_guard<std::mutex> lock(config_mutex_);
+            config_.csma_enabled = new_config.csma_enabled;
+            config_.postamble = new_config.postamble;
+            config_.carrier_threshold_db = new_config.carrier_threshold_db;
+            config_.p_persistence = new_config.p_persistence;
+            config_.slot_time_ms = new_config.slot_time_ms;
+            config_.tx_blanking_enabled = new_config.tx_blanking_enabled;
+        }
         
         // Update callsign if changed
         if (config_.callsign != new_config.callsign) {

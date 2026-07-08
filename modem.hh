@@ -550,6 +550,8 @@ public:
     // Get current modulation bits
     int get_mod_bits() const { return mod_bits; }
 
+    bool in_frame() const { return state_ != State::SEARCHING; }
+
     // Get last per-frame BER
     value get_last_ber() const { return last_ber_; }
 

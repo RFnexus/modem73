@@ -83,6 +83,9 @@ test_robust: test_robust.cc phy/robust_modem.hh phy/common.hh
 test_e2e: test_e2e.cc modem.hh phy/robust_modem.hh phy/mfsk_modem.hh
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -Iphy -o $@ test_e2e.cc -lm
 
+test_csma: test_suite/test_csma.cc modem.hh phy/robust_modem.hh miniaudio_audio.hh deps/miniaudio.o
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -I. -Iphy -o test_suite/$@ test_suite/test_csma.cc deps/miniaudio.o -lpthread -lm
+
 # Help
 help:
 	@echo "MODEM73 makefile"

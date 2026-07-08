@@ -11,6 +11,8 @@
 #include <string>
 #include <iostream>
 #include <cmath>
+#include <cstdint>
+#include <algorithm>
 #include <atomic>
 #include <thread>
 #include <chrono>
@@ -347,10 +349,15 @@ public:
 
 
     float measure_level(int duration_ms = 100) {
-        (void)duration_ms;
         if (!capture_open_) return -100.0f;
-        float rms = std::sqrt(capture_level_sum_.load() /
-                              std::max(1.0f, (float)capture_level_count_.load()));
+        uint64_t start_samples = capture_samples_.load();
+        double start_energy = capture_energy_.load();
+        std::this_thread::sleep_for(std::chrono::milliseconds(std::max(duration_ms, 10)));
+        uint64_t end_samples = capture_samples_.load();
+        double end_energy = capture_energy_.load();
+        if (end_samples == start_samples) return 0.0f;
+        float rms = std::sqrt(std::max(0.0, end_energy - start_energy) /
+                              (double)(end_samples - start_samples));
         if (rms < 1e-10f) return -100.0f;
         return 20.0f * std::log10(rms);
     }
@@ -403,18 +410,19 @@ private:
         size_t available = RING_BUFFER_SIZE - 1 - used;
         
         ma_uint32 to_write = std::min((ma_uint32)available, frame_count);
-        
-        float sum_sq = 0.0f;
+
         for (ma_uint32 i = 0; i < to_write; i++) {
             self->capture_buffer_[(write_pos + i) % RING_BUFFER_SIZE] = in[i];
-            sum_sq += in[i] * in[i];
         }
 
         self->capture_write_pos_ = (write_pos + to_write) % RING_BUFFER_SIZE;
 
-        // Update running level for CSMA exponential moving average
-        self->capture_level_sum_ = sum_sq;
-        self->capture_level_count_ = to_write;
+        float sum_sq = 0.0f;
+        for (ma_uint32 i = 0; i < frame_count; i++) {
+            sum_sq += in[i] * in[i];
+        }
+        self->capture_energy_.store(self->capture_energy_.load() + sum_sq);
+        self->capture_samples_.store(self->capture_samples_.load() + frame_count);
     }
     
     std::string capture_device_id_;
@@ -442,6 +450,6 @@ private:
     int consecutive_write_failures_ = 0;
 
     // Running signal level for CSMA
-    std::atomic<float> capture_level_sum_{0.0f};
-    std::atomic<int> capture_level_count_{1};
+    std::atomic<double> capture_energy_{0.0};
+    std::atomic<uint64_t> capture_samples_{0};
 };

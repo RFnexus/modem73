@@ -670,6 +670,8 @@ public:
     float get_last_ber() const { return last_ber_; }
     float get_ber_ema() const { return ber_ema_; }
 
+    bool in_frame() const { return state_ != State::SEARCHING; }
+
     int stats_sync_count = 0;
     int stats_preamble_errors = 0;
     int stats_crc_errors = 0;
