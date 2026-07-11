@@ -14,6 +14,8 @@ struct CsmaConfig {
     int responder_quiet_ms = 300;
     int deaf_limit_ms = 5000;
     int busy_limit_ms = 60000;
+    int idle_credit_ms = 0;
+    int cold_channel_ms = 10000;
 };
 
 class CsmaGate {
@@ -23,6 +25,9 @@ public:
 
     CsmaGate(const CsmaConfig& cfg, uint32_t seed) : cfg_(cfg) {
         int window = std::max(2, cfg_.cw) * std::max(1, cfg_.slot_ms);
+        if (cfg_.idle_credit_ms >= cfg_.cold_channel_ms)
+            window = std::max(window / 4, 2 * std::max(1, cfg_.slot_ms));
+        window_ = window;
         if (cfg_.responder) {
             quiet_needed_ = std::min(cfg_.quiet_ms, cfg_.responder_quiet_ms);
             contention_ms_ = 0;
@@ -32,6 +37,7 @@ public:
             contention_ms_ = std::uniform_int_distribution<int>(0, window - 1)(gen);
         }
         contention_drawn_ = contention_ms_;
+        idle_ms_ = std::min(std::max(0, cfg_.idle_credit_ms), quiet_needed_);
     }
 
     Verdict step(float level_db, bool capture_alive, bool tx_allowed) {
@@ -67,6 +73,7 @@ public:
 
     Reason reason() const { return reason_; }
     bool quiet_met() const { return idle_ms_ >= quiet_needed_; }
+    int window_ms() const { return window_; }
     int quiet_needed_ms() const { return quiet_needed_; }
     int contention_drawn_ms() const { return contention_drawn_; }
     int contention_left_ms() const { return std::max(0, contention_ms_); }
@@ -76,6 +83,7 @@ public:
 
 private:
     CsmaConfig cfg_;
+    int window_ = 0;
     int quiet_needed_ = 0;
     int contention_ms_ = 0;
     int contention_drawn_ = 0;

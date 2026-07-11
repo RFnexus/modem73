@@ -47,14 +47,22 @@ struct CsmaPreset {
     int dither;
     bool lead_tone;
 };
-static const CsmaPreset CSMA_PRESETS[] = {
-    {"BENCH",    0,  3, 500, 3, 0,    true},
-    {"RELAXED",  0,  8, 500, 3, 300,  true},
-    {"MODERATE", 0, 12, 500, 2, 800,  true},
-    {"BUSY",     0, 16, 500, 2, 1500, true},
+static const CsmaPreset CSMA_PRESETS[2][4] = {
+    {
+        {"BENCH",    0,  3, 500, 3, 0,    true},
+        {"RELAXED",  0,  8, 500, 3, 300,  true},
+        {"MODERATE", 0, 12, 500, 2, 800,  true},
+        {"BUSY",     0, 16, 500, 2, 1500, true},
+    },
+    {
+        {"BENCH",    0,  2, 200, 4, 0,   true},
+        {"RELAXED",  0,  4, 200, 4, 200, true},
+        {"MODERATE", 0,  6, 200, 3, 300, true},
+        {"BUSY",     0, 10, 200, 2, 500, true},
+    },
 };
-static constexpr int CSMA_PRESET_COUNT =
-    (int)(sizeof(CSMA_PRESETS) / sizeof(CSMA_PRESETS[0]));
+static const char* CSMA_BAND_NAMES[2] = {"HF", "VHF/UHF"};
+static constexpr int CSMA_PRESET_COUNT = 4;
 
 struct AltMode {
     const char* label;
@@ -156,6 +164,7 @@ struct TNCUIState {
     bool tx_lead_tone = false;
     int csma_responder_dither = 0;
     int csma_burst = 1;
+    int csma_band = 0;
     bool csma_advanced_open = false;
     
     // Audio settings 
@@ -627,6 +636,7 @@ struct TNCUIState {
         fprintf(f, "tx_lead_tone=%d\n", tx_lead_tone ? 1 : 0);
         fprintf(f, "csma_responder_dither=%d\n", csma_responder_dither);
         fprintf(f, "csma_burst=%d\n", csma_burst);
+        fprintf(f, "csma_band=%d\n", csma_band);
         fprintf(f, "fragmentation_enabled=%d\n", fragmentation_enabled ? 1 : 0);
         fprintf(f, "tx_blanking_enabled=%d\n", tx_blanking_enabled ? 1 : 0);
         fprintf(f, "# Audio/PTT\n");
@@ -708,6 +718,7 @@ struct TNCUIState {
                 else if (strcmp(key, "tx_lead_tone") == 0) tx_lead_tone = atoi(value) != 0;
                 else if (strcmp(key, "csma_responder_dither") == 0) csma_responder_dither = atoi(value);
                 else if (strcmp(key, "csma_burst") == 0) csma_burst = atoi(value);
+                else if (strcmp(key, "csma_band") == 0) csma_band = atoi(value) != 0 ? 1 : 0;
                 else if (strcmp(key, "fragmentation_enabled") == 0) fragmentation_enabled = atoi(value) != 0;
                 else if (strcmp(key, "tx_blanking_enabled") == 0) tx_blanking_enabled = atoi(value) != 0;
                 else if (strcmp(key, "audio_input") == 0) audio_input_device = value;
@@ -1140,6 +1151,7 @@ private:
         FIELD_FREQ,
         FIELD_CSMA,
         FIELD_THRESHOLD,
+        FIELD_CSMA_BAND,
         FIELD_CSMA_PRESET,
         FIELD_CSMA_ADV,
         FIELD_CSMA_QUIET,
@@ -1813,6 +1825,8 @@ private:
         if (field == FIELD_THRESHOLD) return row;
         row++;
         row++;
+        if (field == FIELD_CSMA_BAND) return row;
+        row++;
         if (field == FIELD_CSMA_PRESET) return row;
         row++;
         if (field == FIELD_CSMA_ADV) return row;
@@ -1879,7 +1893,7 @@ private:
 
     int csma_preset_match() const {
         for (int i = 0; i < CSMA_PRESET_COUNT; ++i) {
-            const CsmaPreset& p = CSMA_PRESETS[i];
+            const CsmaPreset& p = CSMA_PRESETS[state_.csma_band & 1][i];
             if (state_.csma_quiet_ms == p.quiet_ms &&
                 state_.csma_cw == p.cw &&
                 state_.slot_time_ms == p.slot_ms &&
@@ -1889,6 +1903,18 @@ private:
                 return i;
         }
         return -1;
+    }
+
+    void csma_apply_preset(int idx) {
+        const CsmaPreset& p = CSMA_PRESETS[state_.csma_band & 1][idx];
+        state_.csma_quiet_ms = p.quiet_ms;
+        state_.csma_cw = p.cw;
+        state_.slot_time_ms = p.slot_ms;
+        state_.csma_burst = p.burst;
+        state_.csma_responder_dither = p.dither;
+        state_.tx_lead_tone = p.lead_tone;
+        state_.add_log(std::string("CSMA preset: ") +
+                       CSMA_BAND_NAMES[state_.csma_band & 1] + " " + p.name);
     }
 
     void adjust_field(int delta) {
@@ -1933,18 +1959,18 @@ private:
                 state_.carrier_threshold_db += delta * 2;
                 state_.carrier_threshold_db = std::max(-80.0f, std::min(0.0f, state_.carrier_threshold_db));
                 break;
+            case FIELD_CSMA_BAND: {
+                int matched = csma_preset_match();
+                state_.csma_band = (state_.csma_band + delta + 2) % 2;
+                if (matched >= 0)
+                    csma_apply_preset(matched);
+                break;
+            }
             case FIELD_CSMA_PRESET: {
                 int idx = csma_preset_match();
                 idx = idx < 0 ? (delta > 0 ? 0 : CSMA_PRESET_COUNT - 1)
                               : (idx + delta + CSMA_PRESET_COUNT) % CSMA_PRESET_COUNT;
-                const CsmaPreset& p = CSMA_PRESETS[idx];
-                state_.csma_quiet_ms = p.quiet_ms;
-                state_.csma_cw = p.cw;
-                state_.slot_time_ms = p.slot_ms;
-                state_.csma_burst = p.burst;
-                state_.csma_responder_dither = p.dither;
-                state_.tx_lead_tone = p.lead_tone;
-                state_.add_log(std::string("CSMA preset: ") + p.name);
+                csma_apply_preset(idx);
                 break;
             }
             case FIELD_CSMA_ADV:
@@ -3190,10 +3216,16 @@ private:
         row++;
         
         dy = visible_y(row);
+        if (dy >= 0) draw_selector_field(dy, c1, c2, "Band", FIELD_CSMA_BAND,
+                                         CSMA_BAND_NAMES[state_.csma_band & 1]);
+        row++;
+
+        dy = visible_y(row);
         if (dy >= 0) {
             int pidx = csma_preset_match();
             draw_selector_field(dy, c1, c2, "Preset", FIELD_CSMA_PRESET,
-                                pidx >= 0 ? CSMA_PRESETS[pidx].name : "CUSTOM");
+                                pidx >= 0 ? CSMA_PRESETS[state_.csma_band & 1][pidx].name
+                                          : "CUSTOM");
         }
         row++;
 
@@ -5118,7 +5150,7 @@ private:
     }
     
     void draw_csma_help(int rows, int cols) {
-        int w = 58, h = 18;
+        int w = 58, h = 19;
         int x0 = (cols - w) / 2, y0 = (rows - h) / 2;
         attron(COLOR_PAIR(4));
         for (int y = y0; y < y0 + h && y < rows; y++)
@@ -5146,6 +5178,7 @@ private:
         item("Enabled",   "turn channel checking on or off");
         item("Threshold", "level above this counts as busy");
         item("Level",     "what the channel measures right now");
+        item("Band",      "HF or VHF/UHF timing for presets");
         item("Preset",    "quick setups by how busy the band is");
         item("Quiet",     "idle time required before contending");
         item("Window",    "random wait range drawn after quiet");

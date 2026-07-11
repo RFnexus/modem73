@@ -564,7 +564,10 @@ private:
                     gcfg.quiet_ms = csma_quiet_ms > 0 ? csma_quiet_ms : auto_quiet_ms();
                     gcfg.cw = csma_cw;
                     gcfg.slot_ms = slot_time_ms;
-                    gcfg.busy_limit_ms = std::max(30000, 8 * frame_air_ms());
+                    gcfg.busy_limit_ms = std::max(30000, 8 * channel_air_ms());
+                    int64_t idle_since = steady_now_ms() - last_channel_busy_ms_.load();
+                    gcfg.idle_credit_ms = (int)std::max<int64_t>(0,
+                        std::min<int64_t>(idle_since, 1000000));
                     if (csma_dither > 0) {
                         uint32_t hash = 2166136261u;
                         for (char c : csma_callsign) {
@@ -582,6 +585,10 @@ private:
                     if (gcfg.responder) {
                         std::cerr << "CSMA: responder priority, quiet "
                                   << gate.quiet_needed_ms() << " ms" << std::endl;
+                    } else if (gcfg.idle_credit_ms >= 250) {
+                        std::cerr << "CSMA: idle credit " << gcfg.idle_credit_ms
+                                  << " ms, window " << gate.window_ms() << " ms"
+                                  << std::endl;
                     }
 
                     bool was_busy = false, was_deaf = false, quiet_logged = false;
@@ -694,8 +701,15 @@ private:
         return frame_air_ms_cache_;
     }
 
+    int channel_air_ms() {
+        int heard = 0;
+        if (steady_now_ms() - heard_air_at_ms_.load() <= 120000)
+            heard = heard_air_ms_.load();
+        return std::max(frame_air_ms(), heard);
+    }
+
     int auto_quiet_ms() {
-        int q = frame_air_ms() / 4;
+        int q = channel_air_ms() / 4;
         if (q < 300) q = 300;
         if (q > 3500) q = 3500;
         return q;
@@ -896,6 +910,7 @@ private:
         if (last) {
             tx_blanking_active_ = false;
         }
+        last_channel_busy_ms_.store(steady_now_ms());
 
 #ifdef WITH_UI
         if (g_ui_state) {
@@ -1143,6 +1158,29 @@ private:
             if (n > 0) {
                 bool blanking = tx_blanking_active_.load();
 
+                {
+                    int64_t now_ms = steady_now_ms();
+                    bool loud = audio_->instant_level_db(config_.carrier_sense_ms) >
+                                config_.carrier_threshold_db;
+                    bool occupied = loud || !is_tx_allowed();
+                    if (occupied || blanking)
+                        last_channel_busy_ms_.store(now_ms);
+                    if (occupied) {
+                        if (spell_start_ms_ < 0)
+                            spell_start_ms_ = now_ms;
+                        spell_last_ms_ = now_ms;
+                    } else if (spell_start_ms_ >= 0) {
+                        int64_t spell = spell_last_ms_ - spell_start_ms_;
+                        if (spell >= 700 &&
+                            (spell > heard_air_ms_.load() ||
+                             now_ms - heard_air_at_ms_.load() > 120000)) {
+                            heard_air_ms_.store((int)std::min<int64_t>(spell, 60000));
+                            heard_air_at_ms_.store(now_ms);
+                        }
+                        spell_start_ms_ = -1;
+                    }
+                }
+
                 if (blanking) {
                     was_blanking = true;
                 } else {
@@ -1329,6 +1367,11 @@ private:
     std::chrono::steady_clock::time_point tx_lockout_until_;
     static constexpr float RX_LOCKOUT_SECONDS = 0.5f;
     std::atomic<int64_t> last_rx_done_ms_{0};
+    std::atomic<int64_t> last_channel_busy_ms_{steady_now_ms()};
+    std::atomic<int> heard_air_ms_{0};
+    std::atomic<int64_t> heard_air_at_ms_{0};
+    int64_t spell_start_ms_ = -1;
+    int64_t spell_last_ms_ = 0;
     
     // TX blanking
     std::atomic<bool> tx_blanking_active_{false};
