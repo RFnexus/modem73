@@ -565,6 +565,9 @@ private:
                     gcfg.cw = csma_cw;
                     gcfg.slot_ms = slot_time_ms;
                     gcfg.busy_limit_ms = std::max(30000, 8 * frame_air_ms());
+                    int64_t idle_since = steady_now_ms() - last_channel_busy_ms_.load();
+                    gcfg.idle_credit_ms = (int)std::max<int64_t>(0,
+                        std::min<int64_t>(idle_since, 1000000));
                     if (csma_dither > 0) {
                         uint32_t hash = 2166136261u;
                         for (char c : csma_callsign) {
@@ -582,6 +585,10 @@ private:
                     if (gcfg.responder) {
                         std::cerr << "CSMA: responder priority, quiet "
                                   << gate.quiet_needed_ms() << " ms" << std::endl;
+                    } else if (gcfg.idle_credit_ms >= 250) {
+                        std::cerr << "CSMA: idle credit " << gcfg.idle_credit_ms
+                                  << " ms, window " << gate.window_ms() << " ms"
+                                  << std::endl;
                     }
 
                     bool was_busy = false, was_deaf = false, quiet_logged = false;
@@ -896,6 +903,7 @@ private:
         if (last) {
             tx_blanking_active_ = false;
         }
+        last_channel_busy_ms_.store(steady_now_ms());
 
 #ifdef WITH_UI
         if (g_ui_state) {
@@ -1143,6 +1151,12 @@ private:
             if (n > 0) {
                 bool blanking = tx_blanking_active_.load();
 
+                if (blanking || !is_tx_allowed() ||
+                    audio_->instant_level_db(config_.carrier_sense_ms) >
+                        config_.carrier_threshold_db) {
+                    last_channel_busy_ms_.store(steady_now_ms());
+                }
+
                 if (blanking) {
                     was_blanking = true;
                 } else {
@@ -1329,6 +1343,7 @@ private:
     std::chrono::steady_clock::time_point tx_lockout_until_;
     static constexpr float RX_LOCKOUT_SECONDS = 0.5f;
     std::atomic<int64_t> last_rx_done_ms_{0};
+    std::atomic<int64_t> last_channel_busy_ms_{steady_now_ms()};
     
     // TX blanking
     std::atomic<bool> tx_blanking_active_{false};
