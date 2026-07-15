@@ -278,8 +278,9 @@ public:
             
             if (available > 0) {
                 int to_write = std::min((int)available, frames - frames_written);
+                float g = tx_gain_.load();
                 for (int i = 0; i < to_write; i++) {
-                    playback_buffer_[(write_pos + i) % RING_BUFFER_SIZE] = buffer[frames_written + i];
+                    playback_buffer_[(write_pos + i) % RING_BUFFER_SIZE] = buffer[frames_written + i] * g;
                 }
                 playback_write_pos_ = (write_pos + to_write) % RING_BUFFER_SIZE;
                 frames_written += to_write;
@@ -296,7 +297,9 @@ public:
         
         return frames_written;
     }
-    
+
+    void set_tx_gain(float g) { tx_gain_.store(g); }
+
     // check audio status
     bool is_healthy() const {
         return capture_open_ && playback_open_ && 
@@ -482,6 +485,7 @@ private:
     ma_device_id stored_capture_id_;
     ma_device_id stored_playback_id_;
     bool playback_open_ = false;
+    std::atomic<float> tx_gain_{1.0f};
     bool capture_open_ = false;
     
     std::vector<float> capture_buffer_;

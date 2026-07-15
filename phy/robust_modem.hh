@@ -2,6 +2,7 @@
 // QPSK carriers at 75 hz spacing, 20 ms symbols (13.3 ms + 6.7 ms cyclic prefix)
 //   wide (2400 hz, 32 carriers)          narrow (600 hz, 8 carriers)
 //   rdm-1200  (8192,4128) r=1/2  ~1150   rdmn-300  (8192,4128)  ~297 bps
+//   rdm-800   (16384,4128) 3/4-punctured, r~1/3  ~780
 //   rdm-600   (16384,4128) r=1/4  ~585   rdmn-150  (16384,4128) ~149 bps
 //   rdm-300   r=1/4 chase x2      ~296
 //
@@ -34,15 +35,19 @@ enum class RobustMode {
     RDM_600S  = 6,
     RDM_300S  = 7,
     RDMN_300S = 8,
-    RDMN_150S = 9
+    RDMN_150S = 9,
+    // appended after the 0-4/5-9 family blocks to keep those numbers stable
+    RDM_800   = 10,
+    RDM_800S  = 11
 };
 
 static const char* ROBUST_MODE_NAMES[] =
     {"RDM-1200", "RDM-600", "RDM-300", "RDMN-300", "RDMN-150",
-     "RDM-1200S", "RDM-600S", "RDM-300S", "RDMN-300S", "RDMN-150S"}; 
+     "RDM-1200S", "RDM-600S", "RDM-300S", "RDMN-300S", "RDMN-150S",
+     "RDM-800", "RDM-800S"};
 
 
-constexpr int ROBUST_MODE_COUNT = 10;
+constexpr int ROBUST_MODE_COUNT = 12;
 
 struct RobustParams {
     static constexpr int SAMPLE_RATE = 48000;
@@ -58,10 +63,16 @@ struct RobustParams {
     static constexpr int NROWS_MAX = 1369;
 
     static bool is_narrow(RobustMode m) {
-        return (int)m % 5 == 3 || (int)m % 5 == 4;
+        int i = (int)m;
+        return i < 10 && (i % 5 == 3 || i % 5 == 4);
     }
-    static bool is_short(RobustMode m) { return (int)m >= 5; }
+    static bool is_short(RobustMode m) {
+        int i = (int)m;
+        return (i >= 5 && i < 10) || i == 11;
+    }
     static RobustMode with_framing(RobustMode m, bool short_frame) {
+        if ((int)m >= 10)
+            return short_frame ? RobustMode::RDM_800S : RobustMode::RDM_800;
         return (RobustMode)((int)m % 5 + (short_frame ? 5 : 0));
     }
     static int nc(RobustMode m) { return is_narrow(m) ? 8 : 32; }
@@ -69,12 +80,27 @@ struct RobustParams {
     static int data_bits(RobustMode m) { return 8 * data_bytes(m); }
     static int mesg_bits(RobustMode m) { return data_bits(m) + CRC_BITS; }
     static int code_order(RobustMode m) {
-        static const int t[] = {13, 14, 14, 13, 14, 12, 13, 13, 12, 13};
+        static const int t[] = {13, 14, 14, 13, 14, 12, 13, 13, 12, 13, 14, 13};
         return t[(int)m];
     }
     static int code_bits(RobustMode m) { return 1 << code_order(m); }
     static int copies(RobustMode m) {
         return m == RobustMode::RDM_300 || m == RobustMode::RDM_300S ? 2 : 1;
+    }
+    // RDM-800 transmits only 3/4 of the shuffled codeword; the receiver
+    // treats the rest as erasures, so the rate-1/4 mother code acts as a
+    // rate-1/3 code
+    static int sent_bits(RobustMode m) {
+        if ((int)m >= 10)
+            return 3 * code_bits(m) / 4;
+        return code_bits(m) * copies(m);
+    }
+    // the punctured quarter is the HEAD of the shuffled codeword, so
+    // RDM-800 bits are misaligned relative to an RDM-600 prefix: a strong
+    // RDM-600 frame must not decode early (mislabeled, DCD dropped with
+    // the sender still keyed) at the shorter RDM-800 checkpoint
+    static int sent_offset(RobustMode m) {
+        return (int)m >= 10 ? code_bits(m) / 4 : 0;
     }
     static const uint32_t* frozen(RobustMode m) {
         if (is_short(m))
@@ -83,7 +109,8 @@ struct RobustParams {
     }
     static int nrows(RobustMode m) {
         static const int t[] = {173, 345, 685, 685, 1369,
-                                89, 177, 349, 345, 689};
+                                89, 177, 349, 345, 689,
+                                257, 129};
         return t[(int)m];
     }
     static bool is_pilot_row(int i) { return i % NS == 0; }
@@ -159,7 +186,6 @@ public:
         const int cbits = RobustParams::code_bits(mode);
         const int nrows = RobustParams::nrows(mode);
         const int nc = RobustParams::nc(mode);
-        const int copies = RobustParams::copies(mode);
         const int base = RobustParams::base_bin(center_freq, mode);
 
         const int dbytes = RobustParams::data_bytes(mode);
@@ -207,7 +233,8 @@ public:
             emit_symbol(out, tones, base, nc, true);
         }
         int kbit = 0;
-        const int total_bits = cbits * copies;
+        const int total_bits = RobustParams::sent_bits(mode);
+        const int poff = RobustParams::sent_offset(mode);
         for (int row = 0; row < nrows; ++row) {
             cmplx tones[RobustParams::NC_MAX];
             if (RobustParams::is_pilot_row(row)) {
@@ -217,8 +244,8 @@ public:
                 for (int k = 0; k < nc; ++k) {
                     int8_t b[2];
                     if (kbit + 1 < total_bits) {
-                        b[0] = perm_[kbit % cbits];
-                        b[1] = perm_[(kbit + 1) % cbits];
+                        b[0] = perm_[(poff + kbit) % cbits];
+                        b[1] = perm_[(poff + kbit + 1) % cbits];
                     } else {
                         b[0] = nrz(filler_seq());
                         b[1] = nrz(filler_seq());
@@ -294,13 +321,16 @@ public:
             modes_[3] = RobustMode::RDMN_150;
             nmodes_ = 4;
         } else {
-            modes_[0] = RobustMode::RDM_1200S;
-            modes_[1] = RobustMode::RDM_1200;
-            modes_[2] = RobustMode::RDM_600S;
-            modes_[3] = RobustMode::RDM_600;
-            modes_[4] = RobustMode::RDM_300S;
-            modes_[5] = RobustMode::RDM_300;
-            nmodes_ = 6;
+            // ascending nrows so each mode's checkpoint is reached in order
+            modes_[0] = RobustMode::RDM_1200S;  // 89 rows
+            modes_[1] = RobustMode::RDM_800S;   // 129
+            modes_[2] = RobustMode::RDM_1200;   // 173
+            modes_[3] = RobustMode::RDM_600S;   // 177
+            modes_[4] = RobustMode::RDM_800;    // 257
+            modes_[5] = RobustMode::RDM_600;    // 345
+            modes_[6] = RobustMode::RDM_300S;   // 349
+            modes_[7] = RobustMode::RDM_300;    // 685
+            nmodes_ = 8;
         }
         nc_ = RobustParams::nc(modes_[0]);
         for (int k = 0; k < nc_; ++k)
@@ -339,6 +369,7 @@ public:
         Ra_ = Rb_ = 0;
         rows_done_ = 0;
         tried_mask_ = 0;
+        confirmed_ = false;
         pilot_alive_total_ = -1;
     }
 
@@ -454,6 +485,7 @@ public:
                     value s_om = omega_;
                     int s_bu = base_use_, s_rd = rows_done_;
                     unsigned s_tm = tried_mask_;
+                    bool s_cf = confirmed_;
                     peak_pos_ = cand_pos_;
                     bool stale = pilot_alive_total_ >= 0 &&
                                  total_in_ - pilot_alive_total_ >= PREEMPT_STALE;
@@ -470,6 +502,7 @@ public:
                     frame_pos_ = s_fp; anchor_u_ = s_au; peak_pos_ = s_pp;
                     omega_ = s_om; base_use_ = s_bu;
                     rows_done_ = s_rd; tried_mask_ = s_tm;
+                    confirmed_ = s_cf;
                 }
                 while (rows_done_ < nrows_top_) {
                     int64_t start = row_start(rows_done_);
@@ -488,6 +521,7 @@ public:
                     if (rows_done_ == 2 * RobustParams::NS + 1 &&
                         pilot_sanity(3, nc_ <= 8 ? 0.45f : 0.28f)) {
                         ++stats_sync_count;
+                        confirmed_ = true;
                     } else if ((rows_done_ == 1 && !pilot_sanity(1, nc_ <= 8 ? 0.30f : 0.18f)) ||
                         (rows_done_ == 2 * RobustParams::NS + 1 &&
                          !pilot_sanity(3, nc_ <= 8 ? 0.45f : 0.28f))) {
@@ -496,6 +530,7 @@ public:
                                   << std::endl;
                         state_ = State::SEARCH;
                         rows_done_ = 0;
+                        confirmed_ = false;
                         ++stats_false_locks;
                         break;
                     }
@@ -541,9 +576,9 @@ public:
     bool in_frame() const { return state_ != State::SEARCH; }
 
     bool carrier_active() const {
-        return state_ != State::SEARCH &&
+        return state_ != State::SEARCH && confirmed_ &&
                (pilot_alive_total_ < 0 ||
-                total_in_ - pilot_alive_total_ < PILOT_GRACE);
+                total_in_ - pilot_alive_total_ < DCD_GRACE);
     }
 
     int stats_sync_count = 0;
@@ -605,7 +640,7 @@ private:
 
     bool narrow_ = false;
     int nc_ = 32;
-    RobustMode modes_[6] = {RobustMode::RDM_1200, RobustMode::RDM_600,
+    RobustMode modes_[8] = {RobustMode::RDM_1200, RobustMode::RDM_600,
                             RobustMode::RDM_300};
     int nmodes_ = 3;
     int nrows_top_ = 685;
@@ -634,9 +669,13 @@ private:
     value cand_metric_ = 0;
     int64_t cand_pos_ = 0;
     int64_t cand_deadline_ = -1;
+    // set once the row-9 pilot sanity passes: the collect is a real frame,
+    // not a lock that will be culled; gates the DCD so noise-floor false
+    // locks never assert carrier_active
+    bool confirmed_ = false;
     int64_t pilot_alive_total_ = -1;
-    static constexpr int64_t PILOT_GRACE = 120000;
     static constexpr int64_t PREEMPT_STALE = 288000;
+    static constexpr int64_t DCD_GRACE = 48000;
 
     cmplx rows_[RobustParams::NROWS_MAX][RobustParams::NC_MAX];
     cmplx rot_[RobustParams::NC_MAX];
@@ -784,6 +823,7 @@ private:
             frame_pos_ = p2u + D;
             rows_done_ = 0;
             tried_mask_ = 0;
+            confirmed_ = false;
         }
         return best_kind;
     }
@@ -862,6 +902,7 @@ private:
             buf_.clear();
         state_ = State::SEARCH;
         rows_done_ = 0;
+        confirmed_ = false;
         refresh_sums((int64_t)buf_.size() - 1);
     }
 
@@ -903,7 +944,7 @@ private:
         const int cbits = RobustParams::code_bits(mode);
         const int nrows = RobustParams::nrows(mode);
         const int copies = RobustParams::copies(mode);
-        const int total_bits = cbits * copies;
+        const int total_bits = RobustParams::sent_bits(mode);
 
         CODE::MLS pilot_seq(0x163, narrow_ ? 89 : 1);
         static cmplx chanP[RobustParams::NROWS_MAX / RobustParams::NS + 2]
@@ -997,8 +1038,19 @@ private:
                 ? (value)(i - row_a) / (value)RobustParams::NS : value(0);
             cmplx chan[RobustParams::NC_MAX], dem[RobustParams::NC_MAX];
             value cp_mean = 0;
+            // Catmull-Rom over four pilot rows: through a fading null the
+            // complex gain curves and its phase slews, which linear
+            // interpolation between the bracketing pilots gets wrong
+            int p0 = pa > 0 ? pa - 1 : pa;
+            int p3 = pb + 1 < npil ? pb + 1 : pb;
+            value t2 = t * t, t3 = t2 * t;
+            value w0 = value(0.5) * (2 * t2 - t3 - t);
+            value w1 = value(0.5) * (3 * t3 - 5 * t2 + 2);
+            value w2 = value(0.5) * (4 * t2 - 3 * t3 + t);
+            value w3 = value(0.5) * (t3 - t2);
             for (int k = 0; k < nc_; ++k) {
-                chan[k] = DSP::lerp(chanP[pa][k], chanP[pb][k], t);
+                chan[k] = w0 * chanP[p0][k] + w1 * chanP[pa][k]
+                        + w2 * chanP[pb][k] + w3 * chanP[p3][k];
                 cp_mean += norm(chan[k]);
             }
             cp_mean /= nc_;
@@ -1045,6 +1097,7 @@ private:
         std::memcpy(perm_raw, perm_, sizeof(code_type) * total_bits);
 
         const int crc_bits = RobustParams::mesg_bits(mode);
+        const int poff = RobustParams::sent_offset(mode);
         auto combine_shuffle = [&]() {
             if (copies == 2) {
                 for (int i = 0; i < cbits; ++i) {
@@ -1053,7 +1106,16 @@ private:
                                          : v < -32767 ? -32767 : v);
                 }
             }
-            shuffle_dec(code_, perm_, order);
+            if (poff) {
+                static code_type full[1 << 14];
+                for (int i = 0; i < poff; ++i)
+                    full[i] = 0;        // punctured head decodes as erasures
+                std::memcpy(full + poff, perm_,
+                            sizeof(code_type) * total_bits);
+                shuffle_dec(code_, full, order);
+            } else {
+                shuffle_dec(code_, perm_, order);
+            }
         };
         auto scan = [&](auto& mesg, auto& dec) -> bool {
             dec(nullptr, mesg, code_, RobustParams::frozen(mode), order);
@@ -1117,11 +1179,15 @@ private:
             CODE::set_le_bit(out, i, ber_mesg_[i] < 0);
 
         ber_encoder_(ber_code_, ber_mesg_, RobustParams::frozen(mode), order);
-        int errs = 0;
-        for (int i = 0; i < cbits; ++i)
+        int errs = 0, counted = 0;
+        for (int i = 0; i < cbits; ++i) {
+            if (code_[i] == 0)          // punctured or erased, never received
+                continue;
+            ++counted;
             if ((code_[i] < 0) != (ber_code_[i] < 0))
                 ++errs;
-        last_ber_ = (value)errs / cbits;
+        }
+        last_ber_ = counted ? (value)errs / counted : 0;
         ber_ema_ = ber_ema_ < 0 ? last_ber_
                                 : value(0.3) * last_ber_ + value(0.7) * ber_ema_;
         last_snr_ = snr_rows > 0

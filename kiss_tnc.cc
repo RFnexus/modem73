@@ -167,6 +167,7 @@ static std::string ofdm_mode_name(int m) {
 class KISSTNC {
 public:
     PerfLogger perf_log_;
+    std::function<void(float snr, float ber_pct, float level_db)> rx_stats_callback;
 
     KISSTNC(const TNCConfig& config) : config_(config) {
         // Allocate OFDM encoder/decoder
@@ -248,6 +249,7 @@ public:
         if (!audio_->open_capture()) {
             throw std::runtime_error("Failed to open audio capture");
         }
+        audio_->set_tx_gain(config_.tx_drive);
         
         std::cerr << "Audio input:  " << config_.audio_input_device << std::endl;
         std::cerr << "Audio output: " << config_.audio_output_device << std::endl;
@@ -535,12 +537,6 @@ private:
                     g_ui_state->tx_queue_size = tx_queue_.size();
                 }
 #endif
-                // Wait for TX lockout to clear 
-                if (!is_tx_allowed()) {
-                    std::cerr << "TX: Waiting for lockout to clear..." << std::endl;
-                    wait_for_tx_allowed();
-                }
-                
                 // CSMA
                 bool csma_enabled;
                 int carrier_sense_ms, slot_time_ms, csma_quiet_ms, csma_cw, csma_dither, csma_burst;
@@ -559,6 +555,15 @@ private:
                     csma_callsign = config_.callsign;
                 }
                 if (csma_enabled) {
+                    // Wait for TX lockout to clear
+                    if (!is_tx_allowed()) {
+                        std::cerr << "TX: Waiting for lockout to clear..." << std::endl;
+#ifdef WITH_UI
+                        if (g_ui_state) g_ui_state->csma_phase = 1;
+#endif
+                        wait_for_tx_allowed();
+                    }
+
                     CsmaConfig gcfg;
                     gcfg.threshold_db = carrier_threshold_db;
                     gcfg.quiet_ms = csma_quiet_ms > 0 ? csma_quiet_ms : auto_quiet_ms();
@@ -638,12 +643,28 @@ private:
                                       << std::endl;
                             quiet_logged = true;
                         }
+#ifdef WITH_UI
+                        if (g_ui_state) {
+                            if (gate.quiet_met()) {
+                                g_ui_state->csma_phase = 3;
+                                g_ui_state->csma_wait_ms = gate.contention_left_ms();
+                                g_ui_state->csma_wait_need = gate.contention_drawn_ms();
+                            } else {
+                                g_ui_state->csma_phase = 2;
+                                g_ui_state->csma_wait_ms = gate.idle_ms();
+                                g_ui_state->csma_wait_need = gate.quiet_needed_ms();
+                            }
+                        }
+#endif
                         std::this_thread::sleep_for(std::chrono::milliseconds(gcfg.poll_ms));
                     }
                     if (!g_running)
                         break;
                 }
 
+#ifdef WITH_UI
+                if (g_ui_state) g_ui_state->csma_phase = 0;
+#endif
                 TxPacket cur = std::move(pkt);
                 bool first = true;
                 int remaining = csma_burst - 1;
@@ -717,6 +738,8 @@ private:
 
     bool transmit(const std::vector<uint8_t>& data, int oper_mode_override = -1,
                   bool first = true, bool last = true) {
+        while (alc_tune_active_.load() && g_running)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         int tx_mode = (oper_mode_override >= 0) ? oper_mode_override : modem_config_.oper_mode;
 
         if (oper_mode_override >= 0) {
@@ -736,7 +759,14 @@ private:
         if (g_ui_state) {
             g_ui_state->transmitting = true;
             g_ui_state->tx_frame_count++;
-            g_ui_state->add_packet(true, data.size(), 0);
+            std::string mname = config_.modem_type == 2
+                ? ROBUST_MODE_NAMES[(oper_mode_override >= 0 &&
+                                     oper_mode_override < ROBUST_MODE_COUNT)
+                                        ? oper_mode_override : config_.robust_mode]
+                : config_.modem_type == 1
+                    ? MFSK_MODE_NAMES[config_.mfsk_mode]
+                    : ofdm_mode_name(tx_mode);
+            g_ui_state->add_packet(true, data.size(), 0, -1.0f, mname);
         }
 #endif
 
@@ -753,7 +783,7 @@ private:
             );
         } else if (config_.modem_type == 2) {
             RobustMode tx_rmode = (oper_mode_override >= 0 &&
-                                   oper_mode_override <= (int)RobustMode::RDMN_150S)
+                                   oper_mode_override < ROBUST_MODE_COUNT)
                 ? (RobustMode)oper_mode_override
                 : (RobustMode)config_.robust_mode;
             samples = robust_encoder_->encode(
@@ -951,7 +981,8 @@ private:
         int level_update_counter = 0;
         const int LEVEL_UPDATE_INTERVAL = 5;
         
-        auto deliver_to_clients = [this](const std::vector<uint8_t>& payload, float snr, float ber_pct, bool was_reassembled) {
+        auto deliver_to_clients = [this](const std::vector<uint8_t>& payload, float snr, float ber_pct, bool was_reassembled,
+                                         const std::string& mode = "", std::string callsign = "") {
             last_rx_done_ms_.store(steady_now_ms());
             ui_log("RX: " + std::to_string(payload.size()) + " bytes, SNR=" +
                    std::to_string((int)snr) + "dB" + (was_reassembled ? " (reassembled)" : ""));
@@ -961,7 +992,12 @@ private:
 
 #ifdef WITH_UI
             if (g_ui_state) {
-                g_ui_state->add_packet(false, payload.size(), snr, ber_pct);
+                if (callsign.empty() && payload.size() > 4 && !memcmp(payload.data(), "M73:", 4)) {
+                    auto sep = std::find(payload.begin() + 4, payload.end(), (uint8_t)':');
+                    if (sep != payload.end() && sep - payload.begin() <= 16)
+                        callsign.assign(payload.begin() + 4, sep);
+                }
+                g_ui_state->add_packet(false, payload.size(), snr, ber_pct, mode, callsign);
             }
 #endif
 
@@ -986,8 +1022,13 @@ private:
                 }
             }
 
+            if (rx_stats_callback) {
+                float level_db = audio_ ? audio_->instant_level_db(200) : 0.0f;
+                rx_stats_callback(snr, ber_pct, level_db);
+            }
+
             auto kiss_frame = KISSParser::wrap(payload);
-            
+
             std::lock_guard<std::mutex> lock(clients_mutex_);
             for (auto& client : clients_) {
                 client->send(kiss_frame);
@@ -1033,10 +1074,12 @@ private:
                 auto reassembled = reassembler_.process(payload);
                 if (!reassembled.empty()) {
                     ui_log("RX: Reassembled " + std::to_string(reassembled.size()) + " bytes from fragments");
-                    deliver_to_clients(reassembled, snr, ber_pct, true);
+                    deliver_to_clients(reassembled, snr, ber_pct, true,
+                                       ofdm_mode_name(decoder_->oper_mode), decoder_->last_call_);
                 }
             } else {
-                deliver_to_clients(payload, snr, ber_pct, false);
+                deliver_to_clients(payload, snr, ber_pct, false,
+                                   ofdm_mode_name(decoder_->oper_mode), decoder_->last_call_);
             }
         };
 
@@ -1066,10 +1109,12 @@ private:
                 auto reassembled = reassembler_.process(payload);
                 if (!reassembled.empty()) {
                     ui_log("RDM RX: Reassembled " + std::to_string(reassembled.size()) + " bytes");
-                    deliver_to_clients(reassembled, snr, ber_pct, true);
+                    deliver_to_clients(reassembled, snr, ber_pct, true,
+                                       ROBUST_MODE_NAMES[(int)robust_decoder_->get_last_mode()]);
                 }
             } else {
-                deliver_to_clients(payload, snr, ber_pct, false);
+                deliver_to_clients(payload, snr, ber_pct, false,
+                                   ROBUST_MODE_NAMES[(int)robust_decoder_->get_last_mode()]);
             }
         };
 
@@ -1099,10 +1144,12 @@ private:
                 auto reassembled = reassembler_.process(payload);
                 if (!reassembled.empty()) {
                     ui_log("RDMn RX: Reassembled " + std::to_string(reassembled.size()) + " bytes");
-                    deliver_to_clients(reassembled, snr, ber_pct, true);
+                    deliver_to_clients(reassembled, snr, ber_pct, true,
+                                       ROBUST_MODE_NAMES[(int)robust_decoder_n_->get_last_mode()]);
                 }
             } else {
-                deliver_to_clients(payload, snr, ber_pct, false);
+                deliver_to_clients(payload, snr, ber_pct, false,
+                                   ROBUST_MODE_NAMES[(int)robust_decoder_n_->get_last_mode()]);
             }
         };
 
@@ -1140,10 +1187,12 @@ private:
                 auto reassembled = reassembler_.process(payload);
                 if (!reassembled.empty()) {
                     ui_log("MFSK RX: Reassembled " + std::to_string(reassembled.size()) + " bytes");
-                    deliver_to_clients(reassembled, snr, ber_pct, true);
+                    deliver_to_clients(reassembled, snr, ber_pct, true,
+                                       MFSK_MODE_NAMES[(int)dec->get_last_decoded_mode()]);
                 }
             } else {
-                deliver_to_clients(payload, snr, ber_pct, false);
+                deliver_to_clients(payload, snr, ber_pct, false,
+                                   MFSK_MODE_NAMES[(int)dec->get_last_decoded_mode()]);
             }
           };
         };
@@ -1179,10 +1228,26 @@ private:
                         }
                         spell_start_ms_ = -1;
                     }
+                    if (occ_last_ms_ > 0 && now_ms > occ_last_ms_) {
+                        float dt = (now_ms - occ_last_ms_) / 1000.0f;
+                        if (dt < 5.0f) {
+                            float a = std::min(1.0f, dt / 30.0f);
+                            float x = (loud || blanking || dcd_active_) ? 1.0f : 0.0f;
+                            occupancy_ema_ += (x - occupancy_ema_) * a;
+                        }
+                    }
+                    occ_last_ms_ = now_ms;
+#ifdef WITH_UI
+                    if (g_ui_state) {
+                        g_ui_state->channel_occupancy = occupancy_ema_;
+                        g_ui_state->dcd_active = dcd_active_;
+                    }
+#endif
                 }
 
                 if (blanking) {
                     was_blanking = true;
+                    dcd_active_ = false;
                 } else {
                     if (was_blanking) {
                         decoder_->reset();
@@ -1199,13 +1264,13 @@ private:
                     robust_decoder_->process(buffer.data(), n, robust_frame_callback);
                     robust_decoder_n_->process(buffer.data(), n, robust_n_frame_callback);
 
-                    if (decoder_->in_frame() || robust_decoder_->carrier_active() ||
-                        robust_decoder_n_->carrier_active() ||
-                        (mfsk_rx && (mfsk_decoders_[0]->in_frame() ||
-                                     mfsk_decoders_[1]->in_frame() ||
-                                     mfsk_decoders_[2]->in_frame()))) {
+                    // sync DCD: OFDM meta-validated in_frame and pilot-confirmed
+                    // RDM collects only; MFSK syncs are too loose to gate TX on
+                    dcd_active_ = decoder_->in_frame() ||
+                                  robust_decoder_->carrier_active() ||
+                                  robust_decoder_n_->carrier_active();
+                    if (dcd_active_)
                         set_tx_lockout(RX_LOCKOUT_SECONDS);
-                    }
                 }
 
 #ifdef WITH_UI
@@ -1220,7 +1285,7 @@ private:
                     float rms = std::sqrt(sum_sq / n);
                     float db = 20.0f * std::log10(rms + 1e-10f);
 
-                    g_ui_state->update_level(db);
+                    g_ui_state->update_level(db, dcd_active_);
 
                     // Copy decoder stats
                     if (g_ui_state->stats_reset_requested.exchange(false)) {
@@ -1372,11 +1437,100 @@ private:
     std::atomic<int64_t> heard_air_at_ms_{0};
     int64_t spell_start_ms_ = -1;
     int64_t spell_last_ms_ = 0;
+    float occupancy_ema_ = 0.0f;
+    int64_t occ_last_ms_ = 0;
+    bool dcd_active_ = false;
+    std::atomic<bool> alc_tune_active_{false};
     
     // TX blanking
     std::atomic<bool> tx_blanking_active_{false};
     
 public:
+    float alc_auto_tune() {
+        if (alc_tune_active_.exchange(true))
+            return -1.0f;
+        bool busy = tx_blanking_active_.load();
+#ifdef WITH_UI
+        if (g_ui_state && g_ui_state->transmitting.load())
+            busy = true;
+#endif
+        if (busy) {
+            ui_log("ALC tune: TX in progress, try again");
+            alc_tune_active_ = false;
+            return -1.0f;
+        }
+        float result = -1.0f;
+        tx_blanking_active_ = true;
+        set_ptt(true);
+        float drive = 0.10f;
+        float prev = drive;
+        float alc_base = NAN;
+        for (int step = 0; step < 14 && g_running; ++step) {
+            audio_->drain_playback();
+            audio_->set_tx_gain(drive);
+            auto tone = generate_tone(modem_config_.center_freq,
+                                      config_.sample_rate * 7 / 10, 0.8f);
+            audio_->write(tone.data(), tone.size());
+            std::this_thread::sleep_for(std::chrono::milliseconds(450));
+            std::string r = rigctl_command("+l ALC");
+            float alc = NAN;
+            if (r.find("RPRT 0") != std::string::npos) {
+                size_t p = r.find("Level Value:");
+                if (p != std::string::npos) {
+                    alc = strtof(r.c_str() + p + 12, nullptr);
+                } else {
+                    size_t pos = 0;
+                    while (pos < r.size()) {
+                        size_t e = r.find('\n', pos);
+                        std::string line = r.substr(pos,
+                            e == std::string::npos ? std::string::npos : e - pos);
+                        if (line.rfind("RPRT", 0) == 0)
+                            break;
+                        if (!line.empty() && line.find(':') == std::string::npos)
+                            alc = strtof(line.c_str(), nullptr);
+                        if (e == std::string::npos)
+                            break;
+                        pos = e + 1;
+                    }
+                }
+            }
+            if (std::isnan(alc)) {
+                ui_log("ALC tune: no ALC reading from rig: " + r);
+                break;
+            }
+            char buf[64];
+            snprintf(buf, sizeof(buf), "ALC tune: drive %d%% ALC %.2f",
+                     (int)lround(drive * 100), alc);
+            ui_log(buf);
+            if (std::isnan(alc_base)) {
+                alc_base = alc;
+                if (alc_base > 0.3f) {
+                    ui_log("ALC tune: ALC already high at 10% drive - reduce rig input gain");
+                    break;
+                }
+            } else if (alc > alc_base + 0.05f) {
+                result = prev;
+                break;
+            } else if (drive >= 0.999f) {
+                result = 1.0f;
+                ui_log("ALC tune: no ALC movement at full drive - rig input gain may be low");
+                break;
+            }
+            prev = drive;
+            drive = std::min(1.0f, drive * 1.25f);
+        }
+        audio_->drain_playback();
+        set_ptt(false);
+        tx_blanking_active_ = false;
+        if (result > 0) {
+            std::lock_guard<std::mutex> lock(config_mutex_);
+            config_.tx_drive = result;
+        }
+        audio_->set_tx_gain(config_.tx_drive);
+        alc_tune_active_ = false;
+        return result;
+    }
+
     // Update config at runtime (called from UI)
     void update_config(const TNCConfig& new_config) {
         // Update CSMA settings (safe to change at runtime)
@@ -1393,6 +1547,10 @@ public:
             config_.csma_burst = new_config.csma_burst;
             config_.tx_lead_tone = new_config.tx_lead_tone;
             config_.tx_blanking_enabled = new_config.tx_blanking_enabled;
+            if (config_.tx_drive != new_config.tx_drive) {
+                config_.tx_drive = new_config.tx_drive;
+                if (audio_) audio_->set_tx_gain(config_.tx_drive);
+            }
         }
         
         // Update callsign if changed
@@ -1563,7 +1721,7 @@ public:
     void queue_data_ex(const std::vector<uint8_t>& data, int oper_mode) {
         size_t effective_payload;
         if (oper_mode >= 0) {
-            if (config_.modem_type == 2 && oper_mode <= (int)RobustMode::RDMN_150S)
+            if (config_.modem_type == 2 && oper_mode < ROBUST_MODE_COUNT)
                 effective_payload = robust_encoder_->get_payload_size((RobustMode)oper_mode) - 2;
             else
                 effective_payload = encoder_->get_payload_size(oper_mode) - 2;
@@ -2055,6 +2213,7 @@ int main(int argc, char** argv) {
                 config.modem_type = ui_state.modem_type_index;
                 config.mfsk_mode = ui_state.mfsk_mode_index;
                 config.robust_mode = ui_state.robust_mode_index;
+                config.tx_drive = ui_state.tx_drive;
                 config.center_freq = ui_state.center_freq;
                 config.modulation = MODULATION_OPTIONS[ui_state.modulation_index];
                 config.code_rate = CODE_RATE_OPTIONS[ui_state.code_rate_index];
@@ -2448,6 +2607,10 @@ int main(int argc, char** argv) {
 
             ctrl = std::make_unique<ControlPort>(config.control_port, config.bind_address, ctrl_iface);
             ctrl->start();
+
+            tnc.rx_stats_callback = [&ctrl](float snr, float ber_pct, float level_db) {
+                if (ctrl) ctrl->notify_rx_frame(snr, ber_pct, level_db);
+            };
         }
 
 #ifdef WITH_UI
@@ -2475,6 +2638,7 @@ int main(int argc, char** argv) {
                 new_config.tx_lead_tone = state.tx_lead_tone;
                 new_config.fragmentation_enabled = state.fragmentation_enabled;
                 new_config.tx_blanking_enabled = state.tx_blanking_enabled;
+                new_config.tx_drive = state.tx_drive;
                 new_config.audio_input_device = state.audio_input_device;
                 new_config.audio_output_device = state.audio_output_device;
                 // PTT settings
@@ -2500,6 +2664,10 @@ int main(int argc, char** argv) {
             // Set up audio reconnect callback
             ui_state.on_reconnect_audio = [&tnc]() -> bool {
                 return tnc.reconnect_audio();
+            };
+
+            ui_state.on_alc_tune = [&tnc]() -> float {
+                return tnc.alc_auto_tune();
             };
 
             ui_state.on_rigctl_command = [&tnc](const std::string& cmd) -> std::string {

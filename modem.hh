@@ -478,6 +478,7 @@ private:
 template<typename value, typename cmplx, int rate>
 class ModemDecoder : public Common {
 public:
+    char last_call_[10] = {0};
     typedef int16_t code_type;
     typedef SIMD<code_type, 32> mesg_type;
     typedef DSP::Const<value> Const;
@@ -1066,6 +1067,7 @@ private:
             char call_sign[10];
             base40_decoder(call_sign, call, 9);
             call_sign[9] = 0;
+            std::memcpy(last_call_, call_sign, sizeof(last_call_));
             std::cerr << "Decoder: Call sign: " << call_sign << std::endl;
 
             mode = meta_info & 255;

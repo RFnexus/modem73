@@ -139,6 +139,17 @@ public:
         cJSON_Delete(event);
     }
 
+    // Push per-frame receive stats to all connected clients
+    void notify_rx_frame(float snr, float ber_pct, float level_db) {
+        cJSON* event = cJSON_CreateObject();
+        cJSON_AddStringToObject(event, "event", "rx_frame");
+        cJSON_AddNumberToObject(event, "snr", snr);
+        cJSON_AddNumberToObject(event, "ber_pct", ber_pct);
+        cJSON_AddNumberToObject(event, "level_db", level_db);
+        broadcast_event(event);
+        cJSON_Delete(event);
+    }
+
     // Push an event to all connected clients (thread-safe)
     void broadcast_event(cJSON* event) {
         char* str = cJSON_PrintUnformatted(event);
