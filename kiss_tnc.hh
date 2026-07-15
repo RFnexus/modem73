@@ -51,6 +51,7 @@ struct TNCConfig {
     std::string audio_input_device = "default";
     std::string audio_output_device = "default";
     int sample_rate = 48000;
+    float tx_drive = 1.0f;
     
     // Modem settings
     int modem_type = 0;         // 0=OFDM, 1=MFSK, 2=ROBUST 

@@ -35,8 +35,22 @@
 constexpr size_t MAX_LOG_ENTRIES = 500;
 
 const std::vector<std::string> MODEM_TYPE_OPTIONS = {"OFDM", "MFSK", "ROBUST"};
-const std::vector<std::string> ROBUST_MODE_OPTIONS = {"RDM-1200", "RDM-600", "RDM-300", "RDMN-300", "RDMN-150"};
+const std::vector<std::string> ROBUST_MODE_OPTIONS = {"RDM-1200", "RDM-800", "RDM-600", "RDM-300", "RDMN-300", "RDMN-150"};
 const std::vector<std::string> ROBUST_MTU_OPTIONS = {"510 B", "170 B (short)"};
+
+// robust_mode ints: 0-4 full-frame, 5-9 short-frame, 10/11 RDM-800/-800S.
+// The UI shows a base-mode selector (index into ROBUST_MODE_OPTIONS above,
+// display order) plus a frame-size toggle; these map between the two.
+inline int robust_base_index(int mode) {
+    if (mode >= 10) return 1;                       // RDM-800 family
+    int fam = mode % 5;                             // 0-4 family order
+    return fam == 0 ? 0 : fam + 1;                  // shifted past RDM-800
+}
+inline int robust_mode_of(int base, bool short_frame) {
+    if (base == 1) return short_frame ? 11 : 10;
+    int fam = base == 0 ? 0 : base - 1;
+    return fam + (short_frame ? 5 : 0);
+}
 
 struct CsmaPreset {
     const char* name;
@@ -86,8 +100,9 @@ static const AltMode ALT_MODES[] = {
     {"MFSK-16",      1, 1, 0, 1, 0, 1},
     {"RDM-1200S",    2, 1, 0, 1, 5, 1},
     {"RDMN-300S",    2, 1, 0, 1, 8, 1},
+    {"RDM-800",      2, 1, 0, 1, 10, 1},
 };
-constexpr int ALT_MODE_COUNT = 12;
+constexpr int ALT_MODE_COUNT = 13;
 const std::vector<std::string> MFSK_MODE_OPTIONS = {"MFSK-8", "MFSK-16", "MFSK-32", "MFSK-32R"};
 
 const std::vector<std::string> MODULATION_OPTIONS = {
@@ -133,6 +148,8 @@ const RigMeterDef RIG_METERS[RIG_METER_COUNT] = {
     {"ALC",     "ALC",                   0.0f,  1.0f},
     {"Temp",    "TEMP_METER",            0.0f, 100.0f},
 };
+constexpr int RIG_METER_SWR = 1;
+constexpr float SWR_WARN_THRESHOLD = 2.5f;
 
 constexpr int UTILS_ACTION_COUNT = 11 + ALT_MODE_COUNT;
 
@@ -190,6 +207,7 @@ struct TNCUIState {
     std::atomic<bool> audio_connected{true};  // Track audio device health
 
     std::function<std::string(const std::string&)> on_rigctl_command;
+    std::function<float()> on_alc_tune;
     std::atomic<bool> rig_poll_enabled{false};
     std::atomic<bool> rig_refresh_requested{false};
     std::atomic<long long> rig_freq_hz{0};
@@ -200,6 +218,19 @@ struct TNCUIState {
     std::atomic<int64_t> rig_last_update_ms{0};
     int64_t rig_last_poll_ms = 0;
     std::array<std::atomic<float>, RIG_METER_COUNT> rig_meter_values;
+    // worst SWR of the last TX burst is latched here when it crosses
+    // SWR_WARN_THRESHOLD; a later burst that stays below clears it
+    std::atomic<float> swr_warn_value{0.0f};
+    float swr_burst_max = 0.0f;   // rig poll thread only
+    bool swr_prev_ptt = false;    // rig poll thread only
+    std::atomic<float> tx_drive{1.0f};
+    std::atomic<bool> alc_tune_running{false};
+    std::atomic<float> channel_occupancy{0.0f};
+    std::atomic<bool> dcd_active{false};
+    // 0 idle, 1 deferring on RX lockout, 2 waiting quiet, 3 contending
+    std::atomic<int> csma_phase{0};
+    std::atomic<int> csma_wait_ms{0};
+    std::atomic<int> csma_wait_need{0};
     std::mutex rig_mode_mutex;
     std::string rig_mode;
     
@@ -291,7 +322,8 @@ struct TNCUIState {
     // Signal visualization
     static constexpr int LEVEL_HISTORY_SIZE = 60;
     std::mutex level_mutex;
-    float level_history[LEVEL_HISTORY_SIZE]; 
+    float level_history[LEVEL_HISTORY_SIZE];
+    bool level_dcd[LEVEL_HISTORY_SIZE] = {false};
     int level_history_pos = 0;
     std::atomic<bool> decoding_active{false};
     
@@ -369,6 +401,8 @@ struct TNCUIState {
         float snr;
         float ber;  // pre-FEC BER as percentage, -1 if unavailable
         std::chrono::steady_clock::time_point timestamp;
+        std::string mode;
+        std::string callsign;
     };
     static constexpr int MAX_RECENT_PACKETS = 8;
     std::mutex packets_mutex;
@@ -551,10 +585,11 @@ struct TNCUIState {
         }
     }
     
-    void update_level(float db) {
+    void update_level(float db, bool dcd = false) {
         carrier_level_db = db;
         std::lock_guard<std::mutex> lock(level_mutex);
         level_history[level_history_pos] = db;
+        level_dcd[level_history_pos] = dcd;
         level_history_pos = (level_history_pos + 1) % LEVEL_HISTORY_SIZE;
     }
     
@@ -576,10 +611,12 @@ struct TNCUIState {
         return result;
     }
     
-    void add_packet(bool is_tx, int size, float snr = 0.0f, float ber = -1.0f) {
+    void add_packet(bool is_tx, int size, float snr = 0.0f, float ber = -1.0f,
+                    const std::string& mode = "", const std::string& callsign = "") {
         {
             std::lock_guard<std::mutex> lock(packets_mutex);
-            recent_packets.push_back({is_tx, size, snr, ber, std::chrono::steady_clock::now()});
+            recent_packets.push_back({is_tx, size, snr, ber,
+                                      std::chrono::steady_clock::now(), mode, callsign});
             if (recent_packets.size() > MAX_RECENT_PACKETS) {
                 recent_packets.pop_front();
             }
@@ -607,6 +644,15 @@ struct TNCUIState {
         }
         return result;
     }
+
+    std::vector<uint8_t> get_level_dcd_history() {
+        std::lock_guard<std::mutex> lock(level_mutex);
+        std::vector<uint8_t> result(LEVEL_HISTORY_SIZE);
+        for (int i = 0; i < LEVEL_HISTORY_SIZE; i++) {
+            result[i] = level_dcd[(level_history_pos + i) % LEVEL_HISTORY_SIZE];
+        }
+        return result;
+    }
     
     // Save settings
     bool save_settings() {
@@ -626,6 +672,7 @@ struct TNCUIState {
         fprintf(f, "center_freq=%d\n", center_freq);
         fprintf(f, "postamble=%d\n", postamble ? 1 : 0);
         fprintf(f, "robust_mode=%d\n", robust_mode_index);
+        fprintf(f, "tx_drive=%.2f\n", tx_drive.load());
         fprintf(f, "alt_mode_mask=%d\n", alt_mode_mask);
         fprintf(f, "csma_enabled=%d\n", csma_enabled ? 1 : 0);
         fprintf(f, "carrier_threshold_db=%.1f\n", carrier_threshold_db);
@@ -691,6 +738,10 @@ struct TNCUIState {
                 else if (strcmp(key, "robust_mode") == 0) {
                     int v = atoi(value);
                     if (v >= 0 && v < ROBUST_MODE_COUNT) robust_mode_index = v;
+                }
+                else if (strcmp(key, "tx_drive") == 0) {
+                    float v = strtof(value, nullptr);
+                    if (v >= 0.05f && v <= 1.0f) tx_drive = v;
                 }
                 else if (strcmp(key, "alt_mode_mask") == 0)
                     alt_mode_mask = atoi(value) & ((1 << ALT_MODE_COUNT) - 1);
@@ -1060,6 +1111,26 @@ struct TNCUIState {
 
         rig_data_valid = any;
         if (any) rig_last_update_ms = now;
+
+        // latch the worst SWR seen while PTT is keyed; warn once the burst
+        // ends if it crossed the threshold, clear after a clean burst
+        bool ptt = ptt_on.load();
+        float swr = rig_meter_values[RIG_METER_SWR].load();
+        if (ptt && !std::isnan(swr) && swr > swr_burst_max)
+            swr_burst_max = swr;
+        if (!ptt && swr_prev_ptt && swr_burst_max > 0.0f) {
+            if (swr_burst_max >= SWR_WARN_THRESHOLD) {
+                char msg[64];
+                snprintf(msg, sizeof(msg), "(!) HIGH SWR %.1f during TX",
+                         swr_burst_max);
+                add_log(msg);
+                swr_warn_value = swr_burst_max;
+            } else {
+                swr_warn_value = 0.0f;
+            }
+            swr_burst_max = 0.0f;
+        }
+        swr_prev_ptt = ptt;
     }
 };
 
@@ -1185,6 +1256,7 @@ private:
         RIG_FIELD_STEP,
         RIG_FIELD_MODE,
         RIG_FIELD_POWER,
+        RIG_FIELD_DRIVE,
         RIG_FIELD_TUNER,
         RIG_FIELD_TUNE,
         RIG_FIELD_COUNT
@@ -1261,6 +1333,8 @@ private:
                     do {
                         rig_field_ = (rig_field_ + RIG_FIELD_COUNT - 1) % RIG_FIELD_COUNT;
                     } while (rig_should_skip(rig_field_));
+                } else if (current_tab_ == 0) {
+                    recent_sel_ = recent_sel_ <= 0 ? 0 : recent_sel_ - 1;
                 }
                 break;
                 
@@ -1284,6 +1358,12 @@ private:
                     do {
                         rig_field_ = (rig_field_ + 1) % RIG_FIELD_COUNT;
                     } while (rig_should_skip(rig_field_));
+                } else if (current_tab_ == 0) {
+                    int n = (int)state_.get_recent_packets().size();
+                    if (recent_sel_ < 0)
+                        recent_sel_ = 0;
+                    else if (recent_sel_ < n - 1)
+                        recent_sel_++;
                 }
                 break;
                 
@@ -1923,14 +2003,18 @@ private:
                 state_.modem_type_index = (state_.modem_type_index + delta + 3) % 3;
                 state_.update_modem_info();
                 break;
-            case FIELD_ROBUST_MODE:
-                state_.robust_mode_index = (state_.robust_mode_index % 5 + delta + 5) % 5
-                                         + 5 * (state_.robust_mode_index / 5);
+            case FIELD_ROBUST_MODE: {
+                int n = (int)ROBUST_MODE_OPTIONS.size();
+                int base = (robust_base_index(state_.robust_mode_index) + delta + n) % n;
+                state_.robust_mode_index = robust_mode_of(base,
+                    RobustParams::is_short((RobustMode)state_.robust_mode_index));
                 state_.update_modem_info();
                 break;
+            }
             case FIELD_ROBUST_MTU:
-                state_.robust_mode_index = state_.robust_mode_index % 5
-                                         + (state_.robust_mode_index < 5 ? 5 : 0);
+                state_.robust_mode_index = robust_mode_of(
+                    robust_base_index(state_.robust_mode_index),
+                    !RobustParams::is_short((RobustMode)state_.robust_mode_index));
                 state_.update_modem_info();
                 break;
             case FIELD_MFSK_MODE:
@@ -2472,7 +2556,21 @@ private:
         update_calibration();
 
         if (current_tab_ >= tab_count()) current_tab_ = 0;
-        state_.rig_poll_enabled = (current_tab_ == 5);
+        {
+            int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (state_.ptt_on.load() || state_.transmitting.load())
+                last_ptt_seen_ms_ = now_ms;
+            state_.rig_poll_enabled = (current_tab_ == 5) || (current_tab_ == 0) ||
+                (last_ptt_seen_ms_ > 0 && now_ms - last_ptt_seen_ms_ < 3000);
+            if (now_ms - occ_hist_ms_ >= 5000) {
+                occ_hist_ms_ = now_ms;
+                occ_hist_[occ_hist_pos_] = state_.channel_occupancy.load();
+                occ_hist_pos_ = (occ_hist_pos_ + 1) % OCC_HIST_SIZE;
+                if (occ_hist_n_ < OCC_HIST_SIZE)
+                    occ_hist_n_++;
+            }
+        }
         if (current_tab_ == 5 && rig_should_skip(rig_field_)) rig_field_ = RIG_FIELD_FREQ;
 
         int rows, cols;
@@ -2510,8 +2608,18 @@ private:
         attron(A_DIM);
         addch(ACS_VLINE);
         attroff(A_DIM);
-        
-        // Mode 
+
+        // high-SWR warning chip, visible from every tab
+        if (state_.swr_warn_value.load() > 0.0f) {
+            attron(COLOR_PAIR(2) | A_BOLD);
+            printw(" !SWR %.1f ", state_.swr_warn_value.load());
+            attroff(COLOR_PAIR(2) | A_BOLD);
+            attron(A_DIM);
+            addch(ACS_VLINE);
+            attroff(A_DIM);
+        }
+
+        // Mode
         addstr(" ");
         attron(A_BOLD);
         addstr(state_.callsign.c_str());
@@ -2522,8 +2630,9 @@ private:
                    state_.center_freq);
         } else if (state_.modem_type_index == 2) {
             printw("  %s %s %dHz",
-                   ROBUST_MODE_OPTIONS[state_.robust_mode_index % 5].c_str(),
-                   state_.robust_mode_index >= 5 ? "170B" : "510B",
+                   ROBUST_MODE_OPTIONS[robust_base_index(state_.robust_mode_index)].c_str(),
+                   RobustParams::is_short((RobustMode)state_.robust_mode_index)
+                       ? "170B" : "510B",
                    state_.center_freq);
         } else {
             printw("  %s %s %s %dHz",
@@ -2534,6 +2643,19 @@ private:
         }
         
         // Stats 
+        {
+            auto now = std::chrono::system_clock::now();
+            auto t = std::chrono::system_clock::to_time_t(now);
+            struct tm lt;
+            localtime_r(&t, &lt);
+            attron(A_BOLD);
+            mvprintw(0, cols - 31, "%02d:%02d:%02d", lt.tm_hour, lt.tm_min, lt.tm_sec);
+            attroff(A_BOLD);
+            attron(A_DIM);
+            addstr(" |");
+            attroff(A_DIM);
+        }
+
         int rx = cols - 20;
         attron(COLOR_PAIR(1) | A_BOLD);
         mvprintw(0, rx, "%d", state_.rx_frame_count.load());
@@ -2701,6 +2823,14 @@ private:
                 attron(A_DIM);
                 mvaddstr(y, c2, "  ---");
                 attroff(A_DIM);
+            } else if (state_.modem_type_index == 2) {
+                if (ber_pct < 18.0f) {
+                    mvprintw(y, c2, "%5.2f%%", ber_pct);
+                } else {
+                    attron(COLOR_PAIR(2) | A_BOLD);
+                    mvprintw(y, c2, "%5.2f%%", ber_pct);
+                    attroff(COLOR_PAIR(2) | A_BOLD);
+                }
             } else if (ber_pct < 3.0f) {
                 attron(COLOR_PAIR(1) | A_BOLD);
                 mvprintw(y, c2, "%5.2f%%", ber_pct);
@@ -2713,6 +2843,42 @@ private:
                 attron(COLOR_PAIR(2) | A_BOLD);
                 mvprintw(y, c2, "%5.2f%%", ber_pct);
                 attroff(COLOR_PAIR(2) | A_BOLD);
+            }
+        }
+        y++;
+
+        mvaddstr(y, c1, "Heard");
+        {
+            auto pkts = state_.get_recent_packets();
+            const TNCUIState::PacketInfo* last = nullptr;
+            for (auto it = pkts.rbegin(); it != pkts.rend(); ++it) {
+                if (!it->is_tx) {
+                    last = &*it;
+                    break;
+                }
+            }
+            move(y, c2);
+            if (!last) {
+                attron(A_DIM);
+                addstr("  ---");
+                attroff(A_DIM);
+            } else {
+                auto secs = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now() - last->timestamp).count();
+                attron(A_BOLD);
+                printw("%s", last->mode.empty() ? "?" : last->mode.c_str());
+                attroff(A_BOLD);
+                printw(" %s %.0fdB ",
+                       last->callsign.empty() ? "-" : last->callsign.c_str(),
+                       last->snr);
+                attron(A_DIM);
+                if (secs < 60)
+                    printw("%llds", (long long)secs);
+                else if (secs < 3600)
+                    printw("%lldm", (long long)(secs / 60));
+                else
+                    printw("%lldh", (long long)(secs / 3600));
+                attroff(A_DIM);
             }
         }
         y++;
@@ -2733,20 +2899,122 @@ private:
             addstr("OFF");
             attroff(COLOR_PAIR(3) | A_BOLD);
         }
-        if (busy) {
-            attron(COLOR_PAIR(3) | A_BOLD);
-            addstr("  BUSY");
-            attroff(COLOR_PAIR(3) | A_BOLD);
+        {
+            bool dcd = state_.dcd_active.load();
+            if (busy || dcd) {
+                attron(COLOR_PAIR(3) | A_BOLD);
+                addstr("  BUSY");
+                attroff(COLOR_PAIR(3) | A_BOLD);
+                if (dcd) {
+                    attron(A_DIM);
+                    addstr(" (sync)");
+                    attroff(A_DIM);
+                }
+            }
         }
         y++;
-        
-        mvaddstr(y, c1, "Persist");
-        mvprintw(y, c2, "%d/%d", state_.p_persistence, 255);
+
+        mvaddstr(y, c1, "Occupancy");
+        {
+            float occ = state_.channel_occupancy.load() * 100.0f;
+            int opair = occ >= 70.0f ? 2 : occ >= 30.0f ? 3 : 1;
+            move(y, c2);
+            attron(COLOR_PAIR(opair) | A_BOLD);
+            printw("%5.0f%%", occ);
+            attroff(COLOR_PAIR(opair) | A_BOLD);
+            attron(A_DIM);
+            addstr(" (30s)");
+            attroff(A_DIM);
+        }
         y++;
-        
+
+        mvaddstr(y, c1, "Occ Hist");
+        move(y, c2);
+        draw_occ_chart(20);
+        y++;
+
+        mvaddstr(y, c1, "Quiet");
+        if (state_.csma_quiet_ms > 0) {
+            mvprintw(y, c2, "%d ms", state_.csma_quiet_ms);
+        } else {
+            int q = (int)(state_.airtime_seconds * 1000.0f) / 4;
+            if (q < 300) q = 300;
+            if (q > 3500) q = 3500;
+            mvprintw(y, c2, "auto ~%d ms", q);
+        }
+        y++;
+
+        mvaddstr(y, c1, "Window");
+        mvprintw(y, c2, "%d slots", state_.csma_cw);
+        y++;
+
         mvaddstr(y, c1, "Slot");
         mvprintw(y, c2, "%d ms", state_.slot_time_ms);
-        
+        y++;
+
+        mvaddstr(y, c1, "TX");
+        {
+            int phase = state_.csma_phase.load();
+            int q = state_.tx_queue_size.load();
+            move(y, c2);
+            if (state_.transmitting.load()) {
+                attron(COLOR_PAIR(2) | A_BOLD);
+                addstr("sending");
+                attroff(COLOR_PAIR(2) | A_BOLD);
+            } else if (phase == 1) {
+                attron(COLOR_PAIR(3));
+                addstr("deferring (RX)");
+                attroff(COLOR_PAIR(3));
+            } else if (phase == 2) {
+                attron(COLOR_PAIR(3));
+                printw("quiet %d/%d ms", state_.csma_wait_ms.load(),
+                       state_.csma_wait_need.load());
+                attroff(COLOR_PAIR(3));
+            } else if (phase == 3) {
+                attron(COLOR_PAIR(4));
+                printw("contending %d ms", state_.csma_wait_ms.load());
+                attroff(COLOR_PAIR(4));
+            } else {
+                attron(A_DIM);
+                addstr("idle");
+                attroff(A_DIM);
+            }
+            if (q > 0) {
+                attron(A_DIM);
+                printw("  %d queued ~%ds", q,
+                       (int)(q * state_.airtime_seconds + 0.5f));
+                attroff(A_DIM);
+            }
+        }
+        y += 2;
+
+        mvaddstr(y, c1, "Rig");
+        {
+            move(y, c2);
+            if (!state_.rigctl_connected.load()) {
+                attron(A_DIM);
+                addstr("  ---");
+                attroff(A_DIM);
+            } else {
+                attron(A_BOLD);
+                printw("%s", format_freq(state_.rig_freq_hz.load()).c_str());
+                attroff(A_BOLD);
+                std::string rmode = state_.get_rig_mode();
+                if (!rmode.empty())
+                    printw(" %s", rmode.c_str());
+                float pwr = state_.rig_power_level.load();
+                if (pwr >= 0)
+                    printw(" %d%%", (int)lround(pwr * 100));
+                float swr = state_.rig_meter_values[RIG_METER_SWR].load();
+                if (!std::isnan(swr)) {
+                    int spair = swr < 1.5f ? 1 : swr < SWR_WARN_THRESHOLD ? 3 : 2;
+                    attron(COLOR_PAIR(spair));
+                    printw(" SWR %.1f", swr);
+                    attroff(COLOR_PAIR(spair));
+                }
+            }
+        }
+
 
         y = 4;
         attron(A_DIM);
@@ -2847,13 +3115,27 @@ private:
         mvaddstr(y, x, "RECENT");
         attroff(A_DIM);
         y++;
-        
+
+        int sel = recent_sel_;
+        if (sel >= (int)packets.size())
+            sel = (int)packets.size() - 1;
+        int limit = max_lines;
+        if (sel >= 0 && limit > 2)
+            limit -= 2;
+
         int lines = 0;
-        for (auto it = packets.rbegin(); it != packets.rend() && lines < max_lines; ++it, ++lines) {
+        for (auto it = packets.rbegin(); it != packets.rend() && lines < limit; ++it, ++lines) {
             const auto& pkt = *it;
-            
+
             move(y + lines, x);
-            
+            if (lines == sel) {
+                attron(A_BOLD);
+                addstr("> ");
+                attroff(A_BOLD);
+            } else {
+                addstr("  ");
+            }
+
             if (pkt.is_tx) {
                 attron(COLOR_PAIR(2) | A_BOLD);
                 addstr("TX ");
@@ -2892,7 +3174,11 @@ private:
             // BER
             if (!pkt.is_tx && pkt.ber >= 0) {
                 float ber_pct = pkt.ber;
-                if (ber_pct < 1.0f) {
+                bool robust = pkt.mode.rfind("RDM", 0) == 0;
+                if (robust) {
+                    if (ber_pct >= 18.0f)
+                        attron(COLOR_PAIR(2));
+                } else if (ber_pct < 1.0f) {
                     attron(COLOR_PAIR(1));
                 } else if (ber_pct < 5.0f) {
                     attron(COLOR_PAIR(3));
@@ -2904,6 +3190,32 @@ private:
                 attroff(COLOR_PAIR(2));
                 attroff(COLOR_PAIR(3));
             }
+        }
+
+        if (sel >= 0 && sel < (int)packets.size()) {
+            const auto& sp = *(packets.rbegin() + sel);
+            move(y + lines + 1, x);
+            attron(A_BOLD);
+            printw("%s", sp.mode.empty() ? "?" : sp.mode.c_str());
+            attroff(A_BOLD);
+            printw("  %s", sp.callsign.empty() ? "-" : sp.callsign.c_str());
+            if (!sp.is_tx && sp.snr > 0) {
+                attron(COLOR_PAIR(4) | A_BOLD);
+                printw("  %.1fdB", sp.snr);
+                attroff(COLOR_PAIR(4) | A_BOLD);
+            }
+            if (!sp.is_tx && sp.ber >= 0) {
+                bool robust = sp.mode.rfind("RDM", 0) == 0;
+                bool bad = robust ? sp.ber >= 18.0f : sp.ber >= 5.0f;
+                if (bad)
+                    attron(COLOR_PAIR(2));
+                printw("  BER %.1f%%", sp.ber);
+                if (bad)
+                    attroff(COLOR_PAIR(2));
+            }
+            attron(A_DIM);
+            printw("  %dB", sp.size);
+            attroff(A_DIM);
         }
     }
     
@@ -2952,6 +3264,30 @@ private:
         attroff(A_DIM);
     }
     
+    void draw_occ_chart(int width) {
+        if (occ_hist_n_ == 0) {
+            attron(A_DIM);
+            addstr("[no data]");
+            attroff(A_DIM);
+            return;
+        }
+        int count = std::min(occ_hist_n_, width);
+        attron(A_DIM);
+        for (int i = count; i < width; i++)
+            addch('.');
+        attroff(A_DIM);
+        for (int i = 0; i < count; i++) {
+            int idx = (occ_hist_pos_ - count + i + 2 * OCC_HIST_SIZE) % OCC_HIST_SIZE;
+            float v = occ_hist_[idx];
+            char ch = v > 0.875f ? '#' : v > 0.7f ? '=' : v > 0.5f ? '+'
+                    : v > 0.3f ? ':' : v > 0.15f ? '-' : v > 0.03f ? '.' : '_';
+            int pair = v >= 0.7f ? 2 : v >= 0.3f ? 3 : 1;
+            attron(COLOR_PAIR(pair));
+            addch(ch);
+            attroff(COLOR_PAIR(pair));
+        }
+    }
+
     void draw_snr_chart(int width) {
         auto history = state_.get_snr_history();
         
@@ -3013,50 +3349,44 @@ private:
     
     void draw_signal_graph(int y, int x, int width, int height) {
         auto history = state_.get_level_history();
-        
+        auto dcd_hist = state_.get_level_dcd_history();
+
 
         float min_db = -80.0f;
         float max_db = 0.0f;
         float thresh = state_.carrier_threshold_db;
-        
-   
+
+
         const char* blocks[] = {" ", ".", ":", "|", "#"};
-        
+
         for (int row = 0; row < height; row++) {
             move(y + row, x);
-            
+
             float row_min = max_db - (max_db - min_db) * (row + 1) / height;
             float row_max = max_db - (max_db - min_db) * row / height;
-            
+
             for (int col = 0; col < width; col++) {
                 int hist_idx = col * TNCUIState::LEVEL_HISTORY_SIZE / width;
                 if (hist_idx >= (int)history.size()) hist_idx = history.size() - 1;
-                
+
                 float level = history[hist_idx];
-                
+                // magenta marks samples taken while the confirmed sync DCD
+                // held: the segment of the waterfall carrying a real frame
+                int pair = dcd_hist[hist_idx] ? 6 : level > thresh ? 4 : 1;
+
                 if (level >= row_max) {
-                    if (level > thresh) {
-                        attron(COLOR_PAIR(4) | A_BOLD);  
-                    } else {
-                        attron(COLOR_PAIR(1) | A_BOLD);  
-                    }
+                    attron(COLOR_PAIR(pair) | A_BOLD);
                     addch(ACS_BLOCK);
-                    attroff(COLOR_PAIR(1) | A_BOLD);
-                    attroff(COLOR_PAIR(4) | A_BOLD);
+                    attroff(COLOR_PAIR(pair) | A_BOLD);
                 } else if (level > row_min) {
                     float frac = (level - row_min) / (row_max - row_min);
                     int idx = (int)(frac * 4);
                     if (idx > 4) idx = 4;
                     if (idx < 0) idx = 0;
-                    
-                    if (level > thresh) {
-                        attron(COLOR_PAIR(4));  
-                    } else {
-                        attron(COLOR_PAIR(1));  
-                    }
+
+                    attron(COLOR_PAIR(pair));
                     addstr(blocks[idx]);
-                    attroff(COLOR_PAIR(1));
-                    attroff(COLOR_PAIR(4));
+                    attroff(COLOR_PAIR(pair));
                 } else {
                     addch(' ');
                 }
@@ -3158,11 +3488,12 @@ private:
         } else {
             dy = visible_y(row);
             if (dy >= 0) draw_selector_field(dy, c1, c2, "RDM Mode", FIELD_ROBUST_MODE,
-                               ROBUST_MODE_OPTIONS[state_.robust_mode_index % 5]);
+                               ROBUST_MODE_OPTIONS[robust_base_index(state_.robust_mode_index)]);
             row++;
             dy = visible_y(row);
             if (dy >= 0) draw_selector_field(dy, c1, c2, "Frame", FIELD_ROBUST_MTU,
-                               ROBUST_MTU_OPTIONS[state_.robust_mode_index / 5]);
+                               ROBUST_MTU_OPTIONS[RobustParams::is_short(
+                                   (RobustMode)state_.robust_mode_index) ? 1 : 0]);
             row++;
         }
 
@@ -4841,6 +5172,15 @@ private:
                 state_.rig_refresh_requested = true;
                 break;
             }
+            case RIG_FIELD_DRIVE: {
+                float d = state_.tx_drive.load();
+                d = std::max(0.05f, std::min(1.0f, d + delta * 0.05f));
+                state_.tx_drive = d;
+                if (state_.on_settings_changed)
+                    state_.on_settings_changed(state_);
+                state_.save_settings();
+                break;
+            }
             case RIG_FIELD_TUNER: {
                 int nv = state_.rig_tuner_on.load() == 1 ? 0 : 1;
                 char cmd[32];
@@ -4860,6 +5200,28 @@ private:
     void rig_enter_action() {
         if (rig_field_ == RIG_FIELD_FREQ) {
             edit_rig_freq();
+        } else if (rig_field_ == RIG_FIELD_DRIVE) {
+            if (!state_.on_alc_tune) {
+                state_.add_log("ALC tune: unavailable");
+            } else if (!state_.alc_tune_running.exchange(true)) {
+                state_.add_log("ALC tune: starting...");
+                std::thread([s = &state_] {
+                    float r = s->on_alc_tune();
+                    if (!g_running.load())
+                        return;
+                    if (r > 0) {
+                        s->tx_drive = r;
+                        s->save_settings();
+                        char b[48];
+                        snprintf(b, sizeof(b), "ALC tune: drive set to %d%%",
+                                 (int)lround(r * 100));
+                        s->add_log(b);
+                    } else {
+                        s->add_log("ALC tune: failed");
+                    }
+                    s->alc_tune_running = false;
+                }).detach();
+            }
         } else if (rig_field_ == RIG_FIELD_TUNER) {
             adjust_rig_field(1);
         } else if (rig_field_ == RIG_FIELD_TUNE) {
@@ -4989,6 +5351,15 @@ private:
             snprintf(pwr_buf, sizeof(pwr_buf), "---");
         }
         draw_selector_field_ex(y, c1, c2, "RF Power", rig_field_ == RIG_FIELD_POWER, pwr_buf);
+        y++;
+
+        char drv_buf[32];
+        if (state_.alc_tune_running.load())
+            snprintf(drv_buf, sizeof(drv_buf), "TUNING...");
+        else
+            snprintf(drv_buf, sizeof(drv_buf), "%d%%  (Enter=ALC tune)",
+                     (int)lround(state_.tx_drive.load() * 100));
+        draw_selector_field_ex(y, c1, c2, "TX Drive", rig_field_ == RIG_FIELD_DRIVE, drv_buf);
         y += 2;
 
         attron(A_DIM);
@@ -5063,7 +5434,7 @@ private:
 
             int pair = 1;
             if (strcmp(RIG_METERS[i].level, "SWR") == 0 && !std::isnan(v)) {
-                pair = v < 1.5f ? 1 : v < 3.0f ? 3 : 2;
+                pair = v < 1.5f ? 1 : v < SWR_WARN_THRESHOLD ? 3 : 2;
             } else if (is_temp) {
                 pair = v < 60.0f ? 1 : v < 80.0f ? 3 : 2;
             }
@@ -5113,6 +5484,22 @@ private:
         attron(A_DIM);
         mvaddstr(ry, c3, "SWR/Power/ALC valid during TX");
         attroff(A_DIM);
+
+        float swr_warn = state_.swr_warn_value.load();
+        if (swr_warn > 0.0f) {
+            ry += 2;
+            attron(COLOR_PAIR(2) | A_BOLD);
+            mvprintw(ry, c3, "(!) HIGH SWR %.1f on last TX - check antenna",
+                     swr_warn);
+            attroff(COLOR_PAIR(2) | A_BOLD);
+            if (state_.rig_tuner_supported.load() == 1 &&
+                state_.rig_tuner_on.load() == 0) {
+                ry++;
+                attron(COLOR_PAIR(3));
+                mvaddstr(ry, c3, "    (tuner is off)");
+                attroff(COLOR_PAIR(3));
+            }
+        }
 
         if (!state_.rig_data_valid.load()) {
             ry += 2;
@@ -5284,6 +5671,13 @@ private:
     int alt_index_ = -1;
     unsigned alt_seqs_[ALT_MODE_COUNT] = {0};
     int rig_field_ = 0;
+    int64_t last_ptt_seen_ms_ = 0;
+    int recent_sel_ = -1;
+    static constexpr int OCC_HIST_SIZE = 60;
+    float occ_hist_[OCC_HIST_SIZE] = {};
+    int occ_hist_n_ = 0;
+    int occ_hist_pos_ = 0;
+    int64_t occ_hist_ms_ = 0;
     int rig_step_index_ = 2;
     int saved_stderr_ = -1;
     int frame_counter_ = 0;  
