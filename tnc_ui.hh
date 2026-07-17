@@ -178,9 +178,9 @@ struct TNCUIState {
     int csma_quiet_ms = 0;
     int csma_cw = 8;
     int p_persistence = 128;
-    bool tx_lead_tone = false;
+    bool tx_lead_tone = true;
     int csma_responder_dither = 0;
-    int csma_burst = 1;
+    int csma_burst = 2;
     int csma_band = 0;
     bool csma_advanced_open = false;
     
@@ -194,9 +194,11 @@ struct TNCUIState {
     int audio_input_index = 0;
     int audio_output_index = 0;
     
-    // Network 
+    // Network
     int port = 8001;
-    
+    std::string bind_address = "0.0.0.0";
+    std::string control_bind_address = "127.0.0.1";
+
     // PTT 
     int ptt_type_index = 1;  // 0=NONE, 1=RIGCTL, 2=VOX
     
@@ -549,7 +551,7 @@ struct TNCUIState {
         int rate = code_rate_index;
 
         if (mod < 0 || mod > 7) mod = 1;
-        if (rate < 0 || rate > 5) rate = 0;
+        if (rate < 0 || rate > 6) rate = 0;
 
         if (rate == 5) {
             static const int payload_rep_short[8]  = {128, 256, 512, 512, 1024, 1024, 2048, 2048};
@@ -560,6 +562,18 @@ struct TNCUIState {
                    : frame_size == 1 ? payload_rep_normal[mod] : 0;
             int du = frame_size == 0 ? duration_rep_short[mod]
                    : frame_size == 1 ? duration_rep_normal[mod] : 0;
+            mtu_bytes = pl > 0 ? pl - 2 : 0;
+            airtime_seconds = du / 1000.0f;
+            bitrate_bps = du > 0 ? (int)(pl * 8000.0f / du) : 0;
+        } else if (rate == 6) {
+            static const int payload_rep2_short[8]  = {64, 64, 256, 128, 512, 512, 1024, 1024};
+            static const int payload_rep2_normal[8] = {128, 256, 512, 512, 1024, 0, 0, 0};
+            static const int duration_rep2_short[8]  = {2733, 1640, 3553, 1640, 3553, 2733, 4100, 3553};
+            static const int duration_rep2_normal[8] = {4920, 4920, 6560, 4920, 6560, 0, 0, 0};
+            int pl = frame_size == 0 ? payload_rep2_short[mod]
+                   : frame_size == 1 ? payload_rep2_normal[mod] : 0;
+            int du = frame_size == 0 ? duration_rep2_short[mod]
+                   : frame_size == 1 ? duration_rep2_normal[mod] : 0;
             mtu_bytes = pl > 0 ? pl - 2 : 0;
             airtime_seconds = du / 1000.0f;
             bitrate_bps = du > 0 ? (int)(pl * 8000.0f / du) : 0;
@@ -705,6 +719,8 @@ struct TNCUIState {
 #endif
         fprintf(f, "# Network\n");
         fprintf(f, "port=%d\n", port);
+        fprintf(f, "bind_address=%s\n", bind_address.c_str());
+        fprintf(f, "control_bind_address=%s\n", control_bind_address.c_str());
         fprintf(f, "# Utils\n");
         fprintf(f, "random_data_size=%d\n", random_data_size);
         fprintf(f, "utils_testing=%d\n", utils_testing_open ? 1 : 0);
@@ -758,7 +774,10 @@ struct TNCUIState {
                     int v = atoi(value);
                     if (v >= 0 && v <= 2) frame_size = v;
                 }
-                else if (strcmp(key, "center_freq") == 0) center_freq = atoi(value);
+                else if (strcmp(key, "center_freq") == 0) {
+                    int v = atoi(value);
+                    if (v >= 300 && v <= 3000) center_freq = v;
+                }
                 else if (strcmp(key, "postamble") == 0) postamble = atoi(value) != 0;
                 else if (strcmp(key, "csma_enabled") == 0) csma_enabled = atoi(value) != 0;
                 else if (strcmp(key, "carrier_threshold_db") == 0) carrier_threshold_db = atof(value);
@@ -778,20 +797,46 @@ struct TNCUIState {
                     audio_input_device = value;
                     audio_output_device = value;
                 }
-                else if (strcmp(key, "ptt_type") == 0) ptt_type_index = atoi(value);
-                else if (strcmp(key, "vox_tone_freq") == 0) vox_tone_freq = atoi(value);
-                else if (strcmp(key, "vox_lead_ms") == 0) vox_lead_ms = atoi(value);
-                else if (strcmp(key, "vox_tail_ms") == 0) vox_tail_ms = atoi(value);
+                else if (strcmp(key, "ptt_type") == 0) {
+                    int v = atoi(value);
+                    if (v >= 0 && v < (int)PTT_TYPE_OPTIONS.size()) ptt_type_index = v;
+                }
+                else if (strcmp(key, "vox_tone_freq") == 0) {
+                    int v = atoi(value);
+                    if (v >= 300 && v <= 3000) vox_tone_freq = v;
+                }
+                else if (strcmp(key, "vox_lead_ms") == 0) {
+                    int v = atoi(value);
+                    if (v >= 50 && v <= 2000) vox_lead_ms = v;
+                }
+                else if (strcmp(key, "vox_tail_ms") == 0) {
+                    int v = atoi(value);
+                    if (v >= 50 && v <= 2000) vox_tail_ms = v;
+                }
                 else if (strcmp(key, "com_port") == 0) com_port = value;
-                else if (strcmp(key, "com_ptt_line") == 0) com_ptt_line = atoi(value);
+                else if (strcmp(key, "com_ptt_line") == 0) {
+                    int v = atoi(value);
+                    if (v >= 0 && v < (int)PTT_LINE_OPTIONS.size()) com_ptt_line = v;
+                }
                 else if (strcmp(key, "com_invert_dtr") == 0) com_invert_dtr = atoi(value) != 0;
                 else if (strcmp(key, "com_invert_rts") == 0) com_invert_rts = atoi(value) != 0;
 #ifdef WITH_CM108
-                else if (strcmp(key, "cm108_gpio") == 0) cm108_gpio = atoi(value);
+                else if (strcmp(key, "cm108_gpio") == 0) {
+                    int v = atoi(value);
+                    if (v >= 1 && v <= 4) cm108_gpio = v;
+                }
                 else if (strcmp(key, "cm108_device") == 0) cm108_device = value;
 #endif
-                else if (strcmp(key, "port") == 0) port = atoi(value);
-                else if (strcmp(key, "random_data_size") == 0) random_data_size = atoi(value);
+                else if (strcmp(key, "port") == 0) {
+                    int v = atoi(value);
+                    if (v >= 1 && v <= 65535) port = v;
+                }
+                else if (strcmp(key, "bind_address") == 0) bind_address = value;
+                else if (strcmp(key, "control_bind_address") == 0) control_bind_address = value;
+                else if (strcmp(key, "random_data_size") == 0) {
+                    int v = atoi(value);
+                    if (v >= 0 && v <= 65535) random_data_size = v;
+                }
                 else if (strcmp(key, "utils_testing") == 0) utils_testing_open = atoi(value) != 0;
             }
         }
@@ -861,26 +906,29 @@ struct TNCUIState {
                        &ptt_type, &vox_freq, &vox_lead, &vox_tail,
                        &modem_type, &mfsk_mode, &robust_mode, &postamble);
 
-            if (n >= 9) {
+            if (n >= 9 && (int)presets.size() < MAX_PRESETS) {
+                auto clampi = [](int v, int lo, int hi) {
+                    return v < lo ? lo : v > hi ? hi : v;
+                };
                 Preset p;
                 p.name = name;
-                p.modulation_index = mod;
-                p.code_rate_index = rate;
+                p.modulation_index = clampi(mod, 0, (int)MODULATION_OPTIONS.size() - 1);
+                p.code_rate_index = clampi(rate, 0, (int)CODE_RATE_OPTIONS.size() - 1);
                 p.frame_size = sf == 1 ? 0 : sf == 2 ? 2 : 1;
-                p.center_freq = freq;
+                p.center_freq = (freq >= 300 && freq <= 3000) ? freq : 1500;
                 p.csma_enabled = csma != 0;
                 p.carrier_threshold_db = thresh;
                 p.slot_time_ms = slot;
                 p.p_persistence = persist;
 
-                p.ptt_type_index = (n >= 10) ? ptt_type : 1;
-                p.vox_tone_freq = (n >= 11) ? vox_freq : 1200;
-                p.vox_lead_ms = (n >= 12) ? vox_lead : 150;
-                p.vox_tail_ms = (n >= 13) ? vox_tail : 100;
+                p.ptt_type_index = (n >= 10) ? clampi(ptt_type, 0, (int)PTT_TYPE_OPTIONS.size() - 1) : 1;
+                p.vox_tone_freq = (n >= 11 && vox_freq >= 300 && vox_freq <= 3000) ? vox_freq : 1200;
+                p.vox_lead_ms = (n >= 12) ? clampi(vox_lead, 50, 2000) : 150;
+                p.vox_tail_ms = (n >= 13) ? clampi(vox_tail, 50, 2000) : 100;
 
 
-                p.modem_type_index = (n >= 14) ? modem_type : 0;
-                p.mfsk_mode_index = (n >= 15) ? mfsk_mode : 1;
+                p.modem_type_index = (n >= 14) ? clampi(modem_type, 0, (int)MODEM_TYPE_OPTIONS.size() - 1) : 0;
+                p.mfsk_mode_index = (n >= 15) ? clampi(mfsk_mode, 0, (int)MFSK_MODE_OPTIONS.size() - 1) : 1;
                 p.robust_mode_index = (n >= 16 && robust_mode >= 0 &&
                                        robust_mode < ROBUST_MODE_COUNT) ? robust_mode : 0;
                 p.postamble = (n >= 17) && postamble != 0;

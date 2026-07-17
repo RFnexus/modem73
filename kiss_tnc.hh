@@ -45,6 +45,7 @@ enum class PTTType {
 struct TNCConfig {
     // Network settings
     std::string bind_address = "0.0.0.0";
+    std::string control_bind_address = "127.0.0.1";
     int port = 8001;
     
     // Audio settings
@@ -107,8 +108,8 @@ struct TNCConfig {
     int csma_quiet_ms = 0;
     int csma_cw = 8;
     int csma_responder_dither = 0;
-    bool tx_lead_tone = false;
-    int csma_burst = 1;
+    bool tx_lead_tone = true;
+    int csma_burst = 2;
     
     // RX decoder settings
     bool mfsk_rx_enabled = true;
@@ -176,6 +177,12 @@ private:
             buffer_.clear();
             escape_ = false;
         } else if (in_frame_) {
+            if (buffer_.size() >= MAX_FRAME) {
+                in_frame_ = false;
+                buffer_.clear();
+                escape_ = false;
+                return;
+            }
             if (escape_) {
                 if (byte == KISS::TFEND) {
                     buffer_.push_back(KISS::FEND);
@@ -193,6 +200,7 @@ private:
         }
     }
     
+    static constexpr size_t MAX_FRAME = 65536;
     FrameCallback callback_;
     std::vector<uint8_t> buffer_;
     bool in_frame_ = false;
@@ -514,17 +522,17 @@ public:
         
         if (pkt.has_first && pkt.has_last) {
             bool complete = true;
-            for (uint8_t i = 0; i <= pkt.last_seq; i++) {
-                if (pkt.fragments.find(i) == pkt.fragments.end()) {
+            for (int i = 0; i <= pkt.last_seq; i++) {
+                if (pkt.fragments.find((uint8_t)i) == pkt.fragments.end()) {
                     complete = false;
                     break;
                 }
             }
-            
+
             if (complete) {
                 std::vector<uint8_t> reassembled;
-                for (uint8_t i = 0; i <= pkt.last_seq; i++) {
-                    auto& frag_data = pkt.fragments[i];
+                for (int i = 0; i <= pkt.last_seq; i++) {
+                    auto& frag_data = pkt.fragments[(uint8_t)i];
                     reassembled.insert(reassembled.end(), frag_data.begin(), frag_data.end());
                 }
                 pending_.erase(packet_id);

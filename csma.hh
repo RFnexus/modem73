@@ -12,6 +12,7 @@ struct CsmaConfig {
     int slot_ms = 500;
     bool responder = false;
     int responder_quiet_ms = 300;
+    int responder_dither_ms = 0;
     int deaf_limit_ms = 5000;
     int busy_limit_ms = 60000;
     int idle_credit_ms = 0;
@@ -30,7 +31,7 @@ public:
         window_ = window;
         if (cfg_.responder) {
             quiet_needed_ = std::min(cfg_.quiet_ms, cfg_.responder_quiet_ms);
-            contention_ms_ = 0;
+            contention_ms_ = cfg_.responder_dither_ms;
         } else {
             std::mt19937 gen(seed);
             quiet_needed_ = cfg_.quiet_ms;

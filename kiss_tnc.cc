@@ -78,24 +78,32 @@ inline void ui_log(const std::string& msg) {
     }
 }
 
+bool valid_bind_address(const std::string& addr) {
+    struct in_addr a;
+    return inet_pton(AF_INET, addr.c_str(), &a) == 1;
+}
+
 bool check_port_available(const std::string& bind_address, int port) {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
         return false;
     }
-    
+
     int opt = 1;
     setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    
+
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = inet_addr(bind_address.c_str());
+    if (inet_pton(AF_INET, bind_address.c_str(), &addr.sin_addr) != 1) {
+        close(sock);
+        return false;
+    }
     addr.sin_port = htons(port);
-    
+
     int result = bind(sock, (struct sockaddr*)&addr, sizeof(addr));
     close(sock);
-    
+
     return result == 0;
 }
 
@@ -113,8 +121,12 @@ public:
     ClientConnection(int fd, std::function<void(uint8_t, uint8_t, const std::vector<uint8_t>&)> callback)
         : fd(fd), parser(callback) {}
     
+    static constexpr size_t MAX_WRITE_BUFFER = 1024 * 1024;
+
     void send(const std::vector<uint8_t>& data) {
         std::lock_guard<std::mutex> lock(write_mutex);
+        if (write_buffer.size() + data.size() > MAX_WRITE_BUFFER)
+            return;
         write_buffer.insert(write_buffer.end(), data.begin(), data.end());
     }
     
@@ -289,9 +301,12 @@ public:
         struct sockaddr_in addr;
         memset(&addr, 0, sizeof(addr));
         addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = inet_addr(config_.bind_address.c_str());
+        if (inet_pton(AF_INET, config_.bind_address.c_str(), &addr.sin_addr) != 1) {
+            close(server_fd_);
+            throw std::runtime_error("Invalid bind address: " + config_.bind_address);
+        }
         addr.sin_port = htons(config_.port);
-        
+
         if (bind(server_fd_, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
             close(server_fd_);
             throw std::runtime_error("Failed to bind to port " + std::to_string(config_.port));
@@ -311,9 +326,14 @@ public:
         std::cerr << "Payload: " << payload_size_ << " bytes (including 2-byte length prefix)" << std::endl;
         
         if (config_.csma_enabled) {
-            std::cerr << "CSMA: enabled (threshold=" << config_.carrier_threshold_db 
-                      << " dB, slot=" << config_.slot_time_ms 
-                      << " ms, p=" << config_.p_persistence << "/255)" << std::endl;
+            std::cerr << "CSMA: enabled (threshold=" << config_.carrier_threshold_db
+                      << " dB, slot=" << config_.slot_time_ms
+                      << " ms, cw=" << config_.csma_cw
+                      << ", quiet=" << (config_.csma_quiet_ms > 0
+                             ? std::to_string(config_.csma_quiet_ms) + " ms" : "auto")
+                      << ", burst=" << config_.csma_burst
+                      << ", dither=" << config_.csma_responder_dither
+                      << " ms)" << std::endl;
         } else {
             std::cerr << "CSMA: disabled" << std::endl;
         }
@@ -347,6 +367,7 @@ public:
         // Start threads
         std::thread rx_thread(&KISSTNC::rx_loop, this);
         std::thread tx_thread(&KISSTNC::tx_loop, this);
+        std::thread watchdog_thread(&KISSTNC::ptt_watchdog_loop, this);
         
         // Main  
         while (g_running) {
@@ -355,19 +376,30 @@ public:
             int client_fd = accept(server_fd_, (struct sockaddr*)&client_addr, &client_len);
             
             if (client_fd >= 0) {
+                {
+                    std::lock_guard<std::mutex> lock(clients_mutex_);
+                    if (clients_.size() >= MAX_CLIENTS) {
+                        ui_log("KISS: client limit reached, rejecting connection");
+                        close(client_fd);
+                        client_fd = -1;
+                    }
+                }
+            }
+
+            if (client_fd >= 0) {
                 // Set TCP_NODELAY
                 int flag = 1;
                 setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
                 fcntl(client_fd, F_SETFL, O_NONBLOCK);
-                
+
                 char ip_str[INET_ADDRSTRLEN];
                 inet_ntop(AF_INET, &client_addr.sin_addr, ip_str, sizeof(ip_str));
                 ui_log(std::string("Client connected: ") + ip_str + ":" + std::to_string(ntohs(client_addr.sin_port)));
-                
+
                 auto callback = [this](uint8_t port, uint8_t cmd, const std::vector<uint8_t>& data) {
                     handle_kiss_frame(port, cmd, data);
                 };
-                
+
                 std::lock_guard<std::mutex> lock(clients_mutex_);
                 clients_.emplace_back(std::make_unique<ClientConnection>(client_fd, callback));
                 
@@ -426,10 +458,13 @@ public:
         // Cleanup
         tx_running_ = false;
         rx_running_ = false;
-        
+
         tx_thread.join();
         rx_thread.join();
-        
+        watchdog_thread.join();
+
+        set_ptt(false);
+
         for (auto& client : clients_) {
             close(client->fd);
         }
@@ -488,14 +523,17 @@ private:
                 break;
             case KISS::CMD_P:
                 if (!data.empty()) {
-                    config_.p_persistence = data[0];
-                    ui_log("P-persistence set to " + std::to_string(config_.p_persistence));
+                    ui_log("KISS P-persistence " + std::to_string(data[0]) +
+                           " ignored (unused)");
                 }
                 break;
             case KISS::CMD_SLOTTIME:
                 if (!data.empty()) {
+                    int prev = config_.slot_time_ms;
                     config_.slot_time_ms = data[0] * 10;
-                    ui_log("Slot time set to " + std::to_string(config_.slot_time_ms) + " ms");
+                    ui_log("KISS client set slot time to " +
+                           std::to_string(config_.slot_time_ms) + " ms (was " +
+                           std::to_string(prev) + " ms)");
                 }
                 break;
             case KISS::CMD_TXTAIL:
@@ -579,7 +617,7 @@ private:
                             hash ^= (uint8_t)c;
                             hash *= 16777619u;
                         }
-                        gcfg.responder_quiet_ms += (int)(hash % (uint32_t)csma_dither);
+                        gcfg.responder_dither_ms = (int)(hash % (uint32_t)csma_dither);
                     }
                     int64_t rx_ms = last_rx_done_ms_.load();
                     gcfg.responder = rx_ms > 0 && pkt.enqueue_ms >= rx_ms &&
@@ -693,13 +731,14 @@ private:
     }
     
     int frame_air_ms() {
+        int ps = payload_size_.load();
         uint64_t key = ((uint64_t)config_.modem_type << 48) ^
-                       ((uint64_t)(uint32_t)payload_size_ << 16) ^
+                       ((uint64_t)(uint32_t)ps << 16) ^
                        (uint32_t)(config_.modem_type == 1 ? config_.mfsk_mode :
                                   config_.modem_type == 2 ? config_.robust_mode :
                                   modem_config_.oper_mode);
         if (key == frame_air_key_) return frame_air_ms_cache_;
-        std::vector<uint8_t> dummy(payload_size_ > 2 ? payload_size_ - 2 : 1, 0x55);
+        std::vector<uint8_t> dummy(ps > 2 ? ps - 2 : 1, 0x55);
         auto framed = frame_with_length(dummy);
         std::vector<float> samples;
         if (config_.modem_type == 1) {
@@ -826,7 +865,11 @@ private:
         
         float duration = samples.size() / (float)config_.sample_rate;
         float total_tx_duration = duration;
-        
+
+        int64_t overhead_ms = config_.tx_delay_ms + config_.ptt_tail_ms +
+                              config_.vox_lead_ms + config_.vox_tail_ms + BURST_GAP_MS;
+        arm_ptt_watchdog((int64_t)(duration * 1000.0f) + overhead_ms);
+
         // Handle PTT based on type
         if (config_.ptt_type == PTTType::VOX) {
             // VOX mode: generate tone to trigger radio's VOX
@@ -861,9 +904,9 @@ private:
             // OFDM data
             for (size_t i = 0; i < samples.size(); i += chunk_size) {
                 int n = std::min(chunk_size, (int)(samples.size() - i));
-                audio_->write(samples.data() + i, n);
+                if (audio_->write(samples.data() + i, n) < n) break;
             }
-            
+
             // Tail tone
             for (size_t i = 0; i < tail_tone.size(); i += chunk_size) {
                 int n = std::min(chunk_size, (int)(tail_tone.size() - i));
@@ -917,7 +960,7 @@ private:
             const int chunk_size = 1024;
             for (size_t i = 0; i < samples.size(); i += chunk_size) {
                 int n = std::min(chunk_size, (int)(samples.size() - i));
-                audio_->write(samples.data() + i, n);
+                if (audio_->write(samples.data() + i, n) < n) break;
             }
 
             if (last) {
@@ -1249,6 +1292,20 @@ private:
                     was_blanking = true;
                     dcd_active_ = false;
                 } else {
+                    if (decoder_reconfig_pending_.exchange(false)) {
+                        int cf;
+                        bool rxf;
+                        {
+                            std::lock_guard<std::mutex> lock(config_mutex_);
+                            cf = config_.center_freq;
+                            rxf = config_.rx_filter_enabled;
+                        }
+                        decoder_->configure_frontend(cf, rxf);
+                        for (int i = 0; i < 3; ++i)
+                            mfsk_decoders_[i]->configure(MFSK_RX_MODES[i], cf);
+                        robust_decoder_->configure(cf);
+                        robust_decoder_n_->configure(cf);
+                    }
                     if (was_blanking) {
                         decoder_->reset();
                         for (auto& d : mfsk_decoders_) d->reset();
@@ -1328,28 +1385,54 @@ private:
         }
     }
     
-    void set_ptt(bool on) {
+    bool set_ptt(bool on) {
+        std::lock_guard<std::mutex> lock(ptt_mutex_);
+        bool ok = true;
         if (rigctl_) {
-            rigctl_->set_ptt(on);
+            ok = rigctl_->set_ptt(on);
         } else if (serial_ptt_) {
-            if (on) {
-                serial_ptt_->ptt_on();
-            } else {
-                serial_ptt_->ptt_off();
-            }
+            ok = on ? serial_ptt_->ptt_on() : serial_ptt_->ptt_off();
 #ifdef WITH_CM108
         } else if (cm108_ptt_) {
-            cm108_ptt_->set_ptt(on);
+            ok = cm108_ptt_->set_ptt(on);
 #endif
         } else if (dummy_ptt_) {
-            dummy_ptt_->set_ptt(on);
+            ok = dummy_ptt_->set_ptt(on);
         }
-        
+        if (on) {
+            ptt_state_.store(true);
+        } else if (ok) {
+            ptt_state_.store(false);
+            ptt_deadline_ms_.store(0);
+        } else {
+            ptt_state_.store(true);
+            ptt_deadline_ms_.store(steady_now_ms() + 1000);
+        }
+
 #ifdef WITH_UI
         if (g_ui_state) {
-            g_ui_state->ptt_on = on;
+            g_ui_state->ptt_on = ptt_state_.load();
         }
 #endif
+        return ok;
+    }
+
+    void arm_ptt_watchdog(int64_t expected_ms) {
+        ptt_deadline_ms_.store(steady_now_ms() + expected_ms + PTT_WATCHDOG_SLACK_MS);
+    }
+
+    void ptt_watchdog_loop() {
+        while (g_running) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            int64_t deadline = ptt_deadline_ms_.load();
+            if (deadline != 0 && ptt_state_.load() && steady_now_ms() > deadline) {
+                ptt_deadline_ms_.store(0);
+                std::cerr << "PTT watchdog: max keyed time exceeded, forcing unkey"
+                          << std::endl;
+                ui_log("PTT watchdog: forcing unkey");
+                set_ptt(false);
+            }
+        }
     }
     
     void set_tx_lockout(float seconds) {
@@ -1388,7 +1471,8 @@ private:
 
     TNCConfig config_;
     ModemConfig modem_config_;
-    int payload_size_;
+    std::atomic<int> payload_size_{0};
+    std::atomic<bool> decoder_reconfig_pending_{false};
     int frame_air_ms_cache_ = 0;
     uint64_t frame_air_key_ = (uint64_t)-1;
     
@@ -1413,6 +1497,7 @@ private:
 #endif
     std::unique_ptr<DummyPTT> dummy_ptt_;
     
+    static constexpr size_t MAX_CLIENTS = 16;
     int server_fd_ = -1;
     std::list<std::unique_ptr<ClientConnection>> clients_;
     mutable std::mutex clients_mutex_;
@@ -1441,7 +1526,12 @@ private:
     int64_t occ_last_ms_ = 0;
     bool dcd_active_ = false;
     std::atomic<bool> alc_tune_active_{false};
-    
+
+    std::mutex ptt_mutex_;
+    std::atomic<bool> ptt_state_{false};
+    std::atomic<int64_t> ptt_deadline_ms_{0};
+    static constexpr int64_t PTT_WATCHDOG_SLACK_MS = 5000;
+
     // TX blanking
     std::atomic<bool> tx_blanking_active_{false};
     
@@ -1462,10 +1552,12 @@ public:
         float result = -1.0f;
         tx_blanking_active_ = true;
         set_ptt(true);
+        arm_ptt_watchdog(2000);
         float drive = 0.10f;
         float prev = drive;
         float alc_base = NAN;
         for (int step = 0; step < 14 && g_running; ++step) {
+            arm_ptt_watchdog(2000);
             audio_->drain_playback();
             audio_->set_tx_gain(drive);
             auto tone = generate_tone(modem_config_.center_freq,
@@ -1533,9 +1625,8 @@ public:
 
     // Update config at runtime (called from UI)
     void update_config(const TNCConfig& new_config) {
-        // Update CSMA settings (safe to change at runtime)
+        std::lock_guard<std::mutex> lock(config_mutex_);
         {
-            std::lock_guard<std::mutex> lock(config_mutex_);
             config_.csma_enabled = new_config.csma_enabled;
             config_.postamble = new_config.postamble;
             config_.carrier_threshold_db = new_config.carrier_threshold_db;
@@ -1564,11 +1655,7 @@ public:
         if (config_.center_freq != new_config.center_freq) {
             config_.center_freq = new_config.center_freq;
             modem_config_.center_freq = config_.center_freq;
-            decoder_->configure_frontend(config_.center_freq, config_.rx_filter_enabled);
-            for (int i = 0; i < 3; ++i)
-                mfsk_decoders_[i]->configure(MFSK_RX_MODES[i], config_.center_freq);
-            robust_decoder_->configure(config_.center_freq);
-            robust_decoder_n_->configure(config_.center_freq);
+            decoder_reconfig_pending_.store(true);
             ui_log("Center frequency changed to " + std::to_string(config_.center_freq) + " Hz");
         }
 
@@ -1629,7 +1716,10 @@ public:
         }
     }
     
-    TNCConfig& get_config() { return config_; }
+    TNCConfig get_config() {
+        std::lock_guard<std::mutex> lock(config_mutex_);
+        return config_;
+    }
 
     int get_payload_size() const { return payload_size_; }
 
@@ -1840,6 +1930,8 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
         else if (!strcmp(key, "cm108_device") && take(key)) config.cm108_device = value;
 #endif
         else if (!strcmp(key, "port") && take(key)) config.port = atoi(value);
+        else if (!strcmp(key, "bind_address") && take(key)) config.bind_address = value;
+        else if (!strcmp(key, "control_bind_address") && take(key)) config.control_bind_address = value;
     }
 
     fclose(f);
@@ -1851,7 +1943,9 @@ void print_help(const char* prog) {
               << "Usage: " << prog << " [options]\n\n"
               << "Options:\n"
               << "  -p, --port PORT         KISS TCP port (default: 8001)\n"
+              << "  --bind ADDR             KISS bind address (default: 0.0.0.0)\n"
               << "  --control-port PORT     Control port (default: 8073, 0 to disable)\n"
+              << "  --control-bind ADDR     Control port bind address (default: 127.0.0.1)\n"
               << "  -d, --device DEV        Audio device for both I/O\n"
               << "  --input-device DEV      Audio input  device\n"
               << "  --output-device DEV     Audio output device\n"
@@ -1895,8 +1989,9 @@ void print_help(const char* prog) {
               << "  --csma-quiet MS         Idle time before contending (default: 0 = auto from frame airtime)\n"
               << "  --csma-cw N             Contention window in slots (default: 8)\n"
               << "  --csma-dither MS        Responder delay spread from callsign hash (default: 0 = off)\n"
-              << "  --csma-burst N          Packets sent per channel acquisition, 1-4 (default: 1)\n"
-              << "  --lead-tone             Send tone during TXDelay so others detect keyup (SSB)\n"
+              << "  --csma-burst N          Packets sent per channel acquisition, 1-4 (default: 2)\n"
+              << "  --lead-tone             Send tone during TXDelay so others detect keyup (default)\n"
+              << "  --no-lead-tone          Send silence during TXDelay instead\n"
               << "  --csma-persist N        P-persistence 0-255 (deprecated, unused)\n"
               << "\nFragmentation:\n"
               << "  --frag                  Enable packet fragmentation/reassembly\n"
@@ -1969,6 +2064,12 @@ int main(int argc, char** argv) {
         } else if ((arg == "-p" || arg == "--port") && i + 1 < argc) {
             config.port = std::atoi(argv[++i]);
             cli_set.insert("port");
+        } else if (arg == "--bind" && i + 1 < argc) {
+            config.bind_address = argv[++i];
+            cli_set.insert("bind_address");
+        } else if (arg == "--control-bind" && i + 1 < argc) {
+            config.control_bind_address = argv[++i];
+            cli_set.insert("control_bind_address");
         } else if (arg == "--control-port" && i + 1 < argc) {
             config.control_port = std::atoi(argv[++i]);
             cli_control_port = true;
@@ -2135,6 +2236,9 @@ int main(int argc, char** argv) {
         } else if (arg == "--lead-tone") {
             config.tx_lead_tone = true;
             cli_set.insert("tx_lead_tone");
+        } else if (arg == "--no-lead-tone") {
+            config.tx_lead_tone = false;
+            cli_set.insert("tx_lead_tone");
         } else if (arg == "--csma-persist" && i + 1 < argc) {
             config.p_persistence = std::atoi(argv[++i]);
             cli_set.insert("p_persistence");
@@ -2260,6 +2364,10 @@ int main(int argc, char** argv) {
                 // Network settings
                 if (!cli_set.count("port"))
                     config.port = ui_state.port;
+                if (!cli_set.count("bind_address"))
+                    config.bind_address = ui_state.bind_address;
+                if (!cli_set.count("control_bind_address"))
+                    config.control_bind_address = ui_state.control_bind_address;
 
                 // Find audio device indices
                 for (size_t i = 0; i < ui_state.available_input_devices.size(); i++) {
@@ -2317,7 +2425,9 @@ int main(int argc, char** argv) {
 #endif
                 // Network settings
                 ui_state.port = config.port;
-                
+                ui_state.bind_address = config.bind_address;
+                ui_state.control_bind_address = config.control_bind_address;
+
                 // Find modulation index
                 for (size_t i = 0; i < MODULATION_OPTIONS.size(); ++i) {
                     if (MODULATION_OPTIONS[i] == config.modulation) {
@@ -2362,6 +2472,16 @@ int main(int argc, char** argv) {
     }
 #endif
     
+    if (!valid_bind_address(config.bind_address)) {
+        std::cerr << "Error: invalid bind address '" << config.bind_address << "'" << std::endl;
+        return 1;
+    }
+    if (!valid_bind_address(config.control_bind_address)) {
+        std::cerr << "Error: invalid control bind address '"
+                  << config.control_bind_address << "'" << std::endl;
+        return 1;
+    }
+
     while (!check_port_available(config.bind_address, config.port)) {
         std::cerr << "Error: Port " << config.port << " is already in use or cannot be bound" << std::endl;
         std::cerr << "Another instance of modem73 may be running, or another application is using this port." << std::endl;
@@ -2396,7 +2516,7 @@ int main(int argc, char** argv) {
         }
     }
     
-    while (config.control_port > 0 && !check_port_available(config.bind_address, config.control_port)) {
+    while (config.control_port > 0 && !check_port_available(config.control_bind_address, config.control_port)) {
         std::cerr << "Error: Control port " << config.control_port << " is already in use" << std::endl;
 
         if (!g_use_ui) {
@@ -2467,7 +2587,7 @@ int main(int argc, char** argv) {
 
             ctrl_iface.get_config = [&tnc]() -> cJSON* {
                 cJSON* j = cJSON_CreateObject();
-                auto& cfg = tnc.get_config();
+                TNCConfig cfg = tnc.get_config();
 
                 cJSON_AddStringToObject(j, "callsign", cfg.callsign.c_str());
                 cJSON_AddNumberToObject(j, "modem_type", cfg.modem_type);
@@ -2605,7 +2725,7 @@ int main(int argc, char** argv) {
                 return true;
             };
 
-            ctrl = std::make_unique<ControlPort>(config.control_port, config.bind_address, ctrl_iface);
+            ctrl = std::make_unique<ControlPort>(config.control_port, config.control_bind_address, ctrl_iface);
             ctrl->start();
 
             tnc.rx_stats_callback = [&ctrl](float snr, float ber_pct, float level_db) {
@@ -2699,6 +2819,8 @@ int main(int argc, char** argv) {
             status_thread.join();
             tnc_thread.join();
 
+            for (int i = 0; i < 100 && ui_state.alc_tune_running.load(); ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
         } else {
             tnc.run();

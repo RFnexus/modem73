@@ -76,11 +76,11 @@ public:
     
     const std::string& last_error() const { return last_error_; }
     
-    void ptt_on() {
-        if (fd_ < 0) return;
-        
+    bool ptt_on() {
+        if (fd_ < 0) return false;
+
         int flags;
-        if (ioctl(fd_, TIOCMGET, &flags) < 0) return;
+        if (ioctl(fd_, TIOCMGET, &flags) < 0) return false;
         
 
 
@@ -99,24 +99,22 @@ public:
 
         if (line_ == PTTLine::RTS || line_ == PTTLine::BOTH) {
             if (invert_rts_) {
-                flags &= ~TIOCM_RTS;  // clear RTS 
+                flags &= ~TIOCM_RTS;  // clear RTS
             } else {
                 flags |= TIOCM_RTS;   // set RTS
             }
         }
-        
 
 
-        ioctl(fd_, TIOCMSET, &flags);
 
-
+        return ioctl(fd_, TIOCMSET, &flags) == 0;
     }
-    
-    void ptt_off() {
-        if (fd_ < 0) return;
-        
+
+    bool ptt_off() {
+        if (fd_ < 0) return false;
+
         int flags;
-        if (ioctl(fd_, TIOCMGET, &flags) < 0) return;
+        if (ioctl(fd_, TIOCMGET, &flags) < 0) return false;
         
 
 
@@ -132,19 +130,17 @@ public:
 
         if (line_ == PTTLine::RTS || line_ == PTTLine::BOTH) {
             if (invert_rts_) {
-                flags |= TIOCM_RTS;   // set RTS 
+                flags |= TIOCM_RTS;   // set RTS
             } else {
-                flags &= ~TIOCM_RTS;  // clear RTS 
+                flags &= ~TIOCM_RTS;  // clear RTS
             }
         }
-        
 
 
-        ioctl(fd_, TIOCMSET, &flags);
 
-
+        return ioctl(fd_, TIOCMSET, &flags) == 0;
     }
-    
+
     bool reconnect() {
         std::string saved_port = port_;
         PTTLine saved_line = line_;

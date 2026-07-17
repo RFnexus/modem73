@@ -89,7 +89,12 @@ public:
         struct sockaddr_in addr;
         memset(&addr, 0, sizeof(addr));
         addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = inet_addr(bind_address_.c_str());
+        if (inet_pton(AF_INET, bind_address_.c_str(), &addr.sin_addr) != 1) {
+            std::cerr << "control: invalid bind address " << bind_address_ << std::endl;
+            close(server_fd_);
+            server_fd_ = -1;
+            return false;
+        }
         addr.sin_port = htons(port_);
 
         if (bind(server_fd_, (struct sockaddr*)&addr, sizeof(addr)) < 0) {

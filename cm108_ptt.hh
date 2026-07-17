@@ -105,14 +105,16 @@ public:
 
     void close(){
         if (handle_) {
+            set_ptt(false);
             hid_close(handle_);
             handle_ = nullptr;
         }
         hid_exit();
     }
 
-    void set_ptt(bool on){
-        if (!handle_) return;
+    bool set_ptt(bool on){
+        if (!handle_) return false;
+        if (gpio_ < 1 || gpio_ > 4) return false;
 
         unsigned char buf[5];
         buf[0] = 0x00;
@@ -128,6 +130,7 @@ public:
         buf[4] = 0x00;
 
         res_ = hid_write(handle_, buf, 5);
+        return res_ >= 0;
     }
 
 private:
