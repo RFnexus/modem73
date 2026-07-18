@@ -1988,7 +1988,7 @@ void print_help(const char* prog) {
               << "  --csma-slot MS          Slot time in ms (default: 500)\n"
               << "  --csma-quiet MS         Idle time before contending (default: 0 = auto from frame airtime)\n"
               << "  --csma-cw N             Contention window in slots (default: 8)\n"
-              << "  --csma-dither MS        Responder delay spread from callsign hash (default: 0 = off)\n"
+              << "  --csma-dither MS        Responder delay spread from callsign hash (default: 250, 0 = off)\n"
               << "  --csma-burst N          Packets sent per channel acquisition, 1-4 (default: 2)\n"
               << "  --lead-tone             Send tone during TXDelay so others detect keyup (default)\n"
               << "  --no-lead-tone          Send silence during TXDelay instead\n"

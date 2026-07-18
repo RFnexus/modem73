@@ -107,7 +107,7 @@ struct TNCConfig {
     int max_backoff_slots = 10;
     int csma_quiet_ms = 0;
     int csma_cw = 8;
-    int csma_responder_dither = 0;
+    int csma_responder_dither = 250;
     bool tx_lead_tone = true;
     int csma_burst = 2;
     

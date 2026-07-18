@@ -179,7 +179,7 @@ struct TNCUIState {
     int csma_cw = 8;
     int p_persistence = 128;
     bool tx_lead_tone = true;
-    int csma_responder_dither = 0;
+    int csma_responder_dither = 250;
     int csma_burst = 2;
     int csma_band = 0;
     bool csma_advanced_open = false;

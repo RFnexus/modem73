@@ -25,17 +25,21 @@ public:
     enum class Reason { NONE, CLEAR, RESPONDER, BUSY_OVERRIDE, NO_AUDIO };
 
     CsmaGate(const CsmaConfig& cfg, uint32_t seed) : cfg_(cfg) {
-        int window = std::max(2, cfg_.cw) * std::max(1, cfg_.slot_ms);
+        int slot = std::max(1, cfg_.slot_ms);
+        int window = std::max(2, cfg_.cw) * slot;
         if (cfg_.idle_credit_ms >= cfg_.cold_channel_ms)
-            window = std::max(window / 4, 2 * std::max(1, cfg_.slot_ms));
+            window = std::max(window / 4, 4 * slot);
         window_ = window;
+        std::mt19937 gen(seed);
         if (cfg_.responder) {
             quiet_needed_ = std::min(cfg_.quiet_ms, cfg_.responder_quiet_ms);
-            contention_ms_ = cfg_.responder_dither_ms;
+            contention_ms_ = cfg_.responder_dither_ms +
+                slot * std::uniform_int_distribution<int>(0, 3)(gen);
         } else {
-            std::mt19937 gen(seed);
+            int slots = std::max(2, window / slot);
             quiet_needed_ = cfg_.quiet_ms;
-            contention_ms_ = std::uniform_int_distribution<int>(0, window - 1)(gen);
+            contention_ms_ = slot *
+                std::uniform_int_distribution<int>(0, slots - 1)(gen);
         }
         contention_drawn_ = contention_ms_;
         idle_ms_ = std::min(std::max(0, cfg_.idle_credit_ms), quiet_needed_);
