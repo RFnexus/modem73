@@ -591,6 +591,15 @@ private:
                     csma_dither = config_.csma_responder_dither;
                     csma_burst = std::max(1, std::min(4, config_.csma_burst));
                     csma_callsign = config_.callsign;
+                    if (config_.modem_type == 0) {
+                        bool short_ofdm = pkt.oper_mode >= 0
+                            ? (pkt.oper_mode & 1) == 0
+                            : config_.frame_size == 0;
+                        if (short_ofdm) {
+                            slot_time_ms = std::min(slot_time_ms, 300);
+                            csma_burst = 4;
+                        }
+                    }
                 }
                 if (csma_enabled) {
                     // Wait for TX lockout to clear
@@ -2097,6 +2106,8 @@ int main(int argc, char** argv) {
             cli_set.insert("audio_output");
         } else if ((arg == "-c" || arg == "--callsign") && i + 1 < argc) {
             config.callsign = argv[++i];
+            for (auto& ch : config.callsign)
+                ch = toupper((unsigned char)ch);
             cli_set.insert("callsign");
         } else if ((arg == "-m" || arg == "--modulation") && i + 1 < argc) {
             config.modulation = argv[++i];
@@ -2318,37 +2329,61 @@ int main(int argc, char** argv) {
                 config.mfsk_mode = ui_state.mfsk_mode_index;
                 config.robust_mode = ui_state.robust_mode_index;
                 config.tx_drive = ui_state.tx_drive;
-                config.center_freq = ui_state.center_freq;
-                config.modulation = MODULATION_OPTIONS[ui_state.modulation_index];
-                config.code_rate = CODE_RATE_OPTIONS[ui_state.code_rate_index];
-                config.frame_size = ui_state.frame_size;
+                if (!cli_set.count("center_freq"))
+                    config.center_freq = ui_state.center_freq;
+                if (!cli_set.count("modulation"))
+                    config.modulation = MODULATION_OPTIONS[ui_state.modulation_index];
+                if (!cli_set.count("code_rate"))
+                    config.code_rate = CODE_RATE_OPTIONS[ui_state.code_rate_index];
+                if (!cli_set.count("frame_size"))
+                    config.frame_size = ui_state.frame_size;
                 config.postamble = ui_state.postamble;
-                config.csma_enabled = ui_state.csma_enabled;
-                config.carrier_threshold_db = ui_state.carrier_threshold_db;
-                config.slot_time_ms = ui_state.slot_time_ms;
-                config.csma_quiet_ms = ui_state.csma_quiet_ms;
-                config.csma_cw = ui_state.csma_cw;
-                config.csma_responder_dither = ui_state.csma_responder_dither;
-                config.csma_burst = ui_state.csma_burst;
-                config.tx_lead_tone = ui_state.tx_lead_tone;
-                config.p_persistence = ui_state.p_persistence;
-                config.fragmentation_enabled = ui_state.fragmentation_enabled;
-                config.tx_blanking_enabled = ui_state.tx_blanking_enabled;
+                if (!cli_set.count("csma_enabled"))
+                    config.csma_enabled = ui_state.csma_enabled;
+                if (!cli_set.count("carrier_threshold_db"))
+                    config.carrier_threshold_db = ui_state.carrier_threshold_db;
+                if (!cli_set.count("slot_time_ms"))
+                    config.slot_time_ms = ui_state.slot_time_ms;
+                if (!cli_set.count("csma_quiet_ms"))
+                    config.csma_quiet_ms = ui_state.csma_quiet_ms;
+                if (!cli_set.count("csma_cw"))
+                    config.csma_cw = ui_state.csma_cw;
+                if (!cli_set.count("csma_responder_dither"))
+                    config.csma_responder_dither = ui_state.csma_responder_dither;
+                if (!cli_set.count("csma_burst"))
+                    config.csma_burst = ui_state.csma_burst;
+                if (!cli_set.count("tx_lead_tone"))
+                    config.tx_lead_tone = ui_state.tx_lead_tone;
+                if (!cli_set.count("p_persistence"))
+                    config.p_persistence = ui_state.p_persistence;
+                if (!cli_set.count("fragmentation_enabled"))
+                    config.fragmentation_enabled = ui_state.fragmentation_enabled;
+                if (!cli_set.count("tx_blanking_enabled"))
+                    config.tx_blanking_enabled = ui_state.tx_blanking_enabled;
                 // Audio devices
-                config.audio_input_device = ui_state.audio_input_device;
-                config.audio_output_device = ui_state.audio_output_device;
+                if (!cli_set.count("audio_input"))
+                    config.audio_input_device = ui_state.audio_input_device;
+                if (!cli_set.count("audio_output"))
+                    config.audio_output_device = ui_state.audio_output_device;
                 // PTT settings
                 if (!cli_set.count("ptt_type"))
                     config.ptt_type = static_cast<PTTType>(ui_state.ptt_type_index);
-                config.vox_tone_freq = ui_state.vox_tone_freq;
-                config.vox_lead_ms = ui_state.vox_lead_ms;
-                config.vox_tail_ms = ui_state.vox_tail_ms;
+                if (!cli_set.count("vox_tone_freq"))
+                    config.vox_tone_freq = ui_state.vox_tone_freq;
+                if (!cli_set.count("vox_lead_ms"))
+                    config.vox_lead_ms = ui_state.vox_lead_ms;
+                if (!cli_set.count("vox_tail_ms"))
+                    config.vox_tail_ms = ui_state.vox_tail_ms;
 
                 // COM PTT settings
-                config.com_port = ui_state.com_port;
-                config.com_ptt_line = ui_state.com_ptt_line;
-                config.com_invert_dtr = ui_state.com_invert_dtr;
-                config.com_invert_rts = ui_state.com_invert_rts;
+                if (!cli_set.count("com_port"))
+                    config.com_port = ui_state.com_port;
+                if (!cli_set.count("com_ptt_line"))
+                    config.com_ptt_line = ui_state.com_ptt_line;
+                if (!cli_set.count("com_invert_dtr"))
+                    config.com_invert_dtr = ui_state.com_invert_dtr;
+                if (!cli_set.count("com_invert_rts"))
+                    config.com_invert_rts = ui_state.com_invert_rts;
 
 #ifdef WITH_CM108
                 // CM108 PTT settings
@@ -2446,6 +2481,57 @@ int main(int argc, char** argv) {
             }
         }
         
+        ui_state.callsign = config.callsign;
+        ui_state.center_freq = config.center_freq;
+        ui_state.frame_size = config.frame_size;
+        ui_state.postamble = config.postamble;
+        ui_state.csma_enabled = config.csma_enabled;
+        ui_state.carrier_threshold_db = config.carrier_threshold_db;
+        ui_state.slot_time_ms = config.slot_time_ms;
+        ui_state.csma_quiet_ms = config.csma_quiet_ms;
+        ui_state.csma_cw = config.csma_cw;
+        ui_state.csma_responder_dither = config.csma_responder_dither;
+        ui_state.csma_burst = config.csma_burst;
+        ui_state.tx_lead_tone = config.tx_lead_tone;
+        ui_state.p_persistence = config.p_persistence;
+        ui_state.audio_input_device = config.audio_input_device;
+        ui_state.audio_output_device = config.audio_output_device;
+        ui_state.com_port = config.com_port;
+        ui_state.com_ptt_line = config.com_ptt_line;
+        ui_state.com_invert_dtr = config.com_invert_dtr;
+        ui_state.com_invert_rts = config.com_invert_rts;
+#ifdef WITH_CM108
+        ui_state.cm108_gpio = config.cm108_gpio;
+        ui_state.cm108_device = config.cm108_device;
+#endif
+        ui_state.port = config.port;
+        ui_state.bind_address = config.bind_address;
+        ui_state.control_bind_address = config.control_bind_address;
+        for (size_t i = 0; i < MODULATION_OPTIONS.size(); ++i) {
+            if (MODULATION_OPTIONS[i] == config.modulation) {
+                ui_state.modulation_index = i;
+                break;
+            }
+        }
+        for (size_t i = 0; i < CODE_RATE_OPTIONS.size(); ++i) {
+            if (CODE_RATE_OPTIONS[i] == config.code_rate) {
+                ui_state.code_rate_index = i;
+                break;
+            }
+        }
+        for (size_t i = 0; i < ui_state.available_input_devices.size(); i++) {
+            if (ui_state.available_input_devices[i] == ui_state.audio_input_device) {
+                ui_state.audio_input_index = i;
+                break;
+            }
+        }
+        for (size_t i = 0; i < ui_state.available_output_devices.size(); i++) {
+            if (ui_state.available_output_devices[i] == ui_state.audio_output_device) {
+                ui_state.audio_output_index = i;
+                break;
+            }
+        }
+
         // Set PTT info for display
         ui_state.ptt_type_index = static_cast<int>(config.ptt_type);
         ui_state.rigctl_host = config.rigctl_host;
