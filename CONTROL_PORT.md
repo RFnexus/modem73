@@ -60,7 +60,6 @@ Stats switch between the OFDM, MFSK and RDM decoders based on active `modem_type
 | `code_rate` | string | `"1/2"`, `"2/3"`, `"3/4"`, `"5/6"`, `"1/4"`, `"1/2x2"`, `"1/4x2"` (OFDM only; the `x2` rates send the codeword twice for time diversity on fading paths; every code bit airs twice, half the frame duration apart. Valid with long frames up to QAM16; not valid with QAM64+ long or QAM256+ normal frames) |
 | `postamble` | bool | OFDM only. Append a trailing sync anchor (~0.4 s of extra airtime) to each transmitted frame. An aware receiver uses it to rescue frames whose preamble/meta was fade-clipped; legacy receivers reject it cleanly (invalid-callsign marker) with no interop impact. |
 | `short_frame` | bool | Short frame mode (OFDM only) |
-| `center_freq` | int | Center frequency in Hz |
 | `payload_size` | int | Current PHY payload capacity in bytes |
 | `csma_enabled` | bool | CSMA carrier sense enabled |
 | `carrier_threshold_db` | float | CSMA threshold (dB) |

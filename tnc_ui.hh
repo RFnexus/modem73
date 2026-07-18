@@ -774,10 +774,7 @@ struct TNCUIState {
                     int v = atoi(value);
                     if (v >= 0 && v <= 2) frame_size = v;
                 }
-                else if (strcmp(key, "center_freq") == 0) {
-                    int v = atoi(value);
-                    if (v >= 300 && v <= 3000) center_freq = v;
-                }
+                else if (strcmp(key, "center_freq") == 0) center_freq = 1500;
                 else if (strcmp(key, "postamble") == 0) postamble = atoi(value) != 0;
                 else if (strcmp(key, "csma_enabled") == 0) csma_enabled = atoi(value) != 0;
                 else if (strcmp(key, "carrier_threshold_db") == 0) carrier_threshold_db = atof(value);
@@ -915,7 +912,7 @@ struct TNCUIState {
                 p.modulation_index = clampi(mod, 0, (int)MODULATION_OPTIONS.size() - 1);
                 p.code_rate_index = clampi(rate, 0, (int)CODE_RATE_OPTIONS.size() - 1);
                 p.frame_size = sf == 1 ? 0 : sf == 2 ? 2 : 1;
-                p.center_freq = (freq >= 300 && freq <= 3000) ? freq : 1500;
+                p.center_freq = 1500;
                 p.csma_enabled = csma != 0;
                 p.carrier_threshold_db = thresh;
                 p.slot_time_ms = slot;
@@ -986,7 +983,6 @@ struct TNCUIState {
         modulation_index = p.modulation_index;
         code_rate_index = p.code_rate_index;
         frame_size = p.frame_size;
-        center_freq = p.center_freq;
         csma_enabled = p.csma_enabled;
         carrier_threshold_db = p.carrier_threshold_db;
         slot_time_ms = p.slot_time_ms;
@@ -1493,12 +1489,6 @@ private:
                         edit_text_field(FIELD_CALLSIGN);
 
 
-                    } else if (current_field_ == FIELD_FREQ) {
-
-
-                        edit_text_field(FIELD_FREQ);
-
-
                     } else if (current_field_ == FIELD_NET_PORT) {
 
 
@@ -1705,7 +1695,7 @@ private:
                         }
                     } else if (event.x >= 18) {
                         // Value area clicks for other fields
-                        if (field == FIELD_CALLSIGN || field == FIELD_FREQ) {
+                        if (field == FIELD_CALLSIGN) {
                             edit_text_field(field);
                         } else if (field >= FIELD_MODULATION) {
                             if (event.x < 22) adjust_field(-1);
@@ -1781,9 +1771,6 @@ private:
         if (field == FIELD_CALLSIGN) {
             row = 5;
             max_len = 10;
-        } else if (field == FIELD_FREQ) {
-            row = 9;
-            max_len = 6;
         } else if (field == FIELD_COM_PORT) {
             row = 20;  
             max_len = 20;
@@ -1817,14 +1804,6 @@ private:
                 for (char* p = buf; *p; p++) *p = toupper(*p);
                 state_.callsign = buf;
                 apply_settings();
-            } else if (field == FIELD_FREQ) {
-                try {
-                    int freq = std::stoi(buf);
-                    if (freq >= 300 && freq <= 3000) {
-                        state_.center_freq = freq;
-                        apply_settings();
-                    }
-                } catch (...) {}
             } else if (field == FIELD_COM_PORT) {
                 state_.com_port = buf;
                 state_.add_log("(!) COM port changed, restart required");
@@ -1882,6 +1861,7 @@ private:
     }
 
     bool should_skip_field(int field) {
+        if (field == FIELD_FREQ) return true;
         // Hide OFDM-only fields when in MFSK mode
         if (state_.modem_type_index != 0) {
             if (field == FIELD_MODULATION || field == FIELD_CODERATE ||
@@ -1945,8 +1925,7 @@ private:
             if (field == FIELD_ROBUST_MTU) return row;
             row++;
         }
-        if (field == FIELD_FREQ) return row;
-        row += 2;
+        row++;
         row++;
         if (field == FIELD_CSMA) return row;
         row++;
@@ -3545,14 +3524,8 @@ private:
             row++;
         }
 
-        dy = visible_y(row);
-        if (dy >= 0) {
-            char freq_buf[32];
-            snprintf(freq_buf, sizeof(freq_buf), "%d Hz", state_.center_freq);
-            draw_field(dy, c1, c2, "Freq", FIELD_FREQ, freq_buf, true);
-        }
-        row += 2;
-        
+        row++;
+
         dy = visible_y(row);
         if (dy >= 0) {
             attron(A_DIM);

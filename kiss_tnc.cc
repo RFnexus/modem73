@@ -1905,7 +1905,7 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
             int v = atoi(value);
             if (v >= 0 && v <= 2) config.frame_size = v;
         }
-        else if (!strcmp(key, "center_freq") && take(key)) config.center_freq = atoi(value);
+        else if (!strcmp(key, "center_freq") && take(key)) config.center_freq = 1500;
         else if (!strcmp(key, "rx_filter_enabled") && take(key)) config.rx_filter_enabled = atoi(value) != 0;
         else if (!strcmp(key, "postamble") && take(key)) config.postamble = atoi(value) != 0;
         else if (!strcmp(key, "mfsk_rx_enabled") && take(key)) config.mfsk_rx_enabled = atoi(value) != 0;
@@ -1962,7 +1962,6 @@ void print_help(const char* prog) {
               << "  -c, --callsign CALL     Callsign (default: N0CALL)\n"
               << "  -m, --modulation MOD    BPSK/QPSK/8PSK/QAM16/QAM64/QAM256 (default: QPSK)\n"
               << "  -r, --rate RATE         Code rate: 1/2, 2/3, 3/4, 5/6, 1/4 (default: 1/2)\n"
-              << "  -f, --freq FREQ         Center frequency in Hz (default: 1500)\n"
               << "  --short                 Use short frames\n"
               << "  --normal                Use normal frames (default)\n"
               << "  --long                  Use long frames\n"
@@ -2116,8 +2115,8 @@ int main(int argc, char** argv) {
             config.code_rate = argv[++i];
             cli_set.insert("code_rate");
         } else if ((arg == "-f" || arg == "--freq") && i + 1 < argc) {
-            config.center_freq = std::atoi(argv[++i]);
-            cli_set.insert("center_freq");
+            ++i;
+            std::cerr << "Warning: center frequency is fixed at 1500 Hz" << std::endl;
         } else if (arg == "--short") {
             config.frame_size = 0;
             cli_set.insert("frame_size");
@@ -2633,6 +2632,8 @@ int main(int argc, char** argv) {
         }
     }
 
+    config.center_freq = 1500;
+
     try {
         KISSTNC tnc(config);
 
@@ -2736,7 +2737,7 @@ int main(int argc, char** argv) {
                     && item->valueint >= 0 && item->valueint <= 2)
                     new_config.frame_size = item->valueint;
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "center_freq")) && cJSON_IsNumber(item))
-                    new_config.center_freq = item->valueint;
+                    new_config.center_freq = 1500;
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "postamble")) && cJSON_IsBool(item))
                     new_config.postamble = cJSON_IsTrue(item);
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "csma_enabled")) && cJSON_IsBool(item))
@@ -2828,7 +2829,7 @@ int main(int argc, char** argv) {
                 new_config.mfsk_mode = state.mfsk_mode_index;
                 new_config.robust_mode = state.robust_mode_index;
                 new_config.callsign = state.callsign;
-                new_config.center_freq = state.center_freq;
+                new_config.center_freq = 1500;
                 new_config.modulation = MODULATION_OPTIONS[state.modulation_index];
                 new_config.code_rate = CODE_RATE_OPTIONS[state.code_rate_index];
                 new_config.frame_size = state.frame_size;
