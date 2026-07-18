@@ -263,15 +263,56 @@ public:
             emit_symbol(out, tones, base, nc, true);
             emit_symbol(out, tones, base, nc, true);
         }
+        tx_filter(out, center_freq, nc);
         return out;
     }
 
     int get_payload_size(RobustMode m) { return RobustParams::data_bytes(m); }
 
 private:
+    // clipping raised the average power codec2-style; this contains the
+    // spectral regrowth so the drive stays inside the occupied bandwidth
+    void tx_filter(std::vector<float>& out, int center_freq, int nc) {
+        const int L = 257;
+        uint64_t key = ((uint64_t)center_freq << 8) | (uint32_t)nc;
+        if (key != tx_bpf_key_) {
+            int half = nc * RobustParams::SPACING / 2 + 400;
+            value f1 = std::max(100, center_freq - half);
+            value f2 = std::min(RobustParams::SAMPLE_RATE / 2 - 100,
+                                center_freq + half);
+            for (int i = 0; i < L; ++i) {
+                int k = i - L / 2;
+                value lp2 = k == 0 ? 2 * f2 / RobustParams::SAMPLE_RATE
+                    : std::sin(2 * (value)M_PI * f2 * k / RobustParams::SAMPLE_RATE)
+                        / ((value)M_PI * k);
+                value lp1 = k == 0 ? 2 * f1 / RobustParams::SAMPLE_RATE
+                    : std::sin(2 * (value)M_PI * f1 * k / RobustParams::SAMPLE_RATE)
+                        / ((value)M_PI * k);
+                value w = value(0.54) - value(0.46)
+                    * std::cos(2 * (value)M_PI * i / (L - 1));
+                tx_bpf_[i] = (lp2 - lp1) * w;
+            }
+            tx_bpf_key_ = key;
+        }
+        std::vector<float> x;
+        x.swap(out);
+        out.assign(x.size() + L - 1, 0.0f);
+        for (size_t i = 0; i < x.size(); ++i) {
+            float v = x[i];
+            if (v == 0.0f)
+                continue;
+            for (int j = 0; j < L; ++j)
+                out[i + j] += v * tx_bpf_[j];
+        }
+        for (auto& v : out)
+            v = std::max(-0.95f, std::min(0.95f, v));
+    }
+
     DSP::FastFourierTransform<RobustParams::NFFT, robust_detail::cmplx, 1> bwd_;
     robust_detail::cmplx rot_[RobustParams::NC_MAX];
     int rot_nc_ = 0;
+    value tx_bpf_[257];
+    uint64_t tx_bpf_key_ = (uint64_t)-1;
     CODE::PolarEncoder<int8_t> polar_encoder_;
     CODE::CRC<uint32_t> crc_{0x8F6E37A0};
     int8_t mesg_[RobustParams::DATA_BITS + RobustParams::CRC_BITS];
@@ -290,7 +331,7 @@ private:
         for (int k = 0; k < nc; ++k)
             fdom[base + k] = rotate ? tones[k] * rot_[k] : tones[k];
         bwd_(tdom, fdom);
-        const float scale = 0.5f / std::sqrt((float)nc);
+        const float scale = 0.62f / std::sqrt((float)nc);
         auto clip = [](float v) {
             float a = v / 0.95f, a2 = a * a;
             return 0.95f * a / std::pow(1.0f + a2 * a2 * a2, 1.0f / 6.0f);
@@ -911,19 +952,34 @@ private:
             RobustMode m = modes_[mi];
             int n = RobustParams::nrows(m);
             int64_t row0 = anchor_u_ - D - (int64_t)n * RobustParams::SYM;
-            if (row0 < 0)
+            // late join: head rows never captured decode as erasures, inside
+            // the margin the rate-1/4 mother code leaves (RDM-800 already
+            // spends half of that margin on puncturing)
+            int missing = row0 < 0
+                ? (int)((-row0 + RobustParams::SYM - 1) / RobustParams::SYM)
+                : 0;
+            if (missing > (RobustParams::sent_offset(m) ? n / 8 : n / 4))
                 continue;
-            if (total_in_ - last_decode_total_ <
-                (int64_t)(n + 4) * RobustParams::SYM)
+            int64_t head_abs = total_in_ - (int64_t)buf_.size()
+                             + std::max<int64_t>(row0, 0);
+            if (head_abs < last_decode_total_)
                 continue;
             frame_pos_ = row0;
             if (mi == 0)
                 ++stats_sync_count;
-            for (int i = 0; i < n; ++i)
-                take_row(i, row_start(i));
+            for (int i = 0; i < n; ++i) {
+                int64_t start = row_start(i);
+                if (start < 0) {
+                    for (int k = 0; k < nc_; ++k)
+                        rows_[i][k] = cmplx(0, 0);
+                } else {
+                    take_row(i, start);
+                }
+            }
             if (try_decode(m, callback)) {
                 std::cerr << "RDM" << (narrow_ ? "n" : "")
                           << ": backward rescue " << ROBUST_MODE_NAMES[(int)m]
+                          << (missing ? " (late join)" : "")
                           << std::endl;
                 int64_t end = anchor_u_ + RobustParams::NFFT;
                 if (end > 0 && (size_t)end <= buf_.size())
