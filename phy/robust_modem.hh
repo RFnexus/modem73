@@ -378,6 +378,16 @@ public:
             rot_[k] = DSP::polar<value>(1, (value)M_PI * k * k / nc_);
         nrows_top_ = RobustParams::nrows(modes_[nmodes_ - 1]);
         keep_ = (size_t)(nrows_top_ + 10) * RobustParams::SYM + 2 * D;
+        {
+            CODE::MLS ps(0x163, narrow_ ? 89 : 1);
+            npat_ = nrows_top_ / RobustParams::NS + 1;
+            for (int j = 0; j < npat_; ++j)
+                for (int k = 0; k < nc_; ++k)
+                    pat_[j][k] = robust_detail::nrz(ps());
+            for (int j = 0; j + 1 < npat_; ++j)
+                for (int k = 0; k < nc_; ++k)
+                    qpat_[j][k] = pat_[j][k] * pat_[j + 1][k];
+        }
         configure(center_freq);
     }
 
@@ -412,6 +422,12 @@ public:
         tried_mask_ = 0;
         confirmed_ = false;
         pilot_alive_total_ = -1;
+        for (int i = 0; i < SCAN_RING; ++i)
+            scan_stamp_[i] = -1;
+        for (int i = 0; i < SCAN_HIST; ++i) {
+            scan_best_q_[i] = 0;
+            scan_best_stamp_[i] = -1;
+        }
     }
 
     void process(const float* samples, size_t count, FrameCallback callback) {
@@ -456,6 +472,8 @@ public:
                     Rb_ += norm(buf_[n]) - norm(buf_[n - D]);
                     Ra_ += norm(buf_[n - D]) - norm(buf_[n - 2 * D]);
                 }
+                if ((total_in_ % SCAN_STRIDE) == 0 && pilot_scan(n))
+                    break;
                 value m = norm(P_) / (Ra_ * Rb_ + value(1e-9));
                 if (m > value(0.15)) {
                     state_ = State::PEAK;
@@ -560,12 +578,14 @@ public:
                             pilot_alive_total_ = total_in_;
                     }
                     if (rows_done_ == 2 * RobustParams::NS + 1 &&
+                        !confirmed_ &&
                         pilot_sanity(3, nc_ <= 8 ? 0.45f : 0.28f)) {
                         ++stats_sync_count;
                         confirmed_ = true;
-                    } else if ((rows_done_ == 1 && !pilot_sanity(1, nc_ <= 8 ? 0.30f : 0.18f)) ||
+                    } else if (!pilot_entry_ &&
+                        ((rows_done_ == 1 && !pilot_sanity(1, nc_ <= 8 ? 0.30f : 0.18f)) ||
                         (rows_done_ == 2 * RobustParams::NS + 1 &&
-                         !pilot_sanity(3, nc_ <= 8 ? 0.45f : 0.28f))) {
+                         !pilot_sanity(3, nc_ <= 8 ? 0.45f : 0.28f)))) {
                         std::cerr << "RDM" << (narrow_ ? "n" : "")
                                   << ": collect abort at row " << rows_done_
                                   << std::endl;
@@ -628,6 +648,7 @@ public:
     int stats_crc_errors = 0;
     int stats_rescues = 0;
     int stats_retry_success = 0;
+    int stats_pilot_syncs = 0;
 
     void reset_stats() {
         stats_sync_count = 0;
@@ -723,6 +744,129 @@ private:
     int8_t pre_[RobustParams::NC_MAX];
     int8_t post_[RobustParams::NC_MAX];
     bool seq_init_ = false;
+
+    // mid-frame acquisition off the pilot rows 
+    static constexpr int SCAN_STRIDE = 240;
+    static constexpr int SCAN_PAIR = 4 * RobustParams::SYM / SCAN_STRIDE;
+    static constexpr int SCAN_RING = SCAN_PAIR + 1;
+    int8_t pat_[RobustParams::NROWS_MAX / RobustParams::NS + 1]
+               [RobustParams::NC_MAX];
+    int8_t qpat_[RobustParams::NROWS_MAX / RobustParams::NS + 1]
+                [RobustParams::NC_MAX];
+    int npat_ = 0;
+    cmplx scan_bins_[SCAN_RING][RobustParams::NC_MAX + 4];
+    int64_t scan_stamp_[SCAN_RING] = {};
+    static constexpr int SCAN_HIST = 2 * SCAN_PAIR + 1;
+    int scan_best_j_[SCAN_HIST];
+    int scan_best_b_[SCAN_HIST];
+    value scan_best_q_[SCAN_HIST];
+    int64_t scan_best_stamp_[SCAN_HIST];
+    bool pilot_entry_ = false;
+
+    void scan_fft(int64_t start, cmplx* bins) {
+        cmplx tdom[RobustParams::NFFT], fdom[RobustParams::NFFT];
+        for (int i = 0; i < RobustParams::NFFT; ++i)
+            tdom[i] = buf_[start + i];
+        fwd_(fdom, tdom);
+        for (int k = 0; k < nc_ + 4; ++k)
+            bins[k] = fdom[base_ - 2 + k];
+    }
+
+    bool pilot_scan(int64_t n) {
+        int slot = (int)((total_in_ / SCAN_STRIDE) % SCAN_RING);
+        int64_t u_buf = n + 1 - RobustParams::NFFT;
+        if (u_buf < 0)
+            return false;
+        int hslot = (int)((total_in_ / SCAN_STRIDE) % SCAN_HIST);
+        scan_fft(u_buf, scan_bins_[slot]);
+        scan_stamp_[slot] = total_in_;
+        scan_best_q_[hslot] = 0;
+        scan_best_stamp_[hslot] = total_in_;
+        int prev = (slot + SCAN_RING - SCAN_PAIR) % SCAN_RING;
+        if (scan_stamp_[prev] != total_in_ - 4 * D)
+            return false;
+        value best_q = 0;
+        int best_j = -1, best_b = 0;
+        for (int b = -2; b <= 2; ++b) {
+            if (base_ + b < 2 ||
+                base_ + b + nc_ + 2 > RobustParams::NFFT / 2)
+                continue;
+            cmplx d[RobustParams::NC_MAX];
+            value pw = 0;
+            for (int k = 0; k < nc_; ++k) {
+                d[k] = scan_bins_[slot][2 + b + k]
+                     * conj(scan_bins_[prev][2 + b + k]);
+                pw += abs(d[k]);
+            }
+            if (pw < value(1e-12))
+                continue;
+            for (int j = 0; j + 1 < npat_; ++j) {
+                cmplx s(0, 0);
+                for (int k = 0; k < nc_; ++k)
+                    s = s + (value)qpat_[j][k] * d[k];
+                value q = abs(s) / pw;
+                if (q > best_q) {
+                    best_q = q; best_j = j; best_b = b;
+                }
+            }
+        }
+        value gate = nc_ <= 8 ? value(0.78) : value(0.60);
+        bool fire = false;
+        int h1 = (hslot + SCAN_HIST - SCAN_PAIR) % SCAN_HIST;
+        int h2 = (hslot + SCAN_HIST - 2 * SCAN_PAIR) % SCAN_HIST;
+        if (best_q > gate &&
+            scan_best_q_[h1] > gate &&
+            scan_best_stamp_[h1] == total_in_ - 4 * D &&
+            scan_best_j_[h1] == best_j - 1 && scan_best_b_[h1] == best_b &&
+            scan_best_q_[h2] > gate &&
+            scan_best_stamp_[h2] == total_in_ - 8 * D &&
+            scan_best_j_[h2] == best_j - 2 && scan_best_b_[h2] == best_b)
+            fire = pilot_enter(best_j, best_b, u_buf, best_q);
+        scan_best_j_[hslot] = best_j;
+        scan_best_b_[hslot] = best_b;
+        scan_best_q_[hslot] = best_q;
+        return fire;
+    }
+
+    bool pilot_enter(int j, int boff, int64_t u_buf, value q) {
+        using namespace robust_detail;
+        int slot = (int)((total_in_ / SCAN_STRIDE) % SCAN_RING);
+        cmplx d2[RobustParams::NC_MAX], s(0, 0);
+        for (int k = 0; k < nc_; ++k)
+            d2[k] = (value)pat_[j + 1][k]
+                  * scan_bins_[slot][2 + boff + k];
+        for (int k = 0; k + 1 < nc_; ++k)
+            s = s + d2[k + 1] * conj(d2[k]);
+        value tau = -arg(s) * RobustParams::NFFT / (2 * (value)M_PI);
+        int64_t u = u_buf + (int64_t)std::lround(tau) - 96;
+        int64_t fp = u - (int64_t)(4 * (j + 1)) * RobustParams::SYM;
+        if (fp < 0 || u - D - RobustParams::CP < 0)
+            return false;
+        const value bin_step = 2 * (value)M_PI * RobustParams::SPACING
+                             / RobustParams::SAMPLE_RATE;
+        omega_ = arg(cp_corr(u, 112, 192)) / (value)RobustParams::NFFT
+               + boff * bin_step;
+        frame_pos_ = fp;
+        anchor_u_ = fp - D;
+        rows_done_ = 0;
+        tried_mask_ = 0;
+        confirmed_ = true;
+        pilot_entry_ = true;
+        locked_q_ = q;
+        cand_deadline_ = -1;
+        pilot_alive_total_ = total_in_;
+        state_ = State::COLLECT;
+        ++stats_pilot_syncs;
+        ++stats_sync_count;
+        std::cerr << "RDM" << (narrow_ ? "n" : "") << ": Sync (PILOT j="
+                  << j + 1 << " q=" << q << " boff=" << boff
+                  << " tau=" << tau << " cfo="
+                  << omega_ * RobustParams::SAMPLE_RATE
+                     / (2 * (value)M_PI) << " Hz) t="
+                  << (double)total_in_ / RobustParams::SAMPLE_RATE << "s"
+                  << std::endl;
+        return true;
+    }
 
     mesg_type mesg_[1 << 14];
     code_type code_[1 << 14];
@@ -865,6 +1009,7 @@ private:
             rows_done_ = 0;
             tried_mask_ = 0;
             confirmed_ = false;
+            pilot_entry_ = false;
         }
         return best_kind;
     }
@@ -944,6 +1089,7 @@ private:
         state_ = State::SEARCH;
         rows_done_ = 0;
         confirmed_ = false;
+        pilot_entry_ = false;
         refresh_sums((int64_t)buf_.size() - 1);
     }
 

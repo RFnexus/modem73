@@ -40,6 +40,12 @@ Want to try out a demo of modem73 directly from your browser? Try it out here:
 https://rfnexus.github.io/modem73-wasm-demo/
 Hit "Start microphone" to begin decoding
 
+
+### Windows?
+Experimental Windows fork: https://github.com/RFnexus/modem73-win | Releases: https://github.com/RFnexus/modem73-win/releases/
+
+It's recommended to use modem73 with [WSL](https://learn.microsoft.com/en-us/windows/wsl/install) instead 
+
 ## Building from source
 
 ### Linux
