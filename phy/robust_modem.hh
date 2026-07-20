@@ -379,6 +379,8 @@ public:
         nrows_top_ = RobustParams::nrows(modes_[nmodes_ - 1]);
         keep_ = (size_t)(nrows_top_ + 10) * RobustParams::SYM + 2 * D;
         {
+            // pilot patterns for mid-frame acquisition: same MLS stream the
+            // encoder feeds into every 4th row
             CODE::MLS ps(0x163, narrow_ ? 89 : 1);
             npat_ = nrows_top_ / RobustParams::NS + 1;
             for (int j = 0; j < npat_; ++j)
@@ -428,6 +430,9 @@ public:
             scan_best_q_[i] = 0;
             scan_best_stamp_[i] = -1;
         }
+        pilot_hold_ = 0;
+        entry_pr_ = 0;
+        entry_checked_ = true;
     }
 
     void process(const float* samples, size_t count, FrameCallback callback) {
@@ -472,7 +477,8 @@ public:
                     Rb_ += norm(buf_[n]) - norm(buf_[n - D]);
                     Ra_ += norm(buf_[n - D]) - norm(buf_[n - 2 * D]);
                 }
-                if ((total_in_ % SCAN_STRIDE) == 0 && pilot_scan(n))
+                if (total_in_ >= pilot_hold_ &&
+                    (total_in_ % SCAN_STRIDE) == 0 && pilot_scan(n))
                     break;
                 value m = norm(P_) / (Ra_ * Rb_ + value(1e-9));
                 if (m > value(0.15)) {
@@ -544,7 +550,7 @@ public:
                     value s_om = omega_;
                     int s_bu = base_use_, s_rd = rows_done_;
                     unsigned s_tm = tried_mask_;
-                    bool s_cf = confirmed_;
+                    bool s_cf = confirmed_, s_pe = pilot_entry_;
                     peak_pos_ = cand_pos_;
                     bool stale = pilot_alive_total_ >= 0 &&
                                  total_in_ - pilot_alive_total_ >= PREEMPT_STALE;
@@ -561,7 +567,7 @@ public:
                     frame_pos_ = s_fp; anchor_u_ = s_au; peak_pos_ = s_pp;
                     omega_ = s_om; base_use_ = s_bu;
                     rows_done_ = s_rd; tried_mask_ = s_tm;
-                    confirmed_ = s_cf;
+                    confirmed_ = s_cf; pilot_entry_ = s_pe;
                 }
                 while (rows_done_ < nrows_top_) {
                     int64_t start = row_start(rows_done_);
@@ -569,6 +575,28 @@ public:
                         break;
                     take_row(rows_done_, start);
                     ++rows_done_;
+                    if (pilot_entry_ && !entry_checked_ &&
+                        rows_done_ == RobustParams::NS * entry_pr_ + 1) {
+                        // a pilot entry commits to a frame grid derived from
+                        // three differential hits; re-verify against the
+                        // demodulated pilot rows around the entry point (the
+                        // head rows may legitimately be noise on a late
+                        // join, so the row-0/row-8 sanity gates stay off)
+                        entry_checked_ = true;
+                        if (!pilot_window_live(entry_pr_, 3,
+                                               nc_ <= 8 ? 0.45f : 0.28f)) {
+                            std::cerr << "RDM" << (narrow_ ? "n" : "")
+                                      << ": pilot entry rejected"
+                                      << std::endl;
+                            state_ = State::SEARCH;
+                            rows_done_ = 0;
+                            confirmed_ = false;
+                            pilot_entry_ = false;
+                            pilot_hold_ = total_in_ + 8 * D;
+                            ++stats_false_locks;
+                            break;
+                        }
+                    }
                     if ((rows_done_ - 1) % RobustParams::NS == 0) {
                         int pr = (rows_done_ - 1) / RobustParams::NS;
                         int wrows = nc_ <= 8 ? 48 : 12;
@@ -745,7 +773,9 @@ private:
     int8_t post_[RobustParams::NC_MAX];
     bool seq_init_ = false;
 
-    // mid-frame acquisition off the pilot rows 
+    // mid-frame acquisition off the pilot rows: a symbol-length FFT every
+    // SCAN_STRIDE samples, differentially matched (this pilot row against the
+    // one 4 symbols earlier) so channel phase and window timing cancel
     static constexpr int SCAN_STRIDE = 240;
     static constexpr int SCAN_PAIR = 4 * RobustParams::SYM / SCAN_STRIDE;
     static constexpr int SCAN_RING = SCAN_PAIR + 1;
@@ -762,6 +792,9 @@ private:
     value scan_best_q_[SCAN_HIST];
     int64_t scan_best_stamp_[SCAN_HIST];
     bool pilot_entry_ = false;
+    int entry_pr_ = 0;
+    bool entry_checked_ = true;
+    int64_t pilot_hold_ = 0;
 
     void scan_fft(int64_t start, cmplx* bins) {
         cmplx tdom[RobustParams::NFFT], fdom[RobustParams::NFFT];
@@ -785,7 +818,11 @@ private:
         int prev = (slot + SCAN_RING - SCAN_PAIR) % SCAN_RING;
         if (scan_stamp_[prev] != total_in_ - 4 * D)
             return false;
-        value best_q = 0;
+        value p[RobustParams::NC_MAX + 4];
+        for (int k = 0; k < nc_ + 4; ++k)
+            p[k] = abs(scan_bins_[slot][k] * conj(scan_bins_[prev][k]));
+        value gate = nc_ <= 8 ? value(0.78) : value(0.60);
+        value best_q = 0, best_r = value(1e9);
         int best_j = -1, best_b = 0;
         for (int b = -2; b <= 2; ++b) {
             if (base_ + b < 2 ||
@@ -796,21 +833,39 @@ private:
             for (int k = 0; k < nc_; ++k) {
                 d[k] = scan_bins_[slot][2 + b + k]
                      * conj(scan_bins_[prev][2 + b + k]);
-                pw += abs(d[k]);
+                pw += p[2 + b + k];
             }
             if (pw < value(1e-12))
                 continue;
+            value qb = 0;
+            int jb = -1;
             for (int j = 0; j + 1 < npat_; ++j) {
                 cmplx s(0, 0);
                 for (int k = 0; k < nc_; ++k)
                     s = s + (value)qpat_[j][k] * d[k];
                 value q = abs(s) / pw;
-                if (q > best_q) {
-                    best_q = q; best_j = j; best_b = b;
+                if (q > qb) {
+                    qb = q; jb = j;
                 }
             }
+            value out = 0;
+            for (int k = 0; k < nc_ + 4; ++k)
+                if (k < 2 + b || k >= 2 + b + nc_)
+                    out = std::max(out, p[k]);
+            value rb = out / (pw / nc_ + value(1e-12));
+            // the (j, b) match is degenerate under translation: shifting the
+            // bin hypothesis shifts the MLS chip index onto another equally
+            // valid pattern (the qpat_ products are all segments of one
+            // m-sequence), so a +-1/2 bin alias scores the same q at a wrong
+            // j.  Only the band edges break the symmetry: the alias leaves
+            // pilot power in a bin outside its hypothesis band, so among
+            // gate-passing candidates the cleanest edges win.
+            bool better = qb > gate && best_q > gate ? rb < best_r
+                                                     : qb > best_q;
+            if (better) {
+                best_q = qb; best_j = jb; best_b = b; best_r = rb;
+            }
         }
-        value gate = nc_ <= 8 ? value(0.78) : value(0.60);
         bool fire = false;
         int h1 = (hslot + SCAN_HIST - SCAN_PAIR) % SCAN_HIST;
         int h2 = (hslot + SCAN_HIST - 2 * SCAN_PAIR) % SCAN_HIST;
@@ -820,7 +875,8 @@ private:
             scan_best_j_[h1] == best_j - 1 && scan_best_b_[h1] == best_b &&
             scan_best_q_[h2] > gate &&
             scan_best_stamp_[h2] == total_in_ - 8 * D &&
-            scan_best_j_[h2] == best_j - 2 && scan_best_b_[h2] == best_b)
+            scan_best_j_[h2] == best_j - 2 && scan_best_b_[h2] == best_b &&
+            best_r < value(0.6))
             fire = pilot_enter(best_j, best_b, u_buf, best_q);
         scan_best_j_[hslot] = best_j;
         scan_best_b_[hslot] = best_b;
@@ -838,14 +894,36 @@ private:
         for (int k = 0; k + 1 < nc_; ++k)
             s = s + d2[k + 1] * conj(d2[k]);
         value tau = -arg(s) * RobustParams::NFFT / (2 * (value)M_PI);
-        int64_t u = u_buf + (int64_t)std::lround(tau) - 96;
+        // tau resolves timing mod NFFT, but the scan window lands anywhere
+        // in the SYM-long symbol cycle: offsets past NFFT/2 wrap and would
+        // put the row grid a full FFT length off.  Test the shifted
+        // candidates one pilot period back (fully inside the buffer) and
+        // keep the one the cyclic prefix actually correlates at.
+        int64_t u0 = u_buf + (int64_t)std::lround(tau) - 96;
+        int64_t u = -1;
+        value best_m = -1;
+        for (int c = -1; c <= 1; ++c) {
+            int64_t uc = u0 + c * RobustParams::NFFT;
+            if (uc - 4 * D - D - RobustParams::CP < 0)
+                continue;
+            value m = abs(cp_corr(uc - 4 * D, 112, 192));
+            if (m > best_m) {
+                best_m = m;
+                u = uc;
+            }
+        }
+        if (u < 0)
+            return false;
         int64_t fp = u - (int64_t)(4 * (j + 1)) * RobustParams::SYM;
         if (fp < 0 || u - D - RobustParams::CP < 0)
             return false;
         const value bin_step = 2 * (value)M_PI * RobustParams::SPACING
                              / RobustParams::SAMPLE_RATE;
-        omega_ = arg(cp_corr(u, 112, 192)) / (value)RobustParams::NFFT
+        omega_ = arg(cp_corr(u - 4 * D, 112, 192)) / (value)RobustParams::NFFT
                + boff * bin_step;
+        base_use_ = base_;
+        entry_pr_ = j + 1;
+        entry_checked_ = false;
         frame_pos_ = fp;
         anchor_u_ = fp - D;
         rows_done_ = 0;
