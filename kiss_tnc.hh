@@ -113,6 +113,8 @@ struct TNCConfig {
     
     // RX decoder settings
     bool mfsk_rx_enabled = true;
+    bool ofdm_rx_enabled = true;
+    bool robust_rx_enabled = true;
 
     // Fragmentation settings
     bool fragmentation_enabled = false;

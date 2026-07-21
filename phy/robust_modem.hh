@@ -433,6 +433,7 @@ public:
         pilot_hold_ = 0;
         entry_pr_ = 0;
         entry_checked_ = true;
+        trail_anchor_ = -1;
     }
 
     void process(const float* samples, size_t count, FrameCallback callback) {
@@ -554,7 +555,8 @@ public:
                     peak_pos_ = cand_pos_;
                     bool stale = pilot_alive_total_ >= 0 &&
                                  total_in_ - pilot_alive_total_ >= PREEMPT_STALE;
-                    if (lock() == 1 && (lock_q_ > locked_q_ + value(0.08) || stale)) {
+                    int lk = lock();
+                    if (lk == 1 && (lock_q_ > locked_q_ + value(0.08) || stale)) {
                         std::cerr << "RDM" << (narrow_ ? "n" : "")
                                   << ": collect preempted (q=" << lock_q_
                                   << " over " << locked_q_
@@ -563,6 +565,12 @@ public:
                         pilot_alive_total_ = total_in_;
                         ++stats_false_locks;
                         break;
+                    }
+                    if (lk == 2) {
+                        // remember the trail seen mid-collect: if the ladder
+                        // exhausts it is a second chance to decode backward
+                        trail_anchor_ = anchor_u_;
+                        trail_omega_ = omega_;
                     }
                     frame_pos_ = s_fp; anchor_u_ = s_au; peak_pos_ = s_pp;
                     omega_ = s_om; base_use_ = s_bu;
@@ -638,7 +646,25 @@ public:
                             std::cerr << "RDM" << (narrow_ ? "n" : "")
                                       << ": ladder exhausted at "
                                       << rows_done_ << " rows" << std::endl;
-                            finish_frame(modes_[mi]);
+                            bool saved = false;
+                            if (trail_anchor_ >= 0) {
+                                int64_t s_fp2 = frame_pos_;
+                                anchor_u_ = trail_anchor_;
+                                omega_ = trail_omega_;
+                                saved = rescue_backward(callback);
+                                if (saved)
+                                    ++stats_rescues;
+                                else
+                                    frame_pos_ = s_fp2;
+                                trail_anchor_ = -1;
+                            }
+                            if (saved) {
+                                state_ = State::SEARCH;
+                                confirmed_ = false;
+                                pilot_entry_ = false;
+                            } else {
+                                finish_frame(modes_[mi]);
+                            }
                             done = true;
                         }
                         break;
@@ -795,6 +821,8 @@ private:
     int entry_pr_ = 0;
     bool entry_checked_ = true;
     int64_t pilot_hold_ = 0;
+    int64_t trail_anchor_ = -1;
+    value trail_omega_ = 0;
 
     void scan_fft(int64_t start, cmplx* bins) {
         cmplx tdom[RobustParams::NFFT], fdom[RobustParams::NFFT];
@@ -930,6 +958,7 @@ private:
         tried_mask_ = 0;
         confirmed_ = true;
         pilot_entry_ = true;
+        trail_anchor_ = -1;
         locked_q_ = q;
         cand_deadline_ = -1;
         pilot_alive_total_ = total_in_;
@@ -1088,6 +1117,7 @@ private:
             tried_mask_ = 0;
             confirmed_ = false;
             pilot_entry_ = false;
+            trail_anchor_ = -1;
         }
         return best_kind;
     }
@@ -1168,6 +1198,7 @@ private:
         rows_done_ = 0;
         confirmed_ = false;
         pilot_entry_ = false;
+        trail_anchor_ = -1;
         refresh_sums((int64_t)buf_.size() - 1);
     }
 
@@ -1432,9 +1463,27 @@ private:
             static mesg64_type mesg64[1 << 14];
             struct Attempt { int erase_frac; bool wide; };
             static const Attempt attempts[] = {
-                {8, false}, {4, false}, {0, true}, {4, true}};
+                {8, false}, {4, false}, {0, true}, {4, true},
+                {-1, false}, {-1, true}};
             for (const auto& at : attempts) {
-                int nerase = at.erase_frac ? std::max(1, ndrows / at.erase_frac) : 0;
+                int nerase;
+                if (at.erase_frac < 0) {
+                    // SNR-floor erasure: a fade null should contribute
+                    // erasures, not noise-level LLRs.  Erase every row whose
+                    // quality sits under 0.3x the frame median, however many
+                    // that is -- a multi-second fade can null more rows than
+                    // the fixed 1/8 and 1/4 fractions above can cover
+                    value med = drow_prec[order_idx[ndrows / 2]];
+                    value fl = value(0.3) * med;
+                    nerase = 0;
+                    while (nerase < ndrows &&
+                           drow_prec[order_idx[nerase]] < fl)
+                        ++nerase;
+                    if (nerase <= ndrows / 4 || nerase > ndrows * 2 / 5)
+                        continue;
+                } else {
+                    nerase = at.erase_frac ? std::max(1, ndrows / at.erase_frac) : 0;
+                }
                 std::memcpy(perm_, perm_raw, sizeof(code_type) * total_bits);
                 for (int e = 0; e < nerase; ++e) {
                     int r = order_idx[e];

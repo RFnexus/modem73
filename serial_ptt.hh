@@ -111,7 +111,7 @@ public:
     }
 
     bool ptt_off() {
-        if (fd_ < 0) return false;
+        if (fd_ < 0) return true;
 
         int flags;
         if (ioctl(fd_, TIOCMGET, &flags) < 0) return false;
