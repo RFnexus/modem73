@@ -279,6 +279,8 @@ public:
                                    config_.com_invert_dtr, 
                                    config_.com_invert_rts)) {
                 std::cerr << "Could not open COM port: " << serial_ptt_->last_error() << std::endl;
+                ui_log(std::string("(!) COM PTT: ") + serial_ptt_->last_error());
+                ui_log("(!) PTT will not key the radio - check COM port in settings");
             }
 #ifdef WITH_CM108
         } else if (config_.ptt_type == PTTType::CM108) {
@@ -338,7 +340,15 @@ public:
             std::cerr << "CSMA: disabled" << std::endl;
         }
         
-        std::cerr << "MFSK RX decoders: " << (config_.mfsk_rx_enabled ? "enabled" : "disabled") << std::endl;
+        std::cerr << "MFSK RX decoders: " << (config_.mfsk_rx_enabled ? "enabled" : "disabled (!) WARNING: MFSK frames will NOT be received") << std::endl;
+        std::cerr << "OFDM RX decoder: " << (config_.ofdm_rx_enabled ? "enabled" : "disabled (!) WARNING: OFDM frames will NOT be received") << std::endl;
+        std::cerr << "ROBUST RX decoders: " << (config_.robust_rx_enabled ? "enabled" : "disabled (!) WARNING: ROBUST frames will NOT be received") << std::endl;
+        if (!config_.mfsk_rx_enabled && config_.modem_type != 1)
+            ui_log("(!) MFSK RX decoding is disabled, MFSK frames will NOT be received");
+        if (!config_.ofdm_rx_enabled && config_.modem_type != 0)
+            ui_log("(!) OFDM RX decoding is disabled, OFDM frames will NOT be received");
+        if (!config_.robust_rx_enabled && config_.modem_type != 2)
+            ui_log("(!) ROBUST RX decoding is disabled, ROBUST frames will NOT be received");
         std::cerr << "Fragmentation: " << (config_.fragmentation_enabled ? "enabled" : "disabled") << std::endl;
         std::cerr << "TX Blanking: " << (config_.tx_blanking_enabled ? "enabled" : "disabled") << std::endl;
         
@@ -1323,18 +1333,24 @@ private:
                         was_blanking = false;
                     }
                     bool mfsk_rx = config_.mfsk_rx_enabled || config_.modem_type == 1;
-                    decoder_->process(buffer.data(), n, frame_callback);
+                    bool ofdm_rx = config_.ofdm_rx_enabled || config_.modem_type == 0;
+                    bool robust_rx = config_.robust_rx_enabled || config_.modem_type == 2;
+                    if (ofdm_rx)
+                        decoder_->process(buffer.data(), n, frame_callback);
                     if (mfsk_rx)
                         for (int i = 0; i < 3; ++i)
                             mfsk_decoders_[i]->process(buffer.data(), n, mfsk_callbacks[i]);
-                    robust_decoder_->process(buffer.data(), n, robust_frame_callback);
-                    robust_decoder_n_->process(buffer.data(), n, robust_n_frame_callback);
+                    if (robust_rx) {
+                        robust_decoder_->process(buffer.data(), n, robust_frame_callback);
+                        robust_decoder_n_->process(buffer.data(), n, robust_n_frame_callback);
+                    }
 
                     // sync DCD: OFDM meta-validated in_frame and pilot-confirmed
                     // RDM collects only; MFSK syncs are too loose to gate TX on
-                    dcd_active_ = decoder_->in_frame() ||
-                                  robust_decoder_->carrier_active() ||
-                                  robust_decoder_n_->carrier_active();
+                    dcd_active_ = (ofdm_rx && decoder_->in_frame()) ||
+                                  (robust_rx &&
+                                   (robust_decoder_->carrier_active() ||
+                                    robust_decoder_n_->carrier_active()));
                     if (dcd_active_)
                         set_tx_lockout(RX_LOCKOUT_SECONDS);
                 }
@@ -1410,12 +1426,22 @@ private:
         }
         if (on) {
             ptt_state_.store(true);
+            if (!ok && !ptt_fail_logged_) {
+                ptt_fail_logged_ = true;
+                ui_log("(!) PTT key failed - radio is NOT transmitting, check PTT settings");
+            }
         } else if (ok) {
             ptt_state_.store(false);
             ptt_deadline_ms_.store(0);
-        } else {
+            ptt_unkey_retries_ = 0;
+        } else if (++ptt_unkey_retries_ < 5) {
             ptt_state_.store(true);
             ptt_deadline_ms_.store(steady_now_ms() + 1000);
+        } else {
+            ptt_state_.store(false);
+            ptt_deadline_ms_.store(0);
+            ptt_unkey_retries_ = 0;
+            ui_log("(!) PTT unkey failed repeatedly - check the radio is not stuck in TX");
         }
 
 #ifdef WITH_UI
@@ -1538,6 +1564,8 @@ private:
 
     std::mutex ptt_mutex_;
     std::atomic<bool> ptt_state_{false};
+    bool ptt_fail_logged_ = false;
+    int ptt_unkey_retries_ = 0;
     std::atomic<int64_t> ptt_deadline_ms_{0};
     static constexpr int64_t PTT_WATCHDOG_SLACK_MS = 5000;
 
@@ -1647,6 +1675,9 @@ public:
             config_.csma_burst = new_config.csma_burst;
             config_.tx_lead_tone = new_config.tx_lead_tone;
             config_.tx_blanking_enabled = new_config.tx_blanking_enabled;
+            config_.mfsk_rx_enabled = new_config.mfsk_rx_enabled;
+            config_.ofdm_rx_enabled = new_config.ofdm_rx_enabled;
+            config_.robust_rx_enabled = new_config.robust_rx_enabled;
             if (config_.tx_drive != new_config.tx_drive) {
                 config_.tx_drive = new_config.tx_drive;
                 if (audio_) audio_->set_tx_gain(config_.tx_drive);
@@ -1909,6 +1940,8 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
         else if (!strcmp(key, "rx_filter_enabled") && take(key)) config.rx_filter_enabled = atoi(value) != 0;
         else if (!strcmp(key, "postamble") && take(key)) config.postamble = atoi(value) != 0;
         else if (!strcmp(key, "mfsk_rx_enabled") && take(key)) config.mfsk_rx_enabled = atoi(value) != 0;
+        else if (!strcmp(key, "ofdm_rx_enabled") && take(key)) config.ofdm_rx_enabled = atoi(value) != 0;
+        else if (!strcmp(key, "robust_rx_enabled") && take(key)) config.robust_rx_enabled = atoi(value) != 0;
         else if (!strcmp(key, "csma_enabled") && take(key)) config.csma_enabled = atoi(value) != 0;
         else if (!strcmp(key, "carrier_threshold_db") && take(key)) config.carrier_threshold_db = atof(value);
         else if (!strcmp(key, "slot_time_ms") && take(key)) config.slot_time_ms = atoi(value);
@@ -1990,6 +2023,10 @@ void print_help(const char* prog) {
               << "\nRX decoder options:\n"
               << "  --no-mfsk-rx            Disable the 3 always-on MFSK RX decoders to save CPU\n"
               << "                          (ignored while an MFSK mode is selected for TX)\n"
+              << "  --no-ofdm-rx            Disable the OFDM RX decoder to save CPU\n"
+              << "                          (ignored while an OFDM mode is selected for TX)\n"
+              << "  --no-robust-rx          Disable the 2 ROBUST (RDM) RX decoders to save CPU\n"
+              << "                          (ignored while a ROBUST mode is selected for TX)\n"
               << "\nCSMA options:\n"
               << "  --no-csma               Disable CSMA carrier sense\n"
               << "  --csma-threshold DB     Carrier sense threshold (default: -30)\n"
@@ -2222,6 +2259,12 @@ int main(int argc, char** argv) {
         } else if (arg == "--no-mfsk-rx") {
             config.mfsk_rx_enabled = false;
             cli_set.insert("mfsk_rx_enabled");
+        } else if (arg == "--no-ofdm-rx") {
+            config.ofdm_rx_enabled = false;
+            cli_set.insert("ofdm_rx_enabled");
+        } else if (arg == "--no-robust-rx") {
+            config.robust_rx_enabled = false;
+            cli_set.insert("robust_rx_enabled");
         } else if (arg == "--no-csma") {
             config.csma_enabled = false;
             cli_set.insert("csma_enabled");
@@ -2359,6 +2402,12 @@ int main(int argc, char** argv) {
                     config.fragmentation_enabled = ui_state.fragmentation_enabled;
                 if (!cli_set.count("tx_blanking_enabled"))
                     config.tx_blanking_enabled = ui_state.tx_blanking_enabled;
+                if (!cli_set.count("ofdm_rx_enabled"))
+                    config.ofdm_rx_enabled = ui_state.ofdm_rx_enabled;
+                if (!cli_set.count("robust_rx_enabled"))
+                    config.robust_rx_enabled = ui_state.robust_rx_enabled;
+                if (!cli_set.count("mfsk_rx_enabled"))
+                    config.mfsk_rx_enabled = ui_state.mfsk_rx_enabled;
                 // Audio devices
                 if (!cli_set.count("audio_input"))
                     config.audio_input_device = ui_state.audio_input_device;
@@ -2435,6 +2484,9 @@ int main(int argc, char** argv) {
                 ui_state.postamble = config.postamble;
                 ui_state.fragmentation_enabled = config.fragmentation_enabled;
                 ui_state.tx_blanking_enabled = config.tx_blanking_enabled;
+                ui_state.ofdm_rx_enabled = config.ofdm_rx_enabled;
+                ui_state.robust_rx_enabled = config.robust_rx_enabled;
+                ui_state.mfsk_rx_enabled = config.mfsk_rx_enabled;
                 // Audio devices
                 ui_state.audio_input_device = config.audio_input_device;
                 ui_state.audio_output_device = config.audio_output_device;
@@ -2547,6 +2599,9 @@ int main(int argc, char** argv) {
         // Sync fragmentation setting from command line to UI
         ui_state.fragmentation_enabled = config.fragmentation_enabled;
         ui_state.tx_blanking_enabled = config.tx_blanking_enabled;
+        ui_state.ofdm_rx_enabled = config.ofdm_rx_enabled;
+        ui_state.robust_rx_enabled = config.robust_rx_enabled;
+        ui_state.mfsk_rx_enabled = config.mfsk_rx_enabled;
 
         ui_state.update_modem_info();
         
@@ -2708,6 +2763,8 @@ int main(int argc, char** argv) {
                 cJSON_AddBoolToObject(j, "tx_blanking_enabled", cfg.tx_blanking_enabled);
                 cJSON_AddBoolToObject(j, "fragmentation_enabled", cfg.fragmentation_enabled);
                 cJSON_AddBoolToObject(j, "mfsk_rx_enabled", cfg.mfsk_rx_enabled);
+                cJSON_AddBoolToObject(j, "ofdm_rx_enabled", cfg.ofdm_rx_enabled);
+                cJSON_AddBoolToObject(j, "robust_rx_enabled", cfg.robust_rx_enabled);
 
                 return j;
             };
@@ -2762,6 +2819,12 @@ int main(int argc, char** argv) {
                     new_config.tx_blanking_enabled = cJSON_IsTrue(item);
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "fragmentation_enabled")) && cJSON_IsBool(item))
                     new_config.fragmentation_enabled = cJSON_IsTrue(item);
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "mfsk_rx_enabled")) && cJSON_IsBool(item))
+                    new_config.mfsk_rx_enabled = cJSON_IsTrue(item);
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "ofdm_rx_enabled")) && cJSON_IsBool(item))
+                    new_config.ofdm_rx_enabled = cJSON_IsTrue(item);
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "robust_rx_enabled")) && cJSON_IsBool(item))
+                    new_config.robust_rx_enabled = cJSON_IsTrue(item);
 
                 tnc.update_config(new_config);
 
@@ -2781,6 +2844,9 @@ int main(int argc, char** argv) {
                     g_ui_state->slot_time_ms = new_config.slot_time_ms;
                     g_ui_state->tx_blanking_enabled = new_config.tx_blanking_enabled;
                     g_ui_state->fragmentation_enabled = new_config.fragmentation_enabled;
+                    g_ui_state->ofdm_rx_enabled = new_config.ofdm_rx_enabled;
+                    g_ui_state->robust_rx_enabled = new_config.robust_rx_enabled;
+                    g_ui_state->mfsk_rx_enabled = new_config.mfsk_rx_enabled;
 
                     // Map modulation string back to index
                     for (size_t i = 0; i < MODULATION_OPTIONS.size(); i++) {
@@ -2845,6 +2911,9 @@ int main(int argc, char** argv) {
                 new_config.tx_lead_tone = state.tx_lead_tone;
                 new_config.fragmentation_enabled = state.fragmentation_enabled;
                 new_config.tx_blanking_enabled = state.tx_blanking_enabled;
+                new_config.ofdm_rx_enabled = state.ofdm_rx_enabled;
+                new_config.robust_rx_enabled = state.robust_rx_enabled;
+                new_config.mfsk_rx_enabled = state.mfsk_rx_enabled;
                 new_config.tx_drive = state.tx_drive;
                 new_config.audio_input_device = state.audio_input_device;
                 new_config.audio_output_device = state.audio_output_device;

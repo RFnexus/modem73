@@ -172,6 +172,10 @@ struct TNCUIState {
     int center_freq = 1500;
     bool postamble = false;
 
+    bool ofdm_rx_enabled = true;
+    bool robust_rx_enabled = true;
+    bool mfsk_rx_enabled = true;
+
     bool csma_enabled = true;
     float carrier_threshold_db = -30.0f;
     int slot_time_ms = 500;
@@ -700,6 +704,9 @@ struct TNCUIState {
         fprintf(f, "csma_band=%d\n", csma_band);
         fprintf(f, "fragmentation_enabled=%d\n", fragmentation_enabled ? 1 : 0);
         fprintf(f, "tx_blanking_enabled=%d\n", tx_blanking_enabled ? 1 : 0);
+        fprintf(f, "ofdm_rx_enabled=%d\n", ofdm_rx_enabled ? 1 : 0);
+        fprintf(f, "robust_rx_enabled=%d\n", robust_rx_enabled ? 1 : 0);
+        fprintf(f, "mfsk_rx_enabled=%d\n", mfsk_rx_enabled ? 1 : 0);
         fprintf(f, "# Audio/PTT\n");
         fprintf(f, "audio_input=%s\n", audio_input_device.c_str());
         fprintf(f, "audio_output=%s\n", audio_output_device.c_str());
@@ -788,6 +795,9 @@ struct TNCUIState {
                 else if (strcmp(key, "csma_band") == 0) csma_band = atoi(value) != 0 ? 1 : 0;
                 else if (strcmp(key, "fragmentation_enabled") == 0) fragmentation_enabled = atoi(value) != 0;
                 else if (strcmp(key, "tx_blanking_enabled") == 0) tx_blanking_enabled = atoi(value) != 0;
+                else if (strcmp(key, "ofdm_rx_enabled") == 0) ofdm_rx_enabled = atoi(value) != 0;
+                else if (strcmp(key, "robust_rx_enabled") == 0) robust_rx_enabled = atoi(value) != 0;
+                else if (strcmp(key, "mfsk_rx_enabled") == 0) mfsk_rx_enabled = atoi(value) != 0;
                 else if (strcmp(key, "audio_input") == 0) audio_input_device = value;
                 else if (strcmp(key, "audio_output") == 0) audio_output_device = value;
                 else if (strcmp(key, "audio_device") == 0) {
@@ -1237,6 +1247,8 @@ public:
             }
             tick_auto_send();
             draw();
+            if (rx_off_dialog_field_ >= 0)
+                draw_rx_off_dialog();
             refresh();
             std::this_thread::sleep_for(std::chrono::milliseconds(33));
         }
@@ -1277,6 +1289,9 @@ private:
         FIELD_CSMA_INFO,
         FIELD_FRAGMENTATION,
         FIELD_TX_BLANKING,
+        FIELD_RX_OFDM,
+        FIELD_RX_ROBUST,
+        FIELD_RX_MFSK,
         FIELD_AUDIO_INPUT,
         FIELD_AUDIO_OUTPUT,
         FIELD_PTT_TYPE,
@@ -1318,6 +1333,24 @@ private:
     }
 
     void handle_input(int ch) {
+        if (rx_off_dialog_field_ >= 0) {
+            if (ch == 'y' || ch == 'Y' || ch == '\n' || ch == KEY_ENTER) {
+                bool* flag = rx_dialog_flag();
+                if (flag) {
+                    *flag = false;
+                    apply_settings();
+                    state_.add_log(std::string("(!) ") + rx_dialog_name() +
+                                   " RX decoding disabled");
+                    if (rx_field_modem(rx_off_dialog_field_) == state_.modem_type_index)
+                        state_.add_log(std::string("(!) ") + rx_dialog_name() +
+                                       " decoder stays on while it is the TX mode");
+                }
+                rx_off_dialog_field_ = -1;
+            } else if (ch == 'n' || ch == 'N' || ch == 27 || ch == 'q') {
+                rx_off_dialog_field_ = -1;
+            }
+            return;
+        }
         if (ch == KEY_MOUSE) {
             MEVENT event;
             if (getmouse(&event) == OK) {
@@ -1959,6 +1992,13 @@ private:
         if (field == FIELD_TX_BLANKING) return row;
         row += 2;
         row++;
+        if (field == FIELD_RX_OFDM) return row;
+        row++;
+        if (field == FIELD_RX_ROBUST) return row;
+        row++;
+        if (field == FIELD_RX_MFSK) return row;
+        row += 2;
+        row++;
         if (field == FIELD_AUDIO_INPUT) return row;
         row++;
         if (field == FIELD_AUDIO_OUTPUT) return row;
@@ -2115,6 +2155,15 @@ private:
                 state_.tx_blanking_enabled = !state_.tx_blanking_enabled;
                 apply_settings();
                 state_.add_log(std::string("TX blanking ") + (state_.tx_blanking_enabled ? "enabled" : "disabled"));
+                break;
+            case FIELD_RX_OFDM:
+                toggle_rx_decoder(state_.ofdm_rx_enabled, "OFDM");
+                break;
+            case FIELD_RX_ROBUST:
+                toggle_rx_decoder(state_.robust_rx_enabled, "ROBUST");
+                break;
+            case FIELD_RX_MFSK:
+                toggle_rx_decoder(state_.mfsk_rx_enabled, "MFSK");
                 break;
             case FIELD_AUDIO_INPUT:
                 break;
@@ -3675,7 +3724,39 @@ private:
         dy = visible_y(row);
         if (dy >= 0) draw_toggle_field(dy, c1, c2, "Enabled", FIELD_TX_BLANKING, state_.tx_blanking_enabled);
         row += 2;
-        
+
+        dy = visible_y(row);
+        if (dy >= 0) {
+            attron(A_DIM);
+            mvaddstr(dy, c1, "RX DECODERS");
+            attroff(A_DIM);
+        }
+        row++;
+
+        dy = visible_y(row);
+        if (dy >= 0) {
+            draw_toggle_field(dy, c1, c2, "OFDM", FIELD_RX_OFDM, state_.ofdm_rx_enabled);
+            if (!state_.ofdm_rx_enabled && state_.modem_type_index == 0)
+                draw_rx_forced(dy, c2);
+        }
+        row++;
+
+        dy = visible_y(row);
+        if (dy >= 0) {
+            draw_toggle_field(dy, c1, c2, "ROBUST", FIELD_RX_ROBUST, state_.robust_rx_enabled);
+            if (!state_.robust_rx_enabled && state_.modem_type_index == 2)
+                draw_rx_forced(dy, c2);
+        }
+        row++;
+
+        dy = visible_y(row);
+        if (dy >= 0) {
+            draw_toggle_field(dy, c1, c2, "MFSK", FIELD_RX_MFSK, state_.mfsk_rx_enabled);
+            if (!state_.mfsk_rx_enabled && state_.modem_type_index == 1)
+                draw_rx_forced(dy, c2);
+        }
+        row += 2;
+
         // Audio / ptt
 
         dy = visible_y(row);
@@ -5679,6 +5760,79 @@ private:
     std::atomic<bool> running_{false};
     int current_tab_ = 0;
     int current_field_ = 0;
+    int rx_off_dialog_field_ = -1;
+
+    bool* rx_dialog_flag() {
+        switch (rx_off_dialog_field_) {
+            case FIELD_RX_OFDM: return &state_.ofdm_rx_enabled;
+            case FIELD_RX_ROBUST: return &state_.robust_rx_enabled;
+            case FIELD_RX_MFSK: return &state_.mfsk_rx_enabled;
+        }
+        return nullptr;
+    }
+
+    const char* rx_dialog_name() {
+        switch (rx_off_dialog_field_) {
+            case FIELD_RX_OFDM: return "OFDM";
+            case FIELD_RX_ROBUST: return "ROBUST";
+            case FIELD_RX_MFSK: return "MFSK";
+        }
+        return "";
+    }
+
+    void draw_rx_forced(int dy, int c2) {
+        attron(COLOR_PAIR(4));
+        mvaddstr(dy, c2 + 10, "still on: current TX mode");
+        attroff(COLOR_PAIR(4));
+    }
+
+    int rx_field_modem(int field) {
+        switch (field) {
+            case FIELD_RX_OFDM: return 0;
+            case FIELD_RX_MFSK: return 1;
+            case FIELD_RX_ROBUST: return 2;
+        }
+        return -1;
+    }
+
+    void draw_rx_off_dialog() {
+        int rows, cols;
+        getmaxyx(stdscr, rows, cols);
+        bool active = rx_field_modem(rx_off_dialog_field_) == state_.modem_type_index;
+        int w = 56, h = active ? 11 : 8;
+        int y = (rows - h) / 2, x = (cols - w) / 2;
+        if (y < 0 || x < 0) return;
+        for (int i = 0; i < h; i++) {
+            move(y + i, x);
+            for (int j = 0; j < w; j++) addch(' ');
+        }
+        draw_box(y, x, h, w);
+        std::string name = rx_dialog_name();
+        attron(COLOR_PAIR(3) | A_BOLD);
+        mvaddstr(y + 1, x + 2, ("(!) DISABLE " + name + " RX DECODING?").c_str());
+        attroff(COLOR_PAIR(3) | A_BOLD);
+        mvaddstr(y + 3, x + 2, "This saves CPU performance, but disables ALL");
+        mvaddstr(y + 4, x + 2, ("reception of " + name + " frames until re-enabled.").c_str());
+        if (active) {
+            attron(COLOR_PAIR(4));
+            mvaddstr(y + 6, x + 2, ("NOTE: " + name + " is the current TX modem type, so").c_str());
+            mvaddstr(y + 7, x + 2, "its decoder keeps running until you switch modes.");
+            attroff(COLOR_PAIR(4));
+        }
+        attron(A_BOLD);
+        mvaddstr(y + h - 2, x + 2, "[Y] Disable        [N] Cancel");
+        attroff(A_BOLD);
+    }
+
+    void toggle_rx_decoder(bool& flag, const char* name) {
+        if (!flag) {
+            flag = true;
+            apply_settings();
+            state_.add_log(std::string(name) + " RX decoding enabled");
+        } else {
+            rx_off_dialog_field_ = current_field_;
+        }
+    }
     int config_scroll_ = 0;
     int log_scroll_ = 0;
     int utils_selection_ = 0;
