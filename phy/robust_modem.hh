@@ -1217,6 +1217,23 @@ private:
             else frame_pos_ = s_fp;
             trail_anchor_ = -1;
         }
+        for (int mi = 0; mi < nmodes_ && !saved; ++mi) {
+            RobustMode m = modes_[mi];
+            int n = RobustParams::nrows(m);
+            if (n <= rows_done_ || rows_done_ < n / 2)
+                continue;
+            for (int i = rows_done_; i < n; ++i)
+                for (int k = 0; k < nc_; ++k)
+                    rows_[i][k] = cmplx(0, 0);
+            if (try_decode(m, callback)) {
+                std::cerr << "RDM" << (narrow_ ? "n" : "")
+                          << ": tail rescue " << ROBUST_MODE_NAMES[(int)m]
+                          << " at " << rows_done_ << " rows" << std::endl;
+                ++stats_rescues;
+                finish_frame(m);
+                saved = true;
+            }
+        }
         if (!saved) {
             int64_t drop = pilot_alive_total_ >= 0
                 ? pilot_alive_total_ - (total_in_ - (int64_t)buf_.size())
