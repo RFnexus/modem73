@@ -524,6 +524,16 @@ public:
                 break;
             }
             case State::COLLECT: {
+                if (confirmed_ && pilot_alive_total_ >= 0 &&
+                    total_in_ - pilot_alive_total_ > COLLECT_STALE &&
+                    rows_done_ >= RobustParams::nrows(modes_[0])) {
+                    std::cerr << "RDM" << (narrow_ ? "n" : "")
+                              << ": carrier dropped, finalizing at "
+                              << rows_done_ << " rows" << std::endl;
+                    finalize_collect(callback);
+
+                    break;
+                }
                 if ((total_in_ & 0x3fff) == 0) {
                     refresh_sums(n);
                 } else {
@@ -646,25 +656,7 @@ public:
                             std::cerr << "RDM" << (narrow_ ? "n" : "")
                                       << ": ladder exhausted at "
                                       << rows_done_ << " rows" << std::endl;
-                            bool saved = false;
-                            if (trail_anchor_ >= 0) {
-                                int64_t s_fp2 = frame_pos_;
-                                anchor_u_ = trail_anchor_;
-                                omega_ = trail_omega_;
-                                saved = rescue_backward(callback);
-                                if (saved)
-                                    ++stats_rescues;
-                                else
-                                    frame_pos_ = s_fp2;
-                                trail_anchor_ = -1;
-                            }
-                            if (saved) {
-                                state_ = State::SEARCH;
-                                confirmed_ = false;
-                                pilot_entry_ = false;
-                            } else {
-                                finish_frame(modes_[mi]);
-                            }
+                            finalize_collect(callback);
                             done = true;
                         }
                         break;
@@ -823,6 +815,14 @@ private:
     int64_t pilot_hold_ = 0;
     int64_t trail_anchor_ = -1;
     value trail_omega_ = 0;
+
+
+
+
+
+
+
+    static constexpr int64_t COLLECT_STALE = 2 * DCD_GRACE;
 
     void scan_fft(int64_t start, cmplx* bins) {
         cmplx tdom[RobustParams::NFFT], fdom[RobustParams::NFFT];
@@ -1202,10 +1202,49 @@ private:
         refresh_sums((int64_t)buf_.size() - 1);
     }
 
-    bool rescue_backward(FrameCallback callback) {
+
+
+
+
+    void finalize_collect(FrameCallback& callback) {
+        bool saved = false;
+        if (trail_anchor_ >= 0) {
+            int64_t s_fp = frame_pos_;
+            anchor_u_ = trail_anchor_;
+            omega_ = trail_omega_;
+            saved = rescue_backward(callback, rows_done_);
+            if (saved) ++stats_rescues;
+            else frame_pos_ = s_fp;
+            trail_anchor_ = -1;
+        }
+        if (!saved) {
+            int64_t drop = pilot_alive_total_ >= 0
+                ? pilot_alive_total_ - (total_in_ - (int64_t)buf_.size())
+                : 0;
+            drop = std::min<int64_t>(std::max<int64_t>(drop, 0),
+                                     (int64_t)buf_.size());
+            if (drop > 0)
+                buf_.erase(buf_.begin(), buf_.begin() + (size_t)drop);
+            refresh_sums((int64_t)buf_.size() - 1);
+        }
+        state_ = State::SEARCH;
+        rows_done_ = 0;
+        confirmed_ = false;
+        pilot_entry_ = false;
+        trail_anchor_ = -1;
+        
+    }
+
+
+
+
+
+    bool rescue_backward(FrameCallback callback, int max_rows = 0) {
         for (int mi = 0; mi < nmodes_; ++mi) {
             RobustMode m = modes_[mi];
             int n = RobustParams::nrows(m);
+            if (max_rows > 0 && n > max_rows)
+                continue;
             int64_t row0 = anchor_u_ - D - (int64_t)n * RobustParams::SYM;
             // late join: head rows never captured decode as erasures, inside
             // the margin the rate-1/4 mother code leaves (RDM-800 already
@@ -1258,9 +1297,10 @@ private:
         const int total_bits = RobustParams::sent_bits(mode);
 
         CODE::MLS pilot_seq(0x163, narrow_ ? 89 : 1);
-        static cmplx chanP[RobustParams::NROWS_MAX / RobustParams::NS + 2]
+        // thread_local instead of static
+        static thread_local cmplx chanP[RobustParams::NROWS_MAX / RobustParams::NS + 2]
                           [RobustParams::NC_MAX];
-        static value pagree[RobustParams::NROWS_MAX / RobustParams::NS + 2];
+        static thread_local value pagree[RobustParams::NROWS_MAX / RobustParams::NS + 2];
         int pilot_row_of[RobustParams::NROWS_MAX];
         int npil = 0;
         for (int i = 0; i < nrows; ++i) {
@@ -1311,7 +1351,7 @@ private:
         }
         pagree[npil - 1] = 1;
 
-        static value cgate[RobustParams::NROWS_MAX / RobustParams::NS + 2]
+        static thread_local value cgate[RobustParams::NROWS_MAX / RobustParams::NS + 2]
                           [RobustParams::NC_MAX];
         for (int p = 0; p + 1 < npil; ++p) {
             value r[RobustParams::NC_MAX], srt[RobustParams::NC_MAX];
@@ -1336,8 +1376,8 @@ private:
         int kbit = 0;
         value snr_acc = 0, row_pwr = 0;
         int snr_rows = 0;
-        static int drow_start[RobustParams::NROWS_MAX];
-        static value drow_prec[RobustParams::NROWS_MAX];
+        static thread_local int drow_start[RobustParams::NROWS_MAX];
+        static thread_local value drow_prec[RobustParams::NROWS_MAX];
         int ndrows = 0;
         for (int i = 0; i < nrows && kbit < total_bits; ++i) {
             if (RobustParams::is_pilot_row(i))
@@ -1404,7 +1444,7 @@ private:
         if (row_pwr < value(1e-12))
             return false;
 
-        static code_type perm_raw[1 << 15];
+        static thread_local code_type perm_raw[1 << 15];
         std::memcpy(perm_raw, perm_, sizeof(code_type) * total_bits);
 
         const int crc_bits = RobustParams::mesg_bits(mode);
@@ -1418,7 +1458,7 @@ private:
                 }
             }
             if (poff) {
-                static code_type full[1 << 14];
+                static thread_local code_type full[1 << 14];
                 for (int i = 0; i < poff; ++i)
                     full[i] = 0;        // punctured head decodes as erasures
                 std::memcpy(full + poff, perm_,
@@ -1454,13 +1494,13 @@ private:
         bool decoded = scan(mesg_, polar_decoder_);
 
         if (!decoded && ndrows >= 8) {
-            static int order_idx[RobustParams::NROWS_MAX];
+            static thread_local int order_idx[RobustParams::NROWS_MAX];
             for (int i = 0; i < ndrows; ++i)
                 order_idx[i] = i;
             std::sort(order_idx, order_idx + ndrows, [&](int a, int b) {
                 return drow_prec[a] < drow_prec[b];
             });
-            static mesg64_type mesg64[1 << 14];
+            static thread_local mesg64_type mesg64[1 << 14];
             struct Attempt { int erase_frac; bool wide; };
             static const Attempt attempts[] = {
                 {8, false}, {4, false}, {0, true}, {4, true},
