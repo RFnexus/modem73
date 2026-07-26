@@ -558,6 +558,7 @@ public:
                 if (cand_deadline_ >= 0 && n >= cand_deadline_) {
                     cand_deadline_ = -1;
                     int64_t s_fp = frame_pos_, s_au = anchor_u_, s_pp = peak_pos_;
+                    int64_t s_ta = trail_anchor_;
                     value s_om = omega_;
                     int s_bu = base_use_, s_rd = rows_done_;
                     unsigned s_tm = tried_mask_;
@@ -571,9 +572,44 @@ public:
                                   << ": collect preempted (q=" << lock_q_
                                   << " over " << locked_q_
                                   << (stale ? ", stale" : "") << ")" << std::endl;
+                        bool rescued = false;
+                        if (s_ta >= 0) {
+                            int64_t n_fp = frame_pos_, n_au = anchor_u_;
+                            value n_om = omega_;
+                            anchor_u_ = s_ta;
+                            omega_ = trail_omega_;
+                            rescued = rescue_backward(callback, s_rd, false);
+                            frame_pos_ = n_fp;
+                            anchor_u_ = n_au;
+                            omega_ = n_om;
+                        }
+                        if (!rescued && s_cf) {
+                            for (int mi = 0; mi < nmodes_ && !rescued; ++mi) {
+                                RobustMode rm = modes_[mi];
+                                int nr = RobustParams::nrows(rm);
+                                if (nr <= s_rd || s_rd < nr / 2)
+                                    continue;
+                                for (int i = s_rd; i < nr; ++i)
+                                    for (int k = 0; k < nc_; ++k)
+                                        rows_[i][k] = cmplx(0, 0);
+                                if (try_decode(rm, callback)) {
+                                    std::cerr << "RDM" << (narrow_ ? "n" : "")
+                                              << ": tail rescue "
+                                              << ROBUST_MODE_NAMES[(int)rm]
+                                              << " at " << s_rd << " rows"
+                                              << std::endl;
+                                    if (pilot_alive_total_ >= 0)
+                                        last_decode_total_ = pilot_alive_total_;
+                                    rescued = true;
+                                }
+                            }
+                        }
+                        if (rescued)
+                            ++stats_rescues;
+                        else
+                            ++stats_false_locks;
                         locked_q_ = lock_q_;
                         pilot_alive_total_ = total_in_;
-                        ++stats_false_locks;
                         break;
                     }
                     if (lk == 2) {
@@ -586,6 +622,8 @@ public:
                     omega_ = s_om; base_use_ = s_bu;
                     rows_done_ = s_rd; tried_mask_ = s_tm;
                     confirmed_ = s_cf; pilot_entry_ = s_pe;
+                    if (lk != 2)
+                        trail_anchor_ = s_ta;
                 }
                 while (rows_done_ < nrows_top_) {
                     int64_t start = row_start(rows_done_);
@@ -1208,13 +1246,18 @@ private:
 
     void finalize_collect(FrameCallback& callback) {
         bool saved = false;
+        bool trail_saved = false;
         if (trail_anchor_ >= 0) {
             int64_t s_fp = frame_pos_;
             anchor_u_ = trail_anchor_;
             omega_ = trail_omega_;
             saved = rescue_backward(callback, rows_done_);
-            if (saved) ++stats_rescues;
-            else frame_pos_ = s_fp;
+            if (saved) {
+                ++stats_rescues;
+                trail_saved = true;
+            } else {
+                frame_pos_ = s_fp;
+            }
             trail_anchor_ = -1;
         }
         for (int mi = 0; mi < nmodes_ && !saved; ++mi) {
@@ -1230,11 +1273,12 @@ private:
                           << ": tail rescue " << ROBUST_MODE_NAMES[(int)m]
                           << " at " << rows_done_ << " rows" << std::endl;
                 ++stats_rescues;
-                finish_frame(m);
+                if (pilot_alive_total_ >= 0)
+                    last_decode_total_ = pilot_alive_total_;
                 saved = true;
             }
         }
-        if (!saved) {
+        if (saved && !trail_saved) {
             int64_t drop = pilot_alive_total_ >= 0
                 ? pilot_alive_total_ - (total_in_ - (int64_t)buf_.size())
                 : 0;
@@ -1256,7 +1300,8 @@ private:
 
 
 
-    bool rescue_backward(FrameCallback callback, int max_rows = 0) {
+    bool rescue_backward(FrameCallback callback, int max_rows = 0,
+                         bool consume = true) {
         for (int mi = 0; mi < nmodes_; ++mi) {
             RobustMode m = modes_[mi];
             int n = RobustParams::nrows(m);
@@ -1292,13 +1337,17 @@ private:
                           << ": backward rescue " << ROBUST_MODE_NAMES[(int)m]
                           << (missing ? " (late join)" : "")
                           << std::endl;
-                int64_t end = anchor_u_ + RobustParams::NFFT;
-                if (end > 0 && (size_t)end <= buf_.size())
-                    buf_.erase(buf_.begin(), buf_.begin() + (size_t)end);
-                else
-                    buf_.clear();
-                rows_done_ = 0;
-                refresh_sums((int64_t)buf_.size() - 1);
+                last_decode_total_ = total_in_ - (int64_t)buf_.size()
+                                   + anchor_u_ + RobustParams::NFFT;
+                if (consume) {
+                    int64_t end = anchor_u_ + RobustParams::NFFT;
+                    if (end > 0 && (size_t)end <= buf_.size())
+                        buf_.erase(buf_.begin(), buf_.begin() + (size_t)end);
+                    else
+                        buf_.clear();
+                    rows_done_ = 0;
+                    refresh_sums((int64_t)buf_.size() - 1);
+                }
                 return true;
             }
         }
