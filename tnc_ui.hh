@@ -3969,12 +3969,13 @@ private:
 
 
         {
-            bool hf_ok = (state_.modem_type_index == 1) ||
+            bool robust = (state_.modem_type_index == 2);
+            bool hf_ok = robust || (state_.modem_type_index == 1) ||
                          (state_.modulation_index <= 2); // BPSK, QPSK, 8PSK
             mvaddstr(y, c3, "Band  ");
             if (hf_ok) {
                 attron(COLOR_PAIR(3) | A_BOLD);
-                addstr("HF/VHF");
+                addstr(robust ? "HF" : "HF/VHF");
                 attroff(COLOR_PAIR(3) | A_BOLD);
             } else {
                 attron(A_DIM);
