@@ -11,10 +11,18 @@
 MODEM73 is an open source software modem that works with any HF, VHF, or UHF radio capable of 2400 Hz of bandwidth. All you need is a sound card and audio cable for your radio.  
 
 ![Screenshot](https://i.ibb.co/4ZhhvcQs/Peek-2026-01-01-10-41.gif)
-<p>
-<img width="546" height="423" alt="image" src="https://github.com/user-attachments/assets/7180ab80-4386-4ee1-8029-42ca5300ef13" />
-<img width="276.5" height="199" alt="image" src="https://github.com/user-attachments/assets/5ac2a8bd-75a1-48a4-8264-74a851a06767" />
-</p>
+<table align="center">
+  <tr>
+    <td align="center"><img height="200" alt="modem73 on a UV-K6 with AIOC" src="https://github.com/user-attachments/assets/7180ab80-4386-4ee1-8029-42ca5300ef13" /></td>
+    <td align="center"><img height="200" alt="modem73 on a Xiegu X6100 with Armbian" src="https://github.com/user-attachments/assets/5ac2a8bd-75a1-48a4-8264-74a851a06767" /></td>
+    <td align="center"><img height="200" alt="modem73 over HF with an IC-7300" src="https://github.com/user-attachments/assets/27fe5f6d-3650-422b-ac52-3ca04b6b1469" /></td>
+  </tr>
+  <tr>
+    <td align="center"><sub>Running on a UV-K6 with an All-In-One Audio Cable (AIOC)</sub></td>
+    <td align="center"><sub>Running natively on a Xiegu X6100 with Armbian</sub></td>
+    <td align="center"><sub>Running over HF with an ICOM-7300</sub></td>
+  </tr>
+</table>
 
 
 
