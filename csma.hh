@@ -6,6 +6,7 @@
 
 struct CsmaConfig {
     float threshold_db = -30.0f;
+    bool sync_only = false;
     int poll_ms = 25;
     int quiet_ms = 1500;
     int cw = 8;
@@ -56,7 +57,7 @@ public:
             return Verdict::WAIT;
         }
         deaf_ms_ = 0;
-        if (!tx_allowed || level_db > cfg_.threshold_db) {
+        if (!tx_allowed || (!cfg_.sync_only && level_db > cfg_.threshold_db)) {
             idle_ms_ = 0;
             busy_ms_ += cfg_.poll_ms;
             if (busy_ms_ >= cfg_.busy_limit_ms) {

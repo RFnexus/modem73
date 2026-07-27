@@ -328,7 +328,9 @@ public:
         std::cerr << "Payload: " << payload_size_ << " bytes (including 2-byte length prefix)" << std::endl;
         
         if (config_.csma_enabled) {
-            std::cerr << "CSMA: enabled (threshold=" << config_.carrier_threshold_db
+            std::cerr << "CSMA: enabled ("
+                      << (config_.csma_sync_only ? "sync-only, " : "")
+                      << "threshold=" << config_.carrier_threshold_db
                       << " dB, slot=" << config_.slot_time_ms
                       << " ms, cw=" << config_.csma_cw
                       << ", quiet=" << (config_.csma_quiet_ms > 0
@@ -586,13 +588,14 @@ private:
                 }
 #endif
                 // CSMA
-                bool csma_enabled;
+                bool csma_enabled, csma_sync_only;
                 int carrier_sense_ms, slot_time_ms, csma_quiet_ms, csma_cw, csma_dither, csma_burst;
                 float carrier_threshold_db;
                 std::string csma_callsign;
                 {
                     std::lock_guard<std::mutex> lock(config_mutex_);
                     csma_enabled = config_.csma_enabled;
+                    csma_sync_only = config_.csma_sync_only;
                     carrier_sense_ms = config_.carrier_sense_ms;
                     carrier_threshold_db = config_.carrier_threshold_db;
                     slot_time_ms = config_.slot_time_ms;
@@ -623,6 +626,7 @@ private:
 
                     CsmaConfig gcfg;
                     gcfg.threshold_db = carrier_threshold_db;
+                    gcfg.sync_only = csma_sync_only;
                     gcfg.quiet_ms = csma_quiet_ms > 0 ? csma_quiet_ms : auto_quiet_ms();
                     gcfg.cw = csma_cw;
                     gcfg.slot_ms = slot_time_ms;
@@ -681,7 +685,8 @@ private:
                             std::cerr << "CSMA: no capture audio, holding TX" << std::endl;
                         }
                         was_deaf = !alive;
-                        bool busy = alive && (!allowed || level_db > carrier_threshold_db);
+                        bool busy = alive && (!allowed ||
+                            (!csma_sync_only && level_db > carrier_threshold_db));
                         if (busy && !was_busy) {
                             if (!allowed) {
                                 std::cerr << "CSMA: receiving, deferring" << std::endl;
@@ -1273,7 +1278,7 @@ private:
                     int64_t now_ms = steady_now_ms();
                     bool loud = audio_->instant_level_db(config_.carrier_sense_ms) >
                                 config_.carrier_threshold_db;
-                    bool occupied = loud || !is_tx_allowed();
+                    bool occupied = (loud && !config_.csma_sync_only) || !is_tx_allowed();
                     if (occupied || blanking)
                         last_channel_busy_ms_.store(now_ms);
                     if (occupied) {
@@ -1294,7 +1299,8 @@ private:
                         float dt = (now_ms - occ_last_ms_) / 1000.0f;
                         if (dt < 5.0f) {
                             float a = std::min(1.0f, dt / 30.0f);
-                            float x = (loud || blanking || dcd_active_) ? 1.0f : 0.0f;
+                            float x = ((loud && !config_.csma_sync_only) ||
+                                       blanking || dcd_active_) ? 1.0f : 0.0f;
                             occupancy_ema_ += (x - occupancy_ema_) * a;
                         }
                     }
@@ -1665,6 +1671,7 @@ public:
         std::lock_guard<std::mutex> lock(config_mutex_);
         {
             config_.csma_enabled = new_config.csma_enabled;
+            config_.csma_sync_only = new_config.csma_sync_only;
             config_.postamble = new_config.postamble;
             config_.carrier_threshold_db = new_config.carrier_threshold_db;
             config_.p_persistence = new_config.p_persistence;
@@ -1943,6 +1950,7 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
         else if (!strcmp(key, "ofdm_rx_enabled") && take(key)) config.ofdm_rx_enabled = atoi(value) != 0;
         else if (!strcmp(key, "robust_rx_enabled") && take(key)) config.robust_rx_enabled = atoi(value) != 0;
         else if (!strcmp(key, "csma_enabled") && take(key)) config.csma_enabled = atoi(value) != 0;
+        else if (!strcmp(key, "csma_sync_only") && take(key)) config.csma_sync_only = atoi(value) != 0;
         else if (!strcmp(key, "carrier_threshold_db") && take(key)) config.carrier_threshold_db = atof(value);
         else if (!strcmp(key, "slot_time_ms") && take(key)) config.slot_time_ms = atoi(value);
         else if (!strcmp(key, "csma_quiet_ms") && take(key)) config.csma_quiet_ms = atoi(value);
@@ -2382,6 +2390,7 @@ int main(int argc, char** argv) {
                 config.postamble = ui_state.postamble;
                 if (!cli_set.count("csma_enabled"))
                     config.csma_enabled = ui_state.csma_enabled;
+                config.csma_sync_only = ui_state.csma_sync_only;
                 if (!cli_set.count("carrier_threshold_db"))
                     config.carrier_threshold_db = ui_state.carrier_threshold_db;
                 if (!cli_set.count("slot_time_ms"))
@@ -2472,6 +2481,7 @@ int main(int argc, char** argv) {
                 ui_state.callsign = config.callsign;
                 ui_state.center_freq = config.center_freq;
                 ui_state.csma_enabled = config.csma_enabled;
+                ui_state.csma_sync_only = config.csma_sync_only;
                 ui_state.carrier_threshold_db = config.carrier_threshold_db;
                 ui_state.slot_time_ms = config.slot_time_ms;
                 ui_state.csma_quiet_ms = config.csma_quiet_ms;
@@ -2537,6 +2547,7 @@ int main(int argc, char** argv) {
         ui_state.frame_size = config.frame_size;
         ui_state.postamble = config.postamble;
         ui_state.csma_enabled = config.csma_enabled;
+        ui_state.csma_sync_only = config.csma_sync_only;
         ui_state.carrier_threshold_db = config.carrier_threshold_db;
         ui_state.slot_time_ms = config.slot_time_ms;
         ui_state.csma_quiet_ms = config.csma_quiet_ms;
@@ -2752,6 +2763,7 @@ int main(int argc, char** argv) {
                 cJSON_AddNumberToObject(j, "center_freq", cfg.center_freq);
                 cJSON_AddNumberToObject(j, "payload_size", tnc.get_payload_size());
                 cJSON_AddBoolToObject(j, "csma_enabled", cfg.csma_enabled);
+                cJSON_AddBoolToObject(j, "csma_sync_only", cfg.csma_sync_only);
                 cJSON_AddNumberToObject(j, "carrier_threshold_db", cfg.carrier_threshold_db);
                 cJSON_AddNumberToObject(j, "p_persistence", cfg.p_persistence);
                 cJSON_AddNumberToObject(j, "slot_time_ms", cfg.slot_time_ms);
@@ -2799,6 +2811,8 @@ int main(int argc, char** argv) {
                     new_config.postamble = cJSON_IsTrue(item);
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "csma_enabled")) && cJSON_IsBool(item))
                     new_config.csma_enabled = cJSON_IsTrue(item);
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "csma_sync_only")) && cJSON_IsBool(item))
+                    new_config.csma_sync_only = cJSON_IsTrue(item);
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "carrier_threshold_db")) && cJSON_IsNumber(item))
                     new_config.carrier_threshold_db = (float)item->valuedouble;
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "p_persistence")) && cJSON_IsNumber(item))
@@ -2839,6 +2853,7 @@ int main(int argc, char** argv) {
                     g_ui_state->frame_size = new_config.frame_size;
                     g_ui_state->postamble = new_config.postamble;
                     g_ui_state->csma_enabled = new_config.csma_enabled;
+                    g_ui_state->csma_sync_only = new_config.csma_sync_only;
                     g_ui_state->carrier_threshold_db = new_config.carrier_threshold_db;
                     g_ui_state->p_persistence = new_config.p_persistence;
                     g_ui_state->slot_time_ms = new_config.slot_time_ms;
@@ -2901,6 +2916,7 @@ int main(int argc, char** argv) {
                 new_config.frame_size = state.frame_size;
                 new_config.postamble = state.postamble;
                 new_config.csma_enabled = state.csma_enabled;
+                new_config.csma_sync_only = state.csma_sync_only;
                 new_config.carrier_threshold_db = state.carrier_threshold_db;
                 new_config.p_persistence = state.p_persistence;
                 new_config.slot_time_ms = state.slot_time_ms;

@@ -62,6 +62,7 @@ Stats switch between the OFDM, MFSK and RDM decoders based on active `modem_type
 | `short_frame` | bool | Short frame mode (OFDM only) |
 | `payload_size` | int | Current PHY payload capacity in bytes |
 | `csma_enabled` | bool | CSMA carrier sense enabled |
+| `csma_sync_only` | bool | Busy detection uses carrier sync (DCD) only, ignoring the audio level threshold |
 | `carrier_threshold_db` | float | CSMA threshold (dB) |
 | `p_persistence` | int | P-persistence value (0-255) |
 | `slot_time_ms` | int | CSMA slot time (ms) |
