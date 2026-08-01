@@ -697,10 +697,11 @@ struct TNCUIState {
     // Save settings
     bool save_settings() {
         if (config_file.empty()) return false;
-        
-        FILE* f = fopen(config_file.c_str(), "w");
+
+        std::string tmp = config_file + ".tmp";
+        FILE* f = fopen(tmp.c_str(), "w");
         if (!f) return false;
-        
+
         fprintf(f, "# MODEM73 Settings\n");
         fprintf(f, "callsign=%s\n", callsign.c_str());
         fprintf(f, "modem_type=%d\n", modem_type_index);
@@ -754,8 +755,11 @@ struct TNCUIState {
         fprintf(f, "# Utils\n");
         fprintf(f, "random_data_size=%d\n", random_data_size);
         fprintf(f, "utils_testing=%d\n", utils_testing_open ? 1 : 0);
-        
-        fclose(f);
+
+        if (fclose(f) != 0 || rename(tmp.c_str(), config_file.c_str()) != 0) {
+            remove(tmp.c_str());
+            return false;
+        }
         return true;
     }
     
@@ -882,9 +886,10 @@ struct TNCUIState {
     bool save_presets() {
         if (presets_file.empty()) return false;
         
-        FILE* f = fopen(presets_file.c_str(), "w");
+        std::string tmp = presets_file + ".tmp";
+        FILE* f = fopen(tmp.c_str(), "w");
         if (!f) return false;
-        
+
         fprintf(f, "# MODEM73 Presets \n");
         for (const auto& p : presets) {
             // 1=short, 0=normal, 2=long, 3=micro
@@ -907,8 +912,11 @@ struct TNCUIState {
                     p.robust_mode_index,
                     p.postamble ? 1 : 0);
         }
-        
-        fclose(f);
+
+        if (fclose(f) != 0 || rename(tmp.c_str(), presets_file.c_str()) != 0) {
+            remove(tmp.c_str());
+            return false;
+        }
         return true;
     }
     
@@ -1059,8 +1067,10 @@ struct TNCUIState {
         std::lock_guard<std::mutex> lock(log_mutex);
         auto now = std::chrono::system_clock::now();
         auto time = std::chrono::system_clock::to_time_t(now);
+        struct tm tmv;
+        localtime_r(&time, &tmv);
         std::stringstream ss;
-        ss << std::put_time(std::localtime(&time), "%H:%M:%S") << "  " << msg;
+        ss << std::put_time(&tmv, "%H:%M:%S") << "  " << msg;
         log_entries.push_back(ss.str());
         if (log_entries.size() > MAX_LOG_ENTRIES) {
             log_entries.pop_front();

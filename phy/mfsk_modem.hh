@@ -412,7 +412,7 @@ public:
                 const int range_back = MFSKParams::SYMBOL_LEN * 5 / 8;
                 const int range_fwd = MFSKParams::SYMBOL_LEN * 13 / 8;
                 if (!pending_sync_) {
-                    int p = step_count_ % 4;
+                    int p = (int)(step_count_ % 4);
                     bool ready = false;
                     for (int h = 0; h < FREQ_HYPS; ++h) {
                         float fh = (float)(FREQ_HYP_BASE + h);
@@ -700,7 +700,7 @@ private:
 
     enum class State { SEARCHING, COLLECTING };
     State state_ = State::SEARCHING;
-    int step_count_ = 0;
+    int64_t step_count_ = 0;
 
     int collect_count_ = 0;
     size_t collect_start_pos_ = 0;

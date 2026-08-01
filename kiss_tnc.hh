@@ -216,6 +216,10 @@ class PacketQueue {
 public:
     void push(T item) {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (queue_.size() >= 256) {
+            std::cerr << "TX queue full (256), dropping frame" << std::endl;
+            return;
+        }
         queue_.push(std::move(item));
     }
     
@@ -447,7 +451,10 @@ public:
         size_t data_per_frag = max_payload - Frag::HEADER_SIZE;
         size_t num_frags = (data.size() + data_per_frag - 1) / data_per_frag;
         if (num_frags > 255) {
-            num_frags = 255;
+            std::cerr << "Fragmenter: packet too large (" << data.size()
+                      << " bytes for " << data_per_frag
+                      << " byte fragments), dropped" << std::endl;
+            return {};
         }
         
         uint16_t packet_id = next_packet_id_++;
@@ -548,7 +555,11 @@ public:
     
     bool is_fragment(const std::vector<uint8_t>& data) const {
         if (data.size() < Frag::HEADER_SIZE) return false;
-        return data[0] == Frag::MAGIC;
+        if (data[0] != Frag::MAGIC) return false;
+        uint8_t flags = data[4];
+        if (flags & ~(Frag::FLAG_MORE_FRAGMENTS | Frag::FLAG_FIRST_FRAGMENT))
+            return false;
+        return ((flags & Frag::FLAG_FIRST_FRAGMENT) != 0) == (data[3] == 0);
     }
     
     void reset() {

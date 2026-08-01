@@ -1228,6 +1228,8 @@ private:
         using namespace robust_detail;
         CODE::MLS ps(0x163, narrow_ ? 89 : 1);
         int first = last_pr - wrows + 1;
+        if (first < 0 || last_pr >= npat_)
+            return false;
         for (int i = 0; i < first * nc_; ++i)
             ps();
         cmplx s(0, 0);

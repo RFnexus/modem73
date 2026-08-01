@@ -325,9 +325,10 @@ public:
 
     }
     
-    int get_payload_size(int oper_mode) {
-        if (!setup(oper_mode)) return 0;
-        return data_bytes;
+    static int get_payload_size(int oper_mode) {
+        Common c;
+        if (!c.setup(oper_mode)) return 0;
+        return c.data_bytes;
     }
     
 private:
@@ -869,6 +870,11 @@ private:
                 ++stats_sync_count;
                 symbol_pos = correlator_ptr->symbol_pos;
                 cfo_rad = correlator_ptr->cfo_rad;
+                if (symbol_pos < 0) {
+                    ++stats_preamble_errors;
+                    reset();
+                    break;
+                }
 
                 frame_raw_.assign(buf_, buf_ + buffer_len);
                 frame_symbol_pos_ = symbol_pos;
@@ -1583,7 +1589,7 @@ private:
         buf_ = frame_raw_.data();
         delete seq1_ptr;
         seq1_ptr = new CODE::MLS(mls1_poly);
-        if (process_preamble()) {
+        if (process_preamble() && oper_mode == mode) {
             bool bad = false;
             for (int j = 1; j <= symbol_count; ++j) {
                 buf_ = frame_raw_.data() + 2 * symbol_len + guard_len
@@ -1659,7 +1665,7 @@ private:
             buf_ = frame_raw_.data();
             delete seq1_ptr;
             seq1_ptr = new CODE::MLS(mls1_poly);
-            if (!process_preamble())
+            if (!process_preamble() || symbol_count > last)
                 continue;
             bool bad = false;
             for (int j = 1; j <= symbol_count; ++j) {
