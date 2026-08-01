@@ -5,6 +5,7 @@
 //   rdm-800   (16384,4128) 3/4-punctured, r~1/3  ~780
 //   rdm-600   (16384,4128) r=1/4  ~585   rdmn-150  (16384,4128) ~149 bps
 //   rdm-300   r=1/4 chase x2      ~296
+//   rdm-qb    (1024,288) r~0.28   ~475   micro burst: 32 B in 0.54 s
 //
 #pragma once
 
@@ -15,6 +16,7 @@
 #include <algorithm>
 #include "common.hh"
 #include "polar_tables_short.hh"
+#include "polar_tables_micro.hh"
 
 #ifndef IMPULSE_BLANKER
 #define IMPULSE_BLANKER 1
@@ -38,16 +40,18 @@ enum class RobustMode {
     RDMN_150S = 9,
     // appended after the 0-4/5-9 family blocks to keep those numbers stable
     RDM_800   = 10,
-    RDM_800S  = 11
+    RDM_800S  = 11,
+    // QB micro burst: 32 bytes in 22 rows (~0.54 s), (1024,288) r=0.28
+    RDM_QB    = 12
 };
 
 static const char* ROBUST_MODE_NAMES[] =
     {"RDM-1200", "RDM-600", "RDM-300", "RDMN-300", "RDMN-150",
      "RDM-1200S", "RDM-600S", "RDM-300S", "RDMN-300S", "RDMN-150S",
-     "RDM-800", "RDM-800S"};
+     "RDM-800", "RDM-800S", "RDM-QB"};
 
 
-constexpr int ROBUST_MODE_COUNT = 12;
+constexpr int ROBUST_MODE_COUNT = 13;
 
 struct RobustParams {
     static constexpr int SAMPLE_RATE = 48000;
@@ -70,17 +74,22 @@ struct RobustParams {
         int i = (int)m;
         return (i >= 5 && i < 10) || i == 11;
     }
+    static bool is_micro(RobustMode m) { return m == RobustMode::RDM_QB; }
     static RobustMode with_framing(RobustMode m, bool short_frame) {
+        if (is_micro(m))
+            return m;
         if ((int)m >= 10)
             return short_frame ? RobustMode::RDM_800S : RobustMode::RDM_800;
         return (RobustMode)((int)m % 5 + (short_frame ? 5 : 0));
     }
     static int nc(RobustMode m) { return is_narrow(m) ? 8 : 32; }
-    static int data_bytes(RobustMode m) { return is_short(m) ? 172 : DATA_BYTES; }
+    static int data_bytes(RobustMode m) {
+        return is_micro(m) ? 32 : is_short(m) ? 172 : DATA_BYTES;
+    }
     static int data_bits(RobustMode m) { return 8 * data_bytes(m); }
     static int mesg_bits(RobustMode m) { return data_bits(m) + CRC_BITS; }
     static int code_order(RobustMode m) {
-        static const int t[] = {13, 14, 14, 13, 14, 12, 13, 13, 12, 13, 14, 13};
+        static const int t[] = {13, 14, 14, 13, 14, 12, 13, 13, 12, 13, 14, 13, 10};
         return t[(int)m];
     }
     static int code_bits(RobustMode m) { return 1 << code_order(m); }
@@ -90,8 +99,11 @@ struct RobustParams {
     // RDM-800 transmits only 3/4 of the shuffled codeword; the receiver
     // treats the rest as erasures, so the rate-1/4 mother code acts as a
     // rate-1/3 code
+    static bool is_punctured(RobustMode m) {
+        return m == RobustMode::RDM_800 || m == RobustMode::RDM_800S;
+    }
     static int sent_bits(RobustMode m) {
-        if ((int)m >= 10)
+        if (is_punctured(m))
             return 3 * code_bits(m) / 4;
         return code_bits(m) * copies(m);
     }
@@ -100,9 +112,11 @@ struct RobustParams {
     // RDM-600 frame must not decode early (mislabeled, DCD dropped with
     // the sender still keyed) at the shorter RDM-800 checkpoint
     static int sent_offset(RobustMode m) {
-        return (int)m >= 10 ? code_bits(m) / 4 : 0;
+        return is_punctured(m) ? code_bits(m) / 4 : 0;
     }
     static const uint32_t* frozen(RobustMode m) {
+        if (is_micro(m))
+            return frozen_1024_288;
         if (is_short(m))
             return code_order(m) == 12 ? frozen_4096_1408 : frozen_8192_1408;
         return code_order(m) == 13 ? frozen_8192_4128 : frozen_16384_4128;
@@ -110,7 +124,7 @@ struct RobustParams {
     static int nrows(RobustMode m) {
         static const int t[] = {173, 345, 685, 685, 1369,
                                 89, 177, 349, 345, 689,
-                                257, 129};
+                                257, 129, 22};
         return t[(int)m];
     }
     static bool is_pilot_row(int i) { return i % NS == 0; }
@@ -135,7 +149,11 @@ inline int nrz(bool bit) { return 1 - 2 * bit; }
 
 template <typename T>
 inline void shuffle_enc(T* dest, const T* src, int order) {
-    if (order == 12) {
+    if (order == 10) {
+        CODE::XorShiftMask<int, 10, 1, 1, 3, 1> seq;
+        dest[0] = src[0];
+        for (int i = 1; i < 1024; ++i) dest[i] = src[seq()];
+    } else if (order == 12) {
         CODE::XorShiftMask<int, 12, 1, 1, 4, 1> seq;
         dest[0] = src[0];
         for (int i = 1; i < 4096; ++i) dest[i] = src[seq()];
@@ -152,7 +170,11 @@ inline void shuffle_enc(T* dest, const T* src, int order) {
 
 template <typename T>
 inline void shuffle_dec(T* dest, const T* src, int order) {
-    if (order == 12) {
+    if (order == 10) {
+        CODE::XorShiftMask<int, 10, 1, 1, 3, 1> seq;
+        dest[0] = src[0];
+        for (int i = 1; i < 1024; ++i) dest[seq()] = src[i];
+    } else if (order == 12) {
         CODE::XorShiftMask<int, 12, 1, 1, 4, 1> seq;
         dest[0] = src[0];
         for (int i = 1; i < 4096; ++i) dest[seq()] = src[i];
@@ -363,15 +385,16 @@ public:
             nmodes_ = 4;
         } else {
             // ascending nrows so each mode's checkpoint is reached in order
-            modes_[0] = RobustMode::RDM_1200S;  // 89 rows
-            modes_[1] = RobustMode::RDM_800S;   // 129
-            modes_[2] = RobustMode::RDM_1200;   // 173
-            modes_[3] = RobustMode::RDM_600S;   // 177
-            modes_[4] = RobustMode::RDM_800;    // 257
-            modes_[5] = RobustMode::RDM_600;    // 345
-            modes_[6] = RobustMode::RDM_300S;   // 349
-            modes_[7] = RobustMode::RDM_300;    // 685
-            nmodes_ = 8;
+            modes_[0] = RobustMode::RDM_QB;     // 22 rows
+            modes_[1] = RobustMode::RDM_1200S;  // 89
+            modes_[2] = RobustMode::RDM_800S;   // 129
+            modes_[3] = RobustMode::RDM_1200;   // 173
+            modes_[4] = RobustMode::RDM_600S;   // 177
+            modes_[5] = RobustMode::RDM_800;    // 257
+            modes_[6] = RobustMode::RDM_600;    // 345
+            modes_[7] = RobustMode::RDM_300S;   // 349
+            modes_[8] = RobustMode::RDM_300;    // 685
+            nmodes_ = 9;
         }
         nc_ = RobustParams::nc(modes_[0]);
         for (int k = 0; k < nc_; ++k)
@@ -786,7 +809,7 @@ private:
 
     bool narrow_ = false;
     int nc_ = 32;
-    RobustMode modes_[8] = {RobustMode::RDM_1200, RobustMode::RDM_600,
+    RobustMode modes_[9] = {RobustMode::RDM_1200, RobustMode::RDM_600,
                             RobustMode::RDM_300};
     int nmodes_ = 3;
     int nrows_top_ = 685;

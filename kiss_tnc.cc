@@ -1941,7 +1941,7 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
         else if (!strcmp(key, "short_frame") && take("frame_size")) config.frame_size = atoi(value) != 0 ? 0 : 1;
         else if (!strcmp(key, "frame_size") && take(key)) {
             int v = atoi(value);
-            if (v >= 0 && v <= 2) config.frame_size = v;
+            if (v >= 0 && v <= 3) config.frame_size = v;
         }
         else if (!strcmp(key, "center_freq") && take(key)) config.center_freq = 1500;
         else if (!strcmp(key, "rx_filter_enabled") && take(key)) config.rx_filter_enabled = atoi(value) != 0;
@@ -2006,6 +2006,7 @@ void print_help(const char* prog) {
               << "  --short                 Use short frames\n"
               << "  --normal                Use normal frames (default)\n"
               << "  --long                  Use long frames\n"
+              << "  --micro                 QB micro burst (QPSK 1/2 only, 32 B in ~0.59 s)\n"
               << "  --no-rxfilter           Disable RX bandpass in front of the OFDM decoder\n"
               << "\nPTT options:\n"
               << "  --ptt TYPE              PTT type: none, rigctl, vox, com"
@@ -2170,6 +2171,9 @@ int main(int argc, char** argv) {
             cli_set.insert("frame_size");
         } else if (arg == "--long") {
             config.frame_size = 2;
+            cli_set.insert("frame_size");
+        } else if (arg == "--micro") {
+            config.frame_size = 3;
             cli_set.insert("frame_size");
         } else if (arg == "--no-rxfilter") {
             config.rx_filter_enabled = false;

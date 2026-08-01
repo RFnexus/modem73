@@ -62,7 +62,7 @@ struct TNCConfig {
     std::string callsign = "N0CALL";
     std::string modulation = "QPSK";
     std::string code_rate = "1/2";
-    int frame_size = 1;         // 0=short, 1=normal, 2=long
+    int frame_size = 1;         // 0=short, 1=normal, 2=long, 3=micro
     bool postamble = false;
     bool rx_filter_enabled = true;  // RX bandpass in front of the OFDM decoder
     

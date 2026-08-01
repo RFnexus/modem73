@@ -35,21 +35,27 @@
 constexpr size_t MAX_LOG_ENTRIES = 500;
 
 const std::vector<std::string> MODEM_TYPE_OPTIONS = {"OFDM", "MFSK", "ROBUST"};
-const std::vector<std::string> ROBUST_MODE_OPTIONS = {"RDM-1200", "RDM-800", "RDM-600", "RDM-300", "RDMN-300", "RDMN-150"};
-const std::vector<std::string> ROBUST_MTU_OPTIONS = {"510 B", "170 B (short)"};
+const std::vector<std::string> ROBUST_MODE_OPTIONS = {"RDM-1200", "RDM-800", "RDM-600", "RDM-300", "RDMN-300", "RDMN-150", "RDM-QB"};
+const std::vector<std::string> ROBUST_MTU_OPTIONS = {"510 B", "170 B (short)", "30 B (micro)"};
 
-// robust_mode ints: 0-4 full-frame, 5-9 short-frame, 10/11 RDM-800/-800S.
+// robust_mode ints: 0-4 full-frame, 5-9 short-frame, 10/11 RDM-800/-800S,
+// 12 RDM-QB (micro burst, single size).
 // The UI shows a base-mode selector (index into ROBUST_MODE_OPTIONS above,
 // display order) plus a frame-size toggle; these map between the two.
 inline int robust_base_index(int mode) {
+    if (mode == 12) return 6;                       // RDM-QB micro
     if (mode >= 10) return 1;                       // RDM-800 family
     int fam = mode % 5;                             // 0-4 family order
     return fam == 0 ? 0 : fam + 1;                  // shifted past RDM-800
 }
 inline int robust_mode_of(int base, bool short_frame) {
+    if (base == 6) return 12;                       // RDM-QB is one size only
     if (base == 1) return short_frame ? 11 : 10;
     int fam = base == 0 ? 0 : base - 1;
     return fam + (short_frame ? 5 : 0);
+}
+inline int robust_mtu_index(int mode) {
+    return mode == 12 ? 2 : RobustParams::is_short((RobustMode)mode) ? 1 : 0;
 }
 
 struct CsmaPreset {
@@ -168,7 +174,16 @@ struct TNCUIState {
     int alt_mode_mask = 0;
     int modulation_index = 1;  // default QPSK N 1/2
     int code_rate_index = 0;
-    int frame_size = 1;        // 0=short, 1=normal, 2=long
+    int frame_size = 1;        // 0=short, 1=normal, 2=long, 3=micro qpsk 1/2 only curent
+
+    // TODO
+    bool micro_allowed() const {
+        return modulation_index == 1 && code_rate_index == 0;
+    }
+    void clamp_micro() {
+        if (frame_size == 3 && !micro_allowed())
+            frame_size = 1;
+    }
     int center_freq = 1500;
     bool postamble = false;
 
@@ -283,7 +298,7 @@ struct TNCUIState {
         // OFDM modem
         int modulation_index;
         int code_rate_index;
-        int frame_size;        // 0=short, 1=normal, 2=long
+        int frame_size;        // 0=short, 1=normal, 2=long, 3=micro (QPSK 1/2 only)
         int center_freq;
         // CSMA
         bool csma_enabled;
@@ -558,7 +573,13 @@ struct TNCUIState {
         if (mod < 0 || mod > 7) mod = 1;
         if (rate < 0 || rate > 6) rate = 0;
 
-        if (rate == 5) {
+        if (frame_size == 3) {
+            // QB QPSK quickburst
+            bool valid = mod == 1 && rate == 0;
+            airtime_seconds = 0.59f;
+            mtu_bytes = valid ? 32 - 2 : 0;
+            bitrate_bps = valid ? (int)(32 * 8 / airtime_seconds) : 0;
+        } else if (rate == 5) {
             static const int payload_rep_short[8]  = {128, 256, 512, 512, 1024, 1024, 2048, 2048};
             static const int payload_rep_normal[8] = {256, 512, 1024, 1024, 2048, 0, 0, 0};
             static const int duration_rep_short[8]  = {2600, 1500, 3400, 1500, 3400, 2600, 4000, 3400};
@@ -781,7 +802,7 @@ struct TNCUIState {
                 else if (strcmp(key, "short_frame") == 0) frame_size = atoi(value) != 0 ? 0 : 1;
                 else if (strcmp(key, "frame_size") == 0) {
                     int v = atoi(value);
-                    if (v >= 0 && v <= 2) frame_size = v;
+                    if (v >= 0 && v <= 3) frame_size = v;
                 }
                 else if (strcmp(key, "center_freq") == 0) center_freq = 1500;
                 else if (strcmp(key, "postamble") == 0) postamble = atoi(value) != 0;
@@ -852,10 +873,11 @@ struct TNCUIState {
         }
         
         fclose(f);
+        clamp_micro();
         update_modem_info();
         return true;
     }
-    
+
 
     bool save_presets() {
         if (presets_file.empty()) return false;
@@ -865,12 +887,12 @@ struct TNCUIState {
         
         fprintf(f, "# MODEM73 Presets \n");
         for (const auto& p : presets) {
-            // sf field keeps legacy semantics: 1=short, 0=normal, 2=long
+            // 1=short, 0=normal, 2=long, 3=micro
             fprintf(f, "preset=%s,%d,%d,%d,%d,%d,%.1f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
                     p.name.c_str(),
                     p.modulation_index,
                     p.code_rate_index,
-                    p.frame_size == 0 ? 1 : p.frame_size == 2 ? 2 : 0,
+                    p.frame_size == 0 ? 1 : p.frame_size >= 2 ? p.frame_size : 0,
                     p.center_freq,
                     p.csma_enabled ? 1 : 0,
                     p.carrier_threshold_db,
@@ -924,7 +946,10 @@ struct TNCUIState {
                 p.name = name;
                 p.modulation_index = clampi(mod, 0, (int)MODULATION_OPTIONS.size() - 1);
                 p.code_rate_index = clampi(rate, 0, (int)CODE_RATE_OPTIONS.size() - 1);
-                p.frame_size = sf == 1 ? 0 : sf == 2 ? 2 : 1;
+                p.frame_size = sf == 1 ? 0 : (sf == 2 || sf == 3) ? sf : 1;
+                if (p.frame_size == 3 &&
+                    !(p.modulation_index == 1 && p.code_rate_index == 0))
+                    p.frame_size = 1;
                 p.center_freq = 1500;
                 p.csma_enabled = csma != 0;
                 p.carrier_threshold_db = thresh;
@@ -996,6 +1021,7 @@ struct TNCUIState {
         modulation_index = p.modulation_index;
         code_rate_index = p.code_rate_index;
         frame_size = p.frame_size;
+        clamp_micro();
         csma_enabled = p.csma_enabled;
         carrier_threshold_db = p.carrier_threshold_db;
         slot_time_ms = p.slot_time_ms;
@@ -2096,15 +2122,19 @@ private:
                 break;
             case FIELD_MODULATION:
                 state_.modulation_index = (state_.modulation_index + delta + 8) % 8;
+                state_.clamp_micro();
                 break;
             case FIELD_CODERATE:
                 do {
                     state_.code_rate_index = (state_.code_rate_index + delta +
                         (int)CODE_RATE_OPTIONS.size()) % (int)CODE_RATE_OPTIONS.size();
                 } while (state_.code_rate_index >= 5);
+                state_.clamp_micro();
                 break;
             case FIELD_FRAMESIZE:
-                state_.frame_size = (state_.frame_size + delta + 3) % 3;
+                do {
+                    state_.frame_size = (state_.frame_size + delta + 4) % 4;
+                } while (state_.frame_size == 3 && !state_.micro_allowed());
                 break;
             case FIELD_POSTAMBLE:
                 state_.postamble = !state_.postamble;
@@ -2723,7 +2753,8 @@ private:
             printw("  %s %s %s %dHz",
                    MODULATION_OPTIONS[state_.modulation_index].c_str(),
                    CODE_RATE_OPTIONS[state_.code_rate_index].c_str(),
-                   state_.frame_size == 0 ? "S" : state_.frame_size == 2 ? "L" : "N",
+                   state_.frame_size == 0 ? "S" : state_.frame_size == 2 ? "L"
+                 : state_.frame_size == 3 ? "U" : "N",
                    state_.center_freq);
         }
         
@@ -3558,7 +3589,8 @@ private:
 
             dy = visible_y(row);
             if (dy >= 0) draw_selector_field(dy, c1, c2, "Frame Size", FIELD_FRAMESIZE,
-                               state_.frame_size == 0 ? "SHORT" : state_.frame_size == 2 ? "LONG" : "NORMAL");
+                               state_.frame_size == 0 ? "SHORT" : state_.frame_size == 2 ? "LONG"
+                             : state_.frame_size == 3 ? "MICRO" : "NORMAL");
             row++;
 
             dy = visible_y(row);
@@ -3577,8 +3609,7 @@ private:
             row++;
             dy = visible_y(row);
             if (dy >= 0) draw_selector_field(dy, c1, c2, "Frame", FIELD_ROBUST_MTU,
-                               ROBUST_MTU_OPTIONS[RobustParams::is_short(
-                                   (RobustMode)state_.robust_mode_index) ? 1 : 0]);
+                               ROBUST_MTU_OPTIONS[robust_mtu_index(state_.robust_mode_index)]);
             row++;
         }
 
@@ -4117,7 +4148,8 @@ private:
             mvprintw(y, c3, "%s %s %s",
                      MODULATION_OPTIONS[p.modulation_index].c_str(),
                      CODE_RATE_OPTIONS[p.code_rate_index].c_str(),
-                     p.frame_size == 0 ? "S" : p.frame_size == 2 ? "L" : "N");
+                     p.frame_size == 0 ? "S" : p.frame_size == 2 ? "L"
+                   : p.frame_size == 3 ? "U" : "N");
             y++;
             
             mvaddstr(y, c3, "PTT ");
