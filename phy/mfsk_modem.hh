@@ -901,7 +901,9 @@ private:
         if (noise_e > 1e-10f) {
             float sig = signal_e / MFSKParams::DATA_SYMBOLS;
             float noi = noise_e / (MFSKParams::DATA_SYMBOLS * (n_tones_ - 1));
-            last_snr_ = 10.0f * log10f(sig / noi);
+            float s = sig - noi;
+            float nb = noi * n_tones_;
+            last_snr_ = 10.0f * log10f(std::max(s, nb * 1e-4f) / nb);
         } else {
             last_snr_ = 50.0f;
         }
