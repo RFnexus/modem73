@@ -1,12 +1,27 @@
 #!/usr/bin/env bash
 set -e
 
-if [ "$(id -u)" = "0" ]; then
+if [[ $(id -u) -eq 0 ]]; then
     echo "Do not run this script as root. It will ask for sudo when needed."
     exit 1
 fi
 
-command -v apt >/dev/null 2>&1 || { echo "This script requires a Debian-based system with apt."; exit 1; }
+# Check if this is Debian, Ubuntu, or some other distribution that uses APT.
+if apt -h >/dev/null 2>&1; then
+    echo "APT-based distribution detected"
+    DIST_STYLE="debian"
+
+# Check if this is Arch Linux.
+elif stat /etc/arch-release >/dev/null 2>&1; then
+    echo "Pacman-based distribution detected"
+    DIST_STYLE="arch"
+
+# No other distribution styles are supported at this time.
+else
+    echo "This script requires a Debian-based system with APT, or alternately,"
+    echo "Arch Linux. No other distributions are supported yet."
+    exit 1
+fi
 
 PARENT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
@@ -14,22 +29,45 @@ echo "=== MODEM73 Installer ==="
 echo "Install directory: $PARENT_DIR"
 echo ""
 
-PACKAGES="git build-essential libncurses-dev g++"
+# Depending on the distribution style, the naming convention and sources for
+# the dependent packages will be different.
+if [[ $DIST_STYLE == "debian" ]]; then
+    PACKAGES="git build-essential libncurses-dev g++"
+elif [[ $DIST_STYLE == "arch" ]]; then
+    PACKAGES="git base-devel ncurses"
+fi
 
 read -rp "Install hamlib for rigctl PTT support? [y/N] " HAMLIB
 if [[ "$HAMLIB" =~ ^[Yy]$ ]]; then
-    PACKAGES="$PACKAGES libhamlib-dev libhamlib-utils"
+    if [[ $DIST_STYLE == "debian" ]]; then
+        PACKAGES="$PACKAGES libhamlib-dev libhamlib-utils"
+    elif [[ $DIST_STYLE == "arch" ]]; then
+        PACKAGES="$PACKAGES hamlib"
+    fi
 fi
 
 read -rp "Install libhidapi-dev for CM108 USB PTT support? [y/N] " CM108
 if [[ "$CM108" =~ ^[Yy]$ ]]; then
-    PACKAGES="$PACKAGES libhidapi-dev"
+    if [[ $DIST_STYLE == "debian" ]]; then
+        PACKAGES="$PACKAGES libhidapi-dev"
+    elif [[ $DIST_STYLE == "arch" ]]; then
+        PACKAGES="$PACKAGES hidapi"
+    fi
 fi
 
 echo ""
 echo "Installing packages: $PACKAGES"
-sudo apt update
-sudo apt install -y $PACKAGES
+
+if [[ $DIST_STYLE == "debian" ]]; then
+    sudo apt update
+    sudo apt install -y $PACKAGES
+
+# Because Arch Linux is a rolling release, blindly installing updates with
+# no opportunity for the user to confirm can lead to disaster. Therefore, for
+# Arch, we require the user to approve the installation of any packages.
+elif [[ $DIST_STYLE == "arch" ]]; then
+    sudo pacman -Syu $PACKAGES
+fi
 
 cd "$PARENT_DIR"
 
@@ -46,6 +84,10 @@ echo "Build complete."
 echo ""
 read -rp "Install modem73 to /usr/local/bin? [y/N] " INSTALL
 if [[ "$INSTALL" =~ ^[Yy]$ ]]; then
+    # Some Arch Linux systems, and even some Debian-like ones that have been
+    # modified, may not have /usr/local/bin as a valid directory. If that is
+    # the case, create it.
+    sudo mkdir -p /usr/local/bin
     sudo make install
     echo ""
     echo "Run: modem73 to launch"
