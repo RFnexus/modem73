@@ -1750,7 +1750,15 @@ private:
                     current_field_ = field;
                     
                     // Handle clicks on interactive elements
-                    if (field == FIELD_PRESET) {
+                    if (field == FIELD_MODEM_TYPE) {
+                        int idx = modem_tab_at(event.x, cols);
+                        if (idx >= 0) {
+                            state_.modem_type_index = idx;
+                            state_.update_modem_info();
+                        } else if (event.x >= 18) {
+                            adjust_field(event.x < 22 ? -1 : 1);
+                        }
+                    } else if (field == FIELD_PRESET) {
                         // Click on preset - determine action by position
                         if (event.x >= 18 && event.x < 22 && !state_.presets.empty()) {
                             // Left arrow
@@ -3581,8 +3589,7 @@ private:
         row++;
 
         dy = visible_y(row);
-        if (dy >= 0) draw_selector_field(dy, c1, c2, "Modem", FIELD_MODEM_TYPE,
-                           MODEM_TYPE_OPTIONS[state_.modem_type_index]);
+        if (dy >= 0) draw_modem_tabs(dy, c1, c2, divider);
         row++;
 
         if (state_.modem_type_index == 0) {
@@ -4256,7 +4263,55 @@ private:
             mvprintw(y, c2, "  %s", value.c_str());
         }
     }
-    
+
+    // which modem family tab is on screen
+    int modem_tab_at(int x, int cols) {
+        int c2 = 16, divider = cols / 2 - 2, total = 0;
+        for (const auto& o : MODEM_TYPE_OPTIONS)
+            total += (int)o.size() + 2;
+        if (c2 + total > divider)
+            return -1;
+        int cx = c2;
+        for (int i = 0; i < (int)MODEM_TYPE_OPTIONS.size(); ++i) {
+            int w = (int)MODEM_TYPE_OPTIONS[i].size() + 2;
+            if (x >= cx && x < cx + w)
+                return i;
+            cx += w;
+        }
+        return -1;
+    }
+
+    void draw_modem_tabs(int y, int c1, int c2, int right_limit) {
+        bool sel = (FIELD_MODEM_TYPE == current_field_);
+        int total = 0;
+        for (const auto& o : MODEM_TYPE_OPTIONS)
+            total += (int)o.size() + 2;
+        if (c2 + total > right_limit) {
+            draw_selector_field(y, c1, c2, "Modem", FIELD_MODEM_TYPE,
+                                MODEM_TYPE_OPTIONS[state_.modem_type_index]);
+            return;
+        }
+        if (sel) {
+            attron(A_BOLD);
+            mvaddch(y, c1 - 2, '>');
+        }
+        mvaddstr(y, c1, "Modem");
+        if (sel) attroff(A_BOLD);
+        move(y, c2);
+        for (int i = 0; i < (int)MODEM_TYPE_OPTIONS.size(); ++i) {
+            bool active = (i == state_.modem_type_index);
+            if (active) {
+                attron(COLOR_PAIR(6) | A_BOLD | A_REVERSE);
+                printw(" %s ", MODEM_TYPE_OPTIONS[i].c_str());
+                attroff(COLOR_PAIR(6) | A_BOLD | A_REVERSE);
+            } else {
+                attron(A_DIM);
+                printw(" %s ", MODEM_TYPE_OPTIONS[i].c_str());
+                attroff(A_DIM);
+            }
+        }
+    }
+
     void draw_toggle_field(int y, int c1, int c2, const char* label, int field, bool value) {
         bool sel = (field == current_field_);
         
