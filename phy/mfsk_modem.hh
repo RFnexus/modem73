@@ -412,7 +412,7 @@ public:
                 const int range_back = MFSKParams::SYMBOL_LEN * 5 / 8;
                 const int range_fwd = MFSKParams::SYMBOL_LEN * 13 / 8;
                 if (!pending_sync_) {
-                    int p = step_count_ % 4;
+                    int p = (int)(step_count_ % 4);
                     bool ready = false;
                     for (int h = 0; h < FREQ_HYPS; ++h) {
                         float fh = (float)(FREQ_HYP_BASE + h);
@@ -700,7 +700,7 @@ private:
 
     enum class State { SEARCHING, COLLECTING };
     State state_ = State::SEARCHING;
-    int step_count_ = 0;
+    int64_t step_count_ = 0;
 
     int collect_count_ = 0;
     size_t collect_start_pos_ = 0;
@@ -901,7 +901,9 @@ private:
         if (noise_e > 1e-10f) {
             float sig = signal_e / MFSKParams::DATA_SYMBOLS;
             float noi = noise_e / (MFSKParams::DATA_SYMBOLS * (n_tones_ - 1));
-            last_snr_ = 10.0f * log10f(sig / noi);
+            float s = sig - noi;
+            float nb = noi * n_tones_;
+            last_snr_ = 10.0f * log10f(std::max(s, nb * 1e-4f) / nb);
         } else {
             last_snr_ = 50.0f;
         }

@@ -71,6 +71,12 @@ debug: $(TARGET)
 test_fade: test_suite/test_fade.cc modem.hh phy/common.hh
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -I. -Iphy -o test_suite/$@ test_suite/test_fade.cc -lm
 
+test_micro: test_suite/test_micro.cc modem.hh phy/common.hh phy/polar_tables_micro.hh
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -I. -Iphy -o test_suite/$@ test_suite/test_micro.cc -lm
+
+test_mfsk_snr: test_suite/test_mfsk_snr.cc phy/mfsk_modem.hh
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -I. -Iphy -o test_suite/$@ test_suite/test_mfsk_snr.cc -lm
+
 test_awgn: test_suite/test_awgn.cc modem.hh phy/common.hh
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -I. -Iphy -o test_suite/$@ test_suite/test_awgn.cc -lm
 

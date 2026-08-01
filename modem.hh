@@ -109,9 +109,21 @@ struct ModemConfig {
         return acc;
     }
     
-    // frame_size: 0=short, 1=normal, 2=long (bit 7; doubles a normal frame)
+    // QB micro modes: bit 7 set with bit 0 clear
+    static bool is_micro(int mode) {
+        return mode >= 0 && (mode & 0x81) == 0x80;
+    }
+
+    // frame_size: 0=short, 1=normal, 2=long (bit 7; doubles a normal frame),
+    // 3=micro 
     static int encode_mode(const char* modulation, const char* code_rate, int frame_size) {
         int mode = 0;
+
+        if (frame_size == 3) {
+            if (strcmp(modulation, "QPSK") || strcmp(code_rate, "1/2"))
+                return -1;
+            return 0x80 | (1 << 4);
+        }
 
         if (frame_size < 0 || frame_size > 2)
             return -1;
@@ -174,7 +186,8 @@ struct ModemConfig {
     }
 
     static const char* frame_size_name(int frame_size) {
-        return frame_size == 0 ? "short" : frame_size == 2 ? "long" : "normal";
+        return frame_size == 0 ? "short" : frame_size == 2 ? "long"
+             : frame_size == 3 ? "micro" : "normal";
     }
 };
 
@@ -204,12 +217,28 @@ public:
         
         guard_interval_weights();
         meta_data((call_sign << 8) | oper_mode);
+
+        // micro frames transmit only the tail of the noise
+
+        // TODO
         
-        // leading noise
         CODE::MLS noise(mls2_poly);
-        for (int j = 0; j < 1; ++j) {
-            for (int i = 0; i < tone_count; ++i)
-                tone[i] = nrz(noise());
+        for (int i = 0; i < tone_count; ++i)
+            tone[i] = nrz(noise());
+        if (is_micro_mode(oper_mode)) {
+            BufferWritePCM<value> lead(rate, 32, 1);
+            symbol(&lead, -3);
+            const int ramp_len = rate / 25;
+            const int attack = ramp_len / 2;
+            const std::vector<value>& s = lead.samples();
+            for (int i = 0; i < ramp_len; ++i) {
+                value w = i < attack
+                    ? value(0.5) * (value(1) - std::cos(DSP::Const<value>::Pi() * i / attack))
+                    : value(1);
+                value v = s[s.size() - ramp_len + i] * w;
+                pcm.write(&v, 1);
+            }
+        } else {
             symbol(&pcm, -3);
         }
         
@@ -296,9 +325,10 @@ public:
 
     }
     
-    int get_payload_size(int oper_mode) {
-        if (!setup(oper_mode)) return 0;
-        return data_bytes;
+    static int get_payload_size(int oper_mode) {
+        Common c;
+        if (!c.setup(oper_mode)) return 0;
+        return c.data_bytes;
     }
     
 private:
@@ -342,6 +372,10 @@ private:
             CODE::XorShiftMask<int, 8, 1, 1, 2, 1> seq;
             dest[0] = src[0];
             for (int i = 1; i < 256; ++i) dest[i] = src[seq()];
+        } else if (order == 9) {
+            CODE::XorShiftMask<int, 9, 1, 3, 5, 1> seq;
+            dest[0] = src[0];
+            for (int i = 1; i < 512; ++i) dest[i] = src[seq()];
         } else if (order == 11) {
             CODE::XorShiftMask<int, 11, 1, 3, 4, 1> seq;
             dest[0] = src[0];
@@ -594,7 +628,7 @@ private:
     CODE::PolarEncoder<int8_t> ber_encoder;
     int8_t ber_mesg[bits_max], ber_code[bits_max];
     DSP::Phasor<cmplx> osc;
-    
+
     mesg_type mesg[bits_max];
     code_type code[bits_max], perm[bits_max];
     cmplx demod[tone_count], chan[tone_count], tone[tone_count];
@@ -740,6 +774,10 @@ private:
             CODE::XorShiftMask<int, 8, 1, 1, 2, 1> seq;
             dest[0] = src[0];
             for (int i = 1; i < 256; ++i) dest[seq()] = src[i];
+        } else if (order == 9) {
+            CODE::XorShiftMask<int, 9, 1, 3, 5, 1> seq;
+            dest[0] = src[0];
+            for (int i = 1; i < 512; ++i) dest[seq()] = src[i];
         } else if (order == 11) {
             CODE::XorShiftMask<int, 11, 1, 3, 4, 1> seq;
             dest[0] = src[0];
@@ -832,6 +870,11 @@ private:
                 ++stats_sync_count;
                 symbol_pos = correlator_ptr->symbol_pos;
                 cfo_rad = correlator_ptr->cfo_rad;
+                if (symbol_pos < 0) {
+                    ++stats_preamble_errors;
+                    reset();
+                    break;
+                }
 
                 frame_raw_.assign(buf_, buf_ + buffer_len);
                 frame_symbol_pos_ = symbol_pos;
@@ -1076,7 +1119,7 @@ private:
             std::cerr << "Decoder: Invalid mode" << std::endl;
             return false;
         }
-        
+
         std::cerr << "Decoder: Mode " << oper_mode << ", " << symbol_count << " data symbols, mod_bits=" << mod_bits << ", code_order=" << code_order << ", data_bytes=" << data_bytes << std::endl;
         
         k_ = 0;
@@ -1095,7 +1138,10 @@ private:
     void build_fwd_perm(int* table, int order) {
         int len = 1 << order;
         table[0] = 0;
-        if (order == 11) {
+        if (order == 9) {
+            CODE::XorShiftMask<int, 9, 1, 3, 5, 1> seq;
+            for (int i = 1; i < len; ++i) table[i] = seq();
+        } else if (order == 11) {
             CODE::XorShiftMask<int, 11, 1, 3, 4, 1> seq;
             for (int i = 1; i < len; ++i) table[i] = seq();
         } else if (order == 12) {
@@ -1543,7 +1589,7 @@ private:
         buf_ = frame_raw_.data();
         delete seq1_ptr;
         seq1_ptr = new CODE::MLS(mls1_poly);
-        if (process_preamble()) {
+        if (process_preamble() && oper_mode == mode) {
             bool bad = false;
             for (int j = 1; j <= symbol_count; ++j) {
                 buf_ = frame_raw_.data() + 2 * symbol_len + guard_len
@@ -1619,7 +1665,7 @@ private:
             buf_ = frame_raw_.data();
             delete seq1_ptr;
             seq1_ptr = new CODE::MLS(mls1_poly);
-            if (!process_preamble())
+            if (!process_preamble() || symbol_count > last)
                 continue;
             bool bad = false;
             for (int j = 1; j <= symbol_count; ++j) {

@@ -67,7 +67,9 @@ public:
         if (csv_) {
             char ts[32];
             time_t now = time(nullptr);
-            strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S", localtime(&now));
+            struct tm tmv;
+            localtime_r(&now, &tmv);
+            strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S", &tmv);
             fprintf(csv_, "%s,%s,%.2f,%.3f,%d,%d,%d\n", ts, mode.c_str(),
                     snr, ber_pct, bytes, seq, lost_before);
             fflush(csv_);

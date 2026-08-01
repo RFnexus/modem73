@@ -66,6 +66,7 @@ public:
             }
             return Verdict::WAIT;
         }
+        busy_ms_ = 0;
         idle_ms_ += cfg_.poll_ms;
         if (idle_ms_ < quiet_needed_)
             return Verdict::WAIT;

@@ -30,9 +30,9 @@ SSB, AM, and FM are all supported. It's plug and play compatible with any KISS a
 
 There are three modem families each suited for covering any possible RF setup from clean line of sight FM links to poor HF band conditions. The receiver decodes all of them at the same time, so one station can hear anything another station sends without switching modes. The modem type can be changed under [ CONFIG ] -> Modem or via the control port  
 
-**OFDM**, based on the open source [COFDMTV modem](https://github.com/aicodix/modem) developed by Ahmet Inan / [aicodix GmbH](https://www.aicodix.de/). Modulations from BPSK to QAM4096 with code rates from 1/4 to 5/6 and payloads from 256 to 6144 bytes per frame. Rates run from about 790 bits per second to over 13 kilobits per second in the same 2400 Hz. 
+**OFDM**, based on the open source [COFDMTV modem](https://github.com/aicodix/modem) developed by Ahmet Inan / [aicodix GmbH](https://www.aicodix.de/). Modulations from BPSK to QAM4096 with code rates from 1/4 to 5/6 and payloads from 256 to 6144 bytes per frame. Rates run from about 790 bits per second to over 13 kilobits per second in the same 2400 Hz.
 
-**ROBUST**, a set of slow modes built for fading HF paths such as 40 and 80 meter NVIS.  Five modes from 1150 bps down to 149 bps in either 2400 Hz or a 600 Hz narrow variant
+**ROBUST**, a set of slow modes built for fading HF paths such as 40 and 80 meter NVIS.  Five modes from 1150 bps down to 149 bps in either 2400 Hz or a 600 Hz narrow variant.
 
 **MFSK**, a non-coherent mode for weak signal propagation and backup links. 
 

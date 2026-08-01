@@ -3,6 +3,7 @@
 #include <string>
 #include <iostream>
 #include <cstring>
+#include <chrono>
 #include <mutex>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -53,7 +54,7 @@ public:
         if (n > 0) {
             response[n] = '\0';
             // rigctld returns RPRT 0 on success
-            if (strstr(response, "RPRT 0") || n == 0) {
+            if (strstr(response, "RPRT 0")) {
                 ptt_on_ = on;
                 std::cerr << "rigctl: PTT " << (on ? "ON" : "OFF") << std::endl;
                 return true;
@@ -62,9 +63,9 @@ public:
                 return false;
             }
         }
-        // temp fallback
-        ptt_on_ = on;
-        return true;
+        std::cerr << "rigctl: No PTT response, disconnecting" << std::endl;
+        disconnect_locked();
+        return false;
     }
 
     // Send an arbitrary rigctld command and return the response
@@ -107,6 +108,12 @@ public:
 private:
     bool connect_locked() {
         if (connected_) return true;
+
+        int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (now - last_connect_ms_ < 3000)
+            return false;
+        last_connect_ms_ = now;
 
         sock_ = socket(AF_INET, SOCK_STREAM, 0);
         if (sock_ < 0) {
@@ -162,6 +169,8 @@ private:
 
     void disconnect_locked() {
         if (sock_ >= 0) {
+            if (ptt_on_)
+                send(sock_, "T 0\n", 4, MSG_NOSIGNAL | MSG_DONTWAIT);
             close(sock_);
             sock_ = -1;
         }
@@ -174,6 +183,7 @@ private:
     int sock_ = -1;
     bool connected_ = false;
     bool ptt_on_ = false;
+    int64_t last_connect_ms_ = 0;
     std::mutex mutex_;
 };
 

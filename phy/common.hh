@@ -21,6 +21,7 @@ namespace DSP { using std::abs; using std::min; using std::cos; using std::sin; 
 #include "crc.hh"
 #include "polar_tables.hh"
 #include "polar_tables_rate14.hh"
+#include "polar_tables_micro.hh"
 #include "hadamard_encoder.hh"
 
 struct Common
@@ -63,8 +64,39 @@ struct Common
 
 	Common() : crc0(0xA8F4), crc1(0x8F6E37A0) {}
 
+
+	// QB microburst family bit 7 set with bit 0 clear
+	static bool is_micro_mode(int mode) {
+		return (mode & 0x81) == 0x80;
+	}
+
+	bool setup_micro(int mode)
+	{
+		int modulation = (mode >> 4) & 7;
+		int sub = (mode >> 1) & 7;
+		if (modulation != 1 || sub != 0)
+			return false;
+		mod_bits = 2;
+		symbol_count = 1;
+		code_order = 9;
+		data_bits = 256;
+		frozen_bits = frozen_512_288;
+		repeat2 = false;
+		oper_mode = mode;
+		data_bytes = data_bits / 8;
+		// 40 ms lead-in + S&C pair + meta + one data symbol final guard
+		float duration = 0.04f + 0.27f + 2 * (41.f / 300.f) + 0.0033f;
+		std::cerr << "modulation: QPSK (micro)" << std::endl;
+		std::cerr << "code rate: 1/2" << std::endl;
+		std::cerr << "duration: " << duration << "s" << std::endl;
+		std::cerr << "payload: " << data_bytes << "B" << std::endl;
+		return true;
+	}
+
 	bool setup(int mode)
 	{
+		if (is_micro_mode(mode))
+			return setup_micro(mode);
 		// bit 7: long frame (double a normal frame). Receivers without
 		// long-frame support reject this bit, so frames are ignored
 		// cleanly rather than misdecoded.

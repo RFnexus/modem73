@@ -48,9 +48,11 @@ public:
         
         cfmakeraw(&tty);
         tcsetattr(fd_, TCSANOW, &tty);
-        
 
-
+        int clear = (invert_dtr_ ? 0 : TIOCM_DTR) | (invert_rts_ ? 0 : TIOCM_RTS);
+        int set = (invert_dtr_ ? TIOCM_DTR : 0) | (invert_rts_ ? TIOCM_RTS : 0);
+        if (clear) ioctl(fd_, TIOCMBIC, &clear);
+        if (set) ioctl(fd_, TIOCMBIS, &set);
 
         ptt_off();
         

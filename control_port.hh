@@ -207,6 +207,7 @@ private:
             }
 
             // Poll clients
+            std::vector<std::pair<int, std::string>> pending;
             {
                 std::lock_guard<std::recursive_mutex> lock(clients_mutex_);
                 for (auto it = clients_.begin(); it != clients_.end();) {
@@ -215,7 +216,12 @@ private:
 
                     if (n > 0) {
                         it->recv_buf.insert(it->recv_buf.end(), buf, buf + n);
-                        process_recv_buf(*it);
+                        if (!process_recv_buf(*it, pending)) {
+                            std::cerr << "control: Client disconnected" << std::endl;
+                            close(it->fd);
+                            it = clients_.erase(it);
+                            continue;
+                        }
                     } else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
                         std::cerr << "control: Client disconnected" << std::endl;
                         close(it->fd);
@@ -226,6 +232,8 @@ private:
                     ++it;
                 }
             }
+            for (auto& m : pending)
+                handle_message(m.first, m.second);
 
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
@@ -240,7 +248,8 @@ private:
         }
     }
 
-    void process_recv_buf(Client& client) {
+    bool process_recv_buf(Client& client,
+                          std::vector<std::pair<int, std::string>>& out) {
         // Messages are: [4-byte big-endian length][JSON bytes]
         while (client.recv_buf.size() >= 4) {
             uint32_t msg_len = ((uint32_t)client.recv_buf[0] << 24) |
@@ -251,8 +260,7 @@ private:
             if (msg_len > 1024 * 1024) {
                 // Sanity limit: 1MB
                 std::cerr << "control: Message too large (" << msg_len << "), disconnecting" << std::endl;
-                client.recv_buf.clear();
-                return;
+                return false;
             }
 
             if (client.recv_buf.size() < 4 + msg_len) {
@@ -265,8 +273,9 @@ private:
             client.recv_buf.erase(client.recv_buf.begin(),
                                   client.recv_buf.begin() + 4 + msg_len);
 
-            handle_message(client.fd, json_str);
+            out.emplace_back(client.fd, std::move(json_str));
         }
+        return true;
     }
 
     void handle_message(int client_fd, const std::string& json_str) {
