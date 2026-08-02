@@ -4723,6 +4723,8 @@ private:
         std::copy(db, db + WF_BINS, sorted);
         std::nth_element(sorted, sorted + WF_BINS / 2, sorted + WF_BINS);
         float med = sorted[WF_BINS / 2];
+        if (med < -105.0f)
+            return;
         if (wf_rows_.empty())
             wf_floor_db_ = med;
         else if (med < wf_floor_db_)
