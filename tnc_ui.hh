@@ -416,6 +416,29 @@ struct TNCUIState {
             std::chrono::steady_clock::now().time_since_epoch()).count();
     }
 
+    static constexpr int WF_DECIM = 8;   // 48 kHz ->   6 kHz display spans 0-3 kHz
+    static constexpr int WF_RING = 1024;
+    std::atomic<bool> scope_active{false};
+    std::mutex wf_mutex;
+    float wf_ring[WF_RING] = {};
+    int wf_wpos = 0;
+    uint32_t wf_written = 0;
+    float wf_acc = 0.0f;
+    int wf_acc_n = 0;
+
+    void push_scope_audio(const float* samples, int n) {
+        std::lock_guard<std::mutex> lock(wf_mutex);
+        for (int i = 0; i < n; i++) {
+            wf_acc += samples[i];
+            if (++wf_acc_n == WF_DECIM) {
+                wf_ring[wf_wpos] = wf_acc * (1.0f / WF_DECIM);
+                wf_wpos = (wf_wpos + 1) % WF_RING;
+                wf_written++;
+                wf_acc = 0.0f;
+                wf_acc_n = 0;
+            }
+        }
+    }
 
     struct PacketInfo {
         bool is_tx;
@@ -1275,6 +1298,23 @@ public:
             init_pair(4, COLOR_CYAN, -1);     // Important 
             init_pair(5, COLOR_WHITE, -1);    // Normal 
             init_pair(6, COLOR_MAGENTA, -1);  // Special
+
+            if (COLORS >= 256 && COLOR_PAIRS > WF_PAIR_BASE + 31) {
+                static const short grad[31] = {
+                    16, 17, 18, 19, 20, 21, 27, 33, 39, 45, 51,
+                    50, 49, 48, 47, 46, 82, 118, 154, 190, 226,
+                    220, 214, 208, 202, 196, 197, 198, 199, 200, 201};
+                for (int i = 0; i < 31; i++)
+                    init_pair(WF_PAIR_BASE + i, COLOR_BLACK, grad[i]);
+                wf_pairs_ = 31;
+            } else if (COLOR_PAIRS > WF_PAIR_BASE + 7) {
+                static const short grad[7] = {COLOR_BLACK, COLOR_BLUE, COLOR_CYAN,
+                                              COLOR_GREEN, COLOR_YELLOW, COLOR_RED,
+                                              COLOR_MAGENTA};
+                for (int i = 0; i < 7; i++)
+                    init_pair(WF_PAIR_BASE + i, COLOR_BLACK, grad[i]);
+                wf_pairs_ = 7;
+            }
         }
         
         running_ = true;
@@ -2698,6 +2738,7 @@ private:
                 last_ptt_seen_ms_ = now_ms;
             state_.rig_poll_enabled = (current_tab_ == 5) || (current_tab_ == 0) ||
                 (last_ptt_seen_ms_ > 0 && now_ms - last_ptt_seen_ms_ < 3000);
+            state_.scope_active = (current_tab_ == 4);
             if (now_ms - occ_hist_ms_ >= 5000) {
                 occ_hist_ms_ = now_ms;
                 occ_hist_[occ_hist_pos_] = state_.channel_occupancy.load();
@@ -4626,9 +4667,148 @@ private:
         }
     }
     
+    void update_waterfall() {
+
+        int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (now_ms - wf_row_ms_ < WF_ROW_MS)
+            return;
+
+        static constexpr int SEGS = 6;
+        static constexpr int HOP = WF_FFT / 2;
+        static constexpr int SPAN = WF_FFT + HOP * (SEGS - 1);
+        float tdom[SPAN];
+        {
+            std::lock_guard<std::mutex> lock(state_.wf_mutex);
+            if (state_.wf_written == wf_seen_)
+                return;
+            wf_seen_ = state_.wf_written;
+            int p = state_.wf_wpos;
+            for (int i = 0; i < SPAN; i++)
+                tdom[i] = state_.wf_ring[(p + TNCUIState::WF_RING - SPAN + i)
+                                         % TNCUIState::WF_RING];
+        }
+
+
+
+        wf_row_ms_ = now_ms;
+
+        static const auto window = [] {
+            std::array<float, WF_FFT> w{};
+            for (int i = 0; i < WF_FFT; i++)
+                w[i] = 0.5f - 0.5f * std::cos(2.0f * (float)M_PI * i / WF_FFT);
+            return w;
+        }();
+
+        float pwr[WF_BINS] = {};
+        float seg[WF_FFT];
+        std::complex<float> fdom[WF_FFT / 2 + 1];
+        for (int s = 0; s < SEGS; s++) {
+            const float* src = tdom + s * HOP;
+            for (int i = 0; i < WF_FFT; i++)
+                seg[i] = src[i] * window[i];
+            wf_fft_(fdom, seg);
+            for (int i = 0; i < WF_BINS; i++)
+                pwr[i] += std::norm(fdom[i]);
+        }
+
+        float db[WF_BINS];
+        for (int i = 0; i < WF_BINS; i++) {
+            float p3 = 2.0f * pwr[i] + pwr[i > 0 ? i - 1 : 0] +
+                       pwr[i < WF_BINS - 1 ? i + 1 : i];
+            db[i] = 10.0f * std::log10(p3 + 1e-12f);
+        }
+
+        float sorted[WF_BINS];
+        std::copy(db, db + WF_BINS, sorted);
+        std::nth_element(sorted, sorted + WF_BINS / 2, sorted + WF_BINS);
+        float med = sorted[WF_BINS / 2];
+        if (med < -105.0f)
+            return;
+        if (wf_rows_.empty())
+            wf_floor_db_ = med;
+        else if (med < wf_floor_db_)
+            wf_floor_db_ += (med - wf_floor_db_) * 0.5f;
+        else
+            wf_floor_db_ += (med - wf_floor_db_) * 0.02f;
+
+        std::array<uint8_t, WF_BINS> row;
+        for (int i = 0; i < WF_BINS; i++) {
+            float v = (db[i] - wf_floor_db_ + 6.0f) * (255.0f / 50.0f);
+            row[i] = (uint8_t)std::max(0.0f, std::min(255.0f, v));
+        }
+        wf_rows_.push_front(row);
+        if ((int)wf_rows_.size() > WF_MAX_ROWS)
+            wf_rows_.pop_back();
+    }
+
+    void draw_waterfall(int y, int x, int h, int w) {
+
+        // frequency axis
+
+        attron(A_DIM);
+        mvhline(y, x, ACS_HLINE, w);
+        for (int f = 0; f <= 3000; f += 500) {
+            int cx = x + (int)((int64_t)f * (w - 1) / 3000);
+            if (f % 1000) {
+                mvaddch(y, cx, '+');
+            } else if (f == 0) {
+                mvaddch(y, cx, '0');
+            } else {
+                char lbl[8];
+                snprintf(lbl, sizeof(lbl), "%dk", f / 1000);
+                if (cx + (int)strlen(lbl) > x + w)
+                    cx = x + w - (int)strlen(lbl);
+                mvaddstr(y, cx, lbl);
+            }
+        }
+        attroff(A_DIM);
+        int cf = state_.center_freq;
+        if (cf > 0 && cf <= 3000) {
+            attron(COLOR_PAIR(4) | A_BOLD);
+            mvaddch(y, x + (int)((int64_t)cf * (w - 1) / 3000), 'v');
+            attroff(COLOR_PAIR(4) | A_BOLD);
+        }
+
+        if (wf_rows_.empty()) {
+            attron(A_DIM);
+            mvaddstr(y + 1, x, "(waiting for audio)");
+            attroff(A_DIM);
+            return;
+        }
+
+        int nrows = std::min((int)wf_rows_.size(), h);
+        for (int r = 0; r < nrows; r++) {
+            const auto& row = wf_rows_[r];
+            move(y + 1 + r, x);
+            int cur = -1;
+            for (int col = 0; col < w; col++) {
+                int b0 = col * WF_BINS / w;
+                int b1 = std::max(b0 + 1, (col + 1) * WF_BINS / w);
+                int q = 0;
+                for (int b = b0; b < b1 && b < WF_BINS; b++)
+                    q = std::max(q, (int)row[b]);
+                if (wf_pairs_ > 0) {
+                    int attr = COLOR_PAIR(WF_PAIR_BASE + q * wf_pairs_ / 256);
+                    if (attr != cur) {
+                        if (cur != -1) attroff(cur);
+                        attron(attr);
+                        cur = attr;
+                    }
+                    addch(' ');
+                } else {
+                    static const char ramp[] = " .:-=+*xX";
+                    addch(ramp[q * 9 / 256]);
+                }
+            }
+            if (cur != -1) attroff(cur);
+        }
+    }
+
     void draw_scope(int y, int h, int cols) {
         int c1 = 3;
-        
+        int bottom = y + h;  // first row past the scope area
+
         attron(COLOR_PAIR(4) | A_BOLD);
         mvaddstr(y, c1, "[ CONSTELLATION ]");
         attroff(COLOR_PAIR(4) | A_BOLD);
@@ -4641,6 +4821,7 @@ private:
         // Terminal chars are ~2:1 aspect ratio (taller than wide)
         // For visually square display: width should be ~2x height
         int const_height = available_h;
+        if (const_height > 10) const_height = 10;  // leftover rows go to the waterfall
         int const_width = const_height * 2;  // 2:1 aspect ratio compensation
         
         // Clamp to available width
@@ -4715,6 +4896,15 @@ private:
         attron(COLOR_PAIR(2));
         printw(" %d", state_.tx_frame_count.load());
         attroff(COLOR_PAIR(2));
+
+        y += 2;
+        int wf_h = bottom - (y + 1);  // history rows under the axis line
+        if (wf_h < 3) {
+            state_.scope_active = false;  // too small; skip audio capture too
+            return;
+        }
+        update_waterfall();
+        draw_waterfall(y, c1, wf_h, cols - c1 - 3);
     }
     
     void draw_utils(int y, int h, int cols) {
@@ -5951,6 +6141,17 @@ private:
             rx_off_dialog_field_ = current_field_;
         }
     }
+    static constexpr int WF_FFT = 256;
+    static constexpr int WF_BINS = WF_FFT / 2;  
+    static constexpr int WF_MAX_ROWS = 64;
+    static constexpr int WF_ROW_MS = 100;
+    static constexpr int WF_PAIR_BASE = 20;
+    int wf_pairs_ = 0;
+    std::deque<std::array<uint8_t, WF_BINS>> wf_rows_;
+    int64_t wf_row_ms_ = 0;
+    uint32_t wf_seen_ = 0;
+    float wf_floor_db_ = -80.0f;
+    DSP::RealToHalfComplexTransform<WF_FFT, std::complex<float>> wf_fft_;
     int config_scroll_ = 0;
     int log_scroll_ = 0;
     int utils_selection_ = 0;
