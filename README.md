@@ -65,7 +65,7 @@ It's recommended to use modem73 with [WSL](https://learn.microsoft.com/en-us/win
 
 ### Linux
 
-On a system with `apt`? Run the installer script:
+On a system with `apt` or an Arch-based distro with `pacman`? Run the installer script:
 ```
 ./install.sh
 ```
