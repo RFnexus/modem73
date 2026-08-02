@@ -1753,8 +1753,10 @@ private:
                     if (field == FIELD_MODEM_TYPE) {
                         int idx = modem_tab_at(event.x, cols);
                         if (idx >= 0) {
-                            state_.modem_type_index = idx;
-                            state_.update_modem_info();
+                            if (idx != state_.modem_type_index) {
+                                state_.modem_type_index = idx;
+                                apply_settings();
+                            }
                         } else if (event.x >= 18) {
                             adjust_field(event.x < 22 ? -1 : 1);
                         }
