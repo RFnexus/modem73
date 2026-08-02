@@ -1370,6 +1370,8 @@ private:
                 }
 
 #ifdef WITH_UI
+                if (g_ui_state && g_ui_state->scope_active.load(std::memory_order_relaxed))
+                    g_ui_state->push_scope_audio(buffer.data(), n);
                 if (g_ui_state && ++level_update_counter >= LEVEL_UPDATE_INTERVAL) {
                     level_update_counter = 0;
 
