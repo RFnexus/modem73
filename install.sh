@@ -61,12 +61,9 @@ echo "Installing packages: $PACKAGES"
 if [[ $DIST_STYLE == "debian" ]]; then
     sudo apt update
     sudo apt install -y $PACKAGES
-
-# Because Arch Linux is a rolling release, blindly installing updates with
-# no opportunity for the user to confirm can lead to disaster. Therefore, for
-# Arch, we require the user to approve the installation of any packages.
 elif [[ $DIST_STYLE == "arch" ]]; then
-    sudo pacman -Syu $PACKAGES
+    sudo pacman -Sy
+    sudo pacman -S $PACKAGES
 fi
 
 cd "$PARENT_DIR"
