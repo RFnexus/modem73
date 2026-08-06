@@ -12,7 +12,7 @@ For a precompiled build, find the release that matches your OS and architecture:
 
 - **Raspberry Pi** (Pi 5, Pi Zero 2): Debian 12 or Debian 13 `arm64`
 - **Everything else**: match your architecture. Builds are available for Ubuntu, Debian, and Mint.
-- **Windows**: see the separate Windows README and find the latest releases here https://github.com/RFnexus/modem73-win/releases/tag/
+- **Windows**: see the separate Windows README and find the latest releases here https://github.com/RFnexus/modem73-win/releases
 
 Install the package with `apt` or your system's package manager:
 
