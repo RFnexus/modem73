@@ -25,6 +25,7 @@ MODEM73 is an open source software modem that works with any HF, VHF, or UHF rad
 </table>
 
 
+### [5 minute quickstart guide](https://modem73.app/quickstart.html)
 
 SSB, AM, and FM are all supported. It's plug and play compatible with any KISS application and works with rigctl, CM108 sound devices, and serial PTT out of the box.
 
@@ -111,8 +112,6 @@ sudo make install
 and run `./modem73`
 
 ## Running & Operations
-
-See [QUICKSTART.md](https://github.com/RFnexus/modem73/blob/master/QUICKSTART.md) for a 5 minute quick start guide
 
 By default, MODEM73 will listen on port 8001
 
