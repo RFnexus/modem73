@@ -157,7 +157,7 @@ const RigMeterDef RIG_METERS[RIG_METER_COUNT] = {
 constexpr int RIG_METER_SWR = 1;
 constexpr float SWR_WARN_THRESHOLD = 2.5f;
 
-constexpr int UTILS_ACTION_COUNT = 11 + ALT_MODE_COUNT;
+constexpr int UTILS_ACTION_COUNT = 10 + ALT_MODE_COUNT;
 
 
 
@@ -4999,7 +4999,6 @@ private:
             "Send Ping",
             "Clear Stats",
             "Auto Threshold",
-            "Reconnect Audio",
             "Compose Message",
             "Auto Send",
             "Perf Log CSV",
@@ -5026,8 +5025,8 @@ private:
                 continue;
             }
             int i = utils_slot_action(slot);
-            const char* label = i >= 11 ? ALT_MODES[i - 11].label : actions[i];
-            const char* indent = i >= 11 ? "   " : "";
+            const char* label = i >= 10 ? ALT_MODES[i - 10].label : actions[i];
+            const char* indent = i >= 10 ? "   " : "";
             if (sel) {
                 attron(A_BOLD);
                 mvprintw(dy, c1, "> %d. %s%s", i + 1, indent, label);
@@ -5037,8 +5036,8 @@ private:
                 mvprintw(dy, c1, "  %d. %s%s", i + 1, indent, label);
                 attroff(A_DIM);
             }
-            if (i >= 11) {
-                bool on = (state_.alt_mode_mask >> (i - 11)) & 1;
+            if (i >= 10) {
+                bool on = (state_.alt_mode_mask >> (i - 10)) & 1;
                 if (on) {
                     attron(COLOR_PAIR(1) | A_BOLD);
                     printw("  [x]");
@@ -5046,7 +5045,7 @@ private:
                 } else {
                     printw("  [ ]");
                 }
-                if (auto_alt_enabled_ && alt_index_ == i - 11) {
+                if (auto_alt_enabled_ && alt_index_ == i - 10) {
                     attron(COLOR_PAIR(4) | A_BOLD);
                     printw("  <TX");
                     attroff(COLOR_PAIR(4) | A_BOLD);
@@ -5332,23 +5331,10 @@ private:
                 break;
             }
             case 5: {
-                state_.add_log("Reconnecting audio...");
-                if (state_.on_reconnect_audio) {
-                    if (state_.on_reconnect_audio()) {
-                        state_.audio_connected = true;
-                        state_.add_log("Audio reconnected OK");
-                    } else {
-                        state_.audio_connected = false;
-                        state_.add_log("Audio reconnect FAILED");
-                    }
-                }
-                break;
-            }
-            case 6: {
                 compose_message();
                 break;
             }
-            case 7: {
+            case 6: {
                 auto_send_enabled_ = !auto_send_enabled_;
                 if (auto_send_enabled_) {
                     auto_alt_enabled_ = false;
@@ -5361,7 +5347,7 @@ private:
                 }
                 break;
             }
-            case 8: {
+            case 7: {
                 if (state_.perf_logger) {
                     bool on = !state_.perf_logger->csv_enabled();
                     state_.perf_logger->set_csv_enabled(on);
@@ -5370,14 +5356,14 @@ private:
                 }
                 break;
             }
-            case 9: {
+            case 8: {
                 if (state_.perf_logger) {
                     state_.perf_logger->reset();
                     state_.add_log("Perf stats reset");
                 }
                 break;
             }
-            case 10: {
+            case 9: {
                 if (!auto_alt_enabled_ && state_.alt_mode_mask == 0) {
                     state_.add_log("Auto alternate: check some modes below first");
                     break;
@@ -5397,9 +5383,9 @@ private:
                 break;
             }
             default: {
-                if (action >= 11 &&
-                    action < 11 + ALT_MODE_COUNT) {
-                    int bit = action - 11;
+                if (action >= 10 &&
+                    action < 10 + ALT_MODE_COUNT) {
+                    int bit = action - 10;
                     state_.alt_mode_mask ^= 1 << bit;
                     state_.save_settings();
                 }
@@ -5449,7 +5435,7 @@ private:
         return out;
     }
 
-    static constexpr int UTILS_TOP_ACTIONS = 7;
+    static constexpr int UTILS_TOP_ACTIONS = 6;
     int utils_visible_slots() const {
         return state_.utils_testing_open ? UTILS_ACTION_COUNT + 1
                                          : UTILS_TOP_ACTIONS + 1;

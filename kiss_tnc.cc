@@ -385,8 +385,12 @@ public:
         std::thread rx_thread(&KISSTNC::rx_loop, this);
         std::thread tx_thread(&KISSTNC::tx_loop, this);
         std::thread watchdog_thread(&KISSTNC::ptt_watchdog_loop, this);
-        
-        // Main  
+
+        int64_t last_audio_check_ms = 0;
+        int64_t next_audio_retry_ms = 0;
+        int64_t audio_retry_backoff_ms = 5000;
+
+        // Main
         while (g_running) {
             struct sockaddr_in client_addr;
             socklen_t client_len = sizeof(client_addr);
@@ -469,9 +473,28 @@ public:
                 }
             }
             
+            int64_t audio_now_ms = steady_now_ms();
+            if (audio_now_ms - last_audio_check_ms >= 1000) {
+                last_audio_check_ms = audio_now_ms;
+                if (audio_ && !audio_->is_healthy() && audio_now_ms >= next_audio_retry_ms) {
+                    ui_log("(!) Audio unhealthy - attempting reconnect");
+                    if (audio_->reconnect()) {
+                        audio_->set_tx_gain(config_.tx_drive);
+                        ui_log("Audio reconnected");
+                        audio_retry_backoff_ms = 5000;
+                        next_audio_retry_ms = 0;
+                    } else {
+                        next_audio_retry_ms = audio_now_ms + audio_retry_backoff_ms;
+                        ui_log("Audio reconnect failed, retrying in " +
+                               std::to_string(audio_retry_backoff_ms / 1000) + "s");
+                        audio_retry_backoff_ms = std::min<int64_t>(audio_retry_backoff_ms * 2, 60000);
+                    }
+                }
+            }
+
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
-        
+
         // Cleanup
         tx_running_ = false;
         rx_running_ = false;
@@ -1424,10 +1447,12 @@ private:
                     }
                 }
 #endif
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
         }
     }
-    
+
     bool set_ptt(bool on) {
         std::lock_guard<std::mutex> lock(ptt_mutex_);
         bool ok = true;
@@ -2464,6 +2489,18 @@ int main(int argc, char** argv) {
                     config.robust_rx_enabled = ui_state.robust_rx_enabled;
                 if (!cli_set.count("mfsk_rx_enabled"))
                     config.mfsk_rx_enabled = ui_state.mfsk_rx_enabled;
+                if (!ui_state.audio_input_device.empty() &&
+                    ui_state.audio_input_device.find_first_not_of("0123456789") == std::string::npos) {
+                    size_t legacy_idx = std::stoul(ui_state.audio_input_device) + 1;
+                    if (legacy_idx < ui_state.available_input_devices.size())
+                        ui_state.audio_input_device = ui_state.available_input_devices[legacy_idx];
+                }
+                if (!ui_state.audio_output_device.empty() &&
+                    ui_state.audio_output_device.find_first_not_of("0123456789") == std::string::npos) {
+                    size_t legacy_idx = std::stoul(ui_state.audio_output_device) + 1;
+                    if (legacy_idx < ui_state.available_output_devices.size())
+                        ui_state.audio_output_device = ui_state.available_output_devices[legacy_idx];
+                }
                 // Audio devices
                 if (!cli_set.count("audio_input"))
                     config.audio_input_device = ui_state.audio_input_device;
