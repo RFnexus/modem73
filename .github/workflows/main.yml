@@ -169,7 +169,7 @@ jobs:
           apt-get install -y --no-install-recommends git ca-certificates
 
       - name: Checkout modem73
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: m73
 
@@ -211,11 +211,16 @@ jobs:
       - name: Build
         working-directory: m73
         env:
-          CC: ${{ matrix.cross_triple && format('{0}-gcc', matrix.cross_triple) || 'gcc' }}
-          CXX: ${{ matrix.cross_triple && format('{0}-g++', matrix.cross_triple) || 'g++' }}
-          PKG_CONFIG_PATH: ${{ matrix.cross_triple && format('/usr/lib/{0}/pkgconfig', matrix.cross_triple) || '' }}
-          PKG_CONFIG_LIBDIR: ${{ matrix.cross_triple && format('/usr/lib/{0}/pkgconfig:/usr/share/pkgconfig', matrix.cross_triple) || '' }}
+          CROSS_TRIPLE: ${{ matrix.cross_triple }}
         run: |
+          CC=gcc
+          CXX=g++
+          if [ -n "$CROSS_TRIPLE" ]; then
+            CC="${CROSS_TRIPLE}-gcc"
+            CXX="${CROSS_TRIPLE}-g++"
+            export PKG_CONFIG_PATH="/usr/lib/${CROSS_TRIPLE}/pkgconfig"
+            export PKG_CONFIG_LIBDIR="/usr/lib/${CROSS_TRIPLE}/pkgconfig:/usr/share/pkgconfig"
+          fi
           make -f packaging/Makefile.pkg \
                CC="$CC" CXX="$CXX" \
                ARCH_FLAGS="${{ matrix.arch_flags }}" \
@@ -232,11 +237,12 @@ jobs:
       - name: Stage install tree
         working-directory: m73
         env:
-          CC: ${{ matrix.cross_triple && format('{0}-gcc', matrix.cross_triple) || 'gcc' }}
-          CXX: ${{ matrix.cross_triple && format('{0}-g++', matrix.cross_triple) || 'g++' }}
-          PKG_CONFIG_PATH: ${{ matrix.cross_triple && format('/usr/lib/{0}/pkgconfig', matrix.cross_triple) || '' }}
-          PKG_CONFIG_LIBDIR: ${{ matrix.cross_triple && format('/usr/lib/{0}/pkgconfig:/usr/share/pkgconfig', matrix.cross_triple) || '' }}
+          CROSS_TRIPLE: ${{ matrix.cross_triple }}
         run: |
+          if [ -n "$CROSS_TRIPLE" ]; then
+            export PKG_CONFIG_PATH="/usr/lib/${CROSS_TRIPLE}/pkgconfig"
+            export PKG_CONFIG_LIBDIR="/usr/lib/${CROSS_TRIPLE}/pkgconfig:/usr/share/pkgconfig"
+          fi
           make -f packaging/Makefile.pkg install DESTDIR=../staging PREFIX=/usr
 
       - name: Build .deb
@@ -290,7 +296,7 @@ jobs:
           dpkg-deb --fsys-tarfile "$DEB" | tar -xO ./usr/bin/modem73 | file -
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pkg-deb-${{ matrix.id }}-${{ matrix.arch }}
           path: |
@@ -383,7 +389,7 @@ jobs:
           fi
 
       - name: Checkout modem73
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: m73
 
@@ -466,7 +472,7 @@ jobs:
           timeout 10 modem73 --help >/dev/null 2>&1 || true
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pkg-rpm-${{ matrix.id }}-${{ matrix.arch }}
           path: |
@@ -492,7 +498,7 @@ jobs:
           pacman -Syu --needed --noconfirm git ca-certificates tar
 
       - name: Checkout modem73
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: m73
 
@@ -563,7 +569,7 @@ jobs:
           timeout 10 modem73 --help >/dev/null 2>&1 || true
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pkg-arch-${{ matrix.id }}-${{ matrix.arch }}
           path: |
@@ -583,7 +589,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           pattern: pkg-*
@@ -593,7 +599,7 @@ jobs:
         run: ls -lR dist
 
       - name: Attach to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.event_name == 'workflow_dispatch' && format('v{0}', github.event.inputs.version) || '' }}
           name: ${{ github.event_name == 'workflow_dispatch' && format('v{0}', github.event.inputs.version) || '' }}
