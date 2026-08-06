@@ -173,24 +173,6 @@ jobs:
         with:
           path: m73
 
-      - name: Checkout aicodix/dsp
-        uses: actions/checkout@v4
-        with:
-          repository: aicodix/dsp
-          path: dsp
-
-      - name: Checkout aicodix/code
-        uses: actions/checkout@v4
-        with:
-          repository: aicodix/code
-          path: code
-
-      - name: Checkout aicodix/modem
-        uses: actions/checkout@v4
-        with:
-          repository: aicodix/modem
-          path: modem
-
       - name: Enable armhf
         if: matrix.cross_triple
         run: |
@@ -237,8 +219,15 @@ jobs:
           make -f packaging/Makefile.pkg \
                CC="$CC" CXX="$CXX" \
                ARCH_FLAGS="${{ matrix.arch_flags }}" \
-               AICODIX_DSP=../dsp AICODIX_CODE=../code MODEM_SRC=../modem \
                -j"$(nproc)"
+
+      - name: Verify CM108 support is compiled in
+        working-directory: m73
+        run: |
+          readelf -d modem73 | grep -q hidapi || {
+            echo "::error::binary is not linked against hidapi - CM108 PTT was silently disabled"
+            exit 1
+          }
 
       - name: Stage install tree
         working-directory: m73
@@ -253,10 +242,8 @@ jobs:
       - name: Build .deb
         working-directory: m73
         run: |
-          PATHS="usr"
           HIDAPI_DEP=""
-          if [ -d ../staging/lib ]; then
-            PATHS="$PATHS lib"
+          if [ -f ../staging/usr/lib/udev/rules.d/50-cm108-ptt.rules ]; then
             HIDAPI_DEP="-d libhidapi-hidraw0"
           fi
           fpm -s dir -t deb \
@@ -275,7 +262,7 @@ jobs:
             --deb-no-default-config-files \
             -C ../staging \
             -p "../modem73_${{ needs.prep.outputs.version }}_${{ matrix.id }}_${{ matrix.arch }}.deb" \
-            $PATHS
+            usr
 
       - name: Checksums
         run: |
@@ -319,8 +306,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - id: fedora-41
-            container: fedora:41
+          - id: fedora-43
+            container: fedora:43
             family: fedora
             arch: x86_64
             runner: ubuntu-24.04
@@ -330,8 +317,8 @@ jobs:
             dep_ncurses: ncurses-libs
             dep_cxx: libstdc++
             dep_hidapi: hidapi
-          - id: fedora-41
-            container: fedora:41
+          - id: fedora-43
+            container: fedora:43
             family: fedora
             arch: aarch64
             runner: ubuntu-24.04-arm
@@ -341,8 +328,8 @@ jobs:
             dep_ncurses: ncurses-libs
             dep_cxx: libstdc++
             dep_hidapi: hidapi
-          - id: fedora-42
-            container: fedora:42
+          - id: fedora-44
+            container: fedora:44
             family: fedora
             arch: x86_64
             runner: ubuntu-24.04
@@ -352,8 +339,8 @@ jobs:
             dep_ncurses: ncurses-libs
             dep_cxx: libstdc++
             dep_hidapi: hidapi
-          - id: fedora-42
-            container: fedora:42
+          - id: fedora-44
+            container: fedora:44
             family: fedora
             arch: aarch64
             runner: ubuntu-24.04-arm
@@ -363,25 +350,25 @@ jobs:
             dep_ncurses: ncurses-libs
             dep_cxx: libstdc++
             dep_hidapi: hidapi
-          - id: opensuse-leap-15.6
-            container: opensuse/leap:15.6
+          - id: opensuse-leap-16.0
+            container: opensuse/leap:16.0
             family: suse
             arch: x86_64
             runner: ubuntu-24.04
             arch_flags: "-march=x86-64-v2"
-            cc: gcc-13
-            cxx: g++-13
+            cc: gcc
+            cxx: g++
             dep_ncurses: libncurses6
             dep_cxx: libstdc++6
             dep_hidapi: libhidapi-hidraw0
-          - id: opensuse-leap-15.6
-            container: opensuse/leap:15.6
+          - id: opensuse-leap-16.0
+            container: opensuse/leap:16.0
             family: suse
             arch: aarch64
             runner: ubuntu-24.04-arm
             arch_flags: "-march=armv8-a"
-            cc: gcc-13
-            cxx: g++-13
+            cc: gcc
+            cxx: g++
             dep_ncurses: libncurses6
             dep_cxx: libstdc++6
             dep_hidapi: libhidapi-hidraw0
@@ -400,36 +387,16 @@ jobs:
         with:
           path: m73
 
-      - name: Checkout aicodix/dsp
-        uses: actions/checkout@v4
-        with:
-          repository: aicodix/dsp
-          path: dsp
-
-      - name: Checkout aicodix/code
-        uses: actions/checkout@v4
-        with:
-          repository: aicodix/code
-          path: code
-
-      - name: Checkout aicodix/modem
-        uses: actions/checkout@v4
-        with:
-          repository: aicodix/modem
-          path: modem
-
       - name: Install build dependencies
         run: |
           if [ "${{ matrix.family }}" = "fedora" ]; then
             dnf -y install gcc gcc-c++ make pkgconf-pkg-config ncurses-devel \
-              rpm-build redhat-rpm-config ruby ruby-devel
-            dnf -y install hidapi-devel || true
+              rpm-build redhat-rpm-config ruby ruby-devel hidapi-devel
           else
             zypper -n --gpg-auto-import-keys refresh || true
-            zypper -n install --force-resolution --oldpackage \
-              gcc gcc-c++ gcc13 gcc13-c++ make pkg-config ncurses-devel \
-              rpm-build ruby ruby-devel
-            zypper -n install --force-resolution --oldpackage libhidapi-devel || true
+            zypper -n install \
+              gcc gcc-c++ make pkgconf-pkg-config ncurses-devel \
+              rpm-build ruby ruby-devel libhidapi-devel
           fi
           gem install --no-document --bindir /usr/local/bin fpm
           echo /usr/local/bin >> "$GITHUB_PATH"
@@ -440,8 +407,15 @@ jobs:
           make -f packaging/Makefile.pkg \
                CC="${{ matrix.cc }}" CXX="${{ matrix.cxx }}" \
                ARCH_FLAGS="${{ matrix.arch_flags }}" \
-               AICODIX_DSP=../dsp AICODIX_CODE=../code MODEM_SRC=../modem \
                -j"$(nproc)"
+
+      - name: Verify CM108 support is compiled in
+        working-directory: m73
+        run: |
+          readelf -d modem73 | grep -q hidapi || {
+            echo "::error::binary is not linked against hidapi - CM108 PTT was silently disabled"
+            exit 1
+          }
 
       - name: Stage install tree
         working-directory: m73
@@ -452,10 +426,8 @@ jobs:
       - name: Build .rpm
         working-directory: m73
         run: |
-          PATHS="usr"
           HIDAPI_DEP=""
-          if [ -d ../staging/lib ]; then
-            PATHS="$PATHS lib"
+          if [ -f ../staging/usr/lib/udev/rules.d/50-cm108-ptt.rules ]; then
             HIDAPI_DEP="-d ${{ matrix.dep_hidapi }}"
           fi
           fpm -s dir -t rpm \
@@ -472,7 +444,7 @@ jobs:
             $HIDAPI_DEP \
             -C ../staging \
             -p "../modem73_${{ needs.prep.outputs.version }}_${{ matrix.id }}_${{ matrix.arch }}.rpm" \
-            $PATHS
+            usr
 
       - name: Checksums
         run: |
@@ -502,10 +474,110 @@ jobs:
             modem73_*.rpm.sha256
             modem73_*.rpm.sha512
 
+  build-arch:
+    needs: prep
+    runs-on: ubuntu-24.04
+    container: archlinux:base-devel
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: archlinux
+            arch: x86_64
+            arch_flags: "-march=x86-64-v2"
+
+    steps:
+      - name: Bootstrap container
+        run: |
+          pacman -Syu --needed --noconfirm git ca-certificates tar
+
+      - name: Checkout modem73
+        uses: actions/checkout@v4
+        with:
+          path: m73
+
+      - name: Install build dependencies
+        run: |
+          pacman -S --needed --noconfirm \
+            gcc make pkgconf ncurses hidapi ruby rubygems zstd fakeroot libarchive
+          gem install --no-document --bindir /usr/local/bin fpm
+          echo /usr/local/bin >> "$GITHUB_PATH"
+
+      - name: Build
+        working-directory: m73
+        run: |
+          make -f packaging/Makefile.pkg \
+               CC=gcc CXX=g++ \
+               ARCH_FLAGS="${{ matrix.arch_flags }}" \
+               -j"$(nproc)"
+
+      - name: Verify CM108 support is compiled in
+        working-directory: m73
+        run: |
+          readelf -d modem73 | grep -q hidapi || {
+            echo "::error::binary is not linked against hidapi - CM108 PTT was silently disabled"
+            exit 1
+          }
+
+      - name: Stage install tree
+        working-directory: m73
+        run: |
+          make -f packaging/Makefile.pkg install DESTDIR=../staging PREFIX=/usr
+
+      - name: Build package
+        working-directory: m73
+        run: |
+          HIDAPI_DEP=""
+          if [ -f ../staging/usr/lib/udev/rules.d/50-cm108-ptt.rules ]; then
+            HIDAPI_DEP="-d hidapi"
+          fi
+          fpm -s dir -t pacman \
+            -n modem73 \
+            -v "${{ needs.prep.outputs.version }}" \
+            -a "${{ matrix.arch }}" \
+            --description "KISS TNC frontend for the aicodix OFDM modem." \
+            --url "https://github.com/${{ github.repository }}" \
+            --license "see LICENSE" \
+            --maintainer "modem73 maintainers" \
+            -d glibc \
+            -d gcc-libs \
+            -d ncurses \
+            $HIDAPI_DEP \
+            -C ../staging \
+            -p "../modem73_${{ needs.prep.outputs.version }}_${{ matrix.id }}_${{ matrix.arch }}.pkg.tar.zst" \
+            usr
+
+      - name: Checksums
+        run: |
+          for f in modem73_*.pkg.tar.zst; do
+            sha256sum "$f" | tee "${f}.sha256"
+            sha512sum "$f" | tee "${f}.sha512"
+          done
+
+      - name: Smoke test
+        run: |
+          PKG="$(ls modem73_*.pkg.tar.zst)"
+          pacman -U --noconfirm "./$PKG"
+          command -v modem73
+          pacman -Ql modem73 | head -30
+          timeout 10 modem73 --help >/dev/null 2>&1 || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-arch-${{ matrix.id }}-${{ matrix.arch }}
+          path: |
+            modem73_*.pkg.tar.zst
+            modem73_*.pkg.tar.zst.sha256
+            modem73_*.pkg.tar.zst.sha512
+
   release:
-    needs: [prep, build-deb, build-rpm]
+    needs: [prep, build-deb, build-rpm, build-arch]
     if: |
-      always() &&
+      !cancelled() &&
+      needs.build-deb.result == 'success' &&
+      needs.build-rpm.result == 'success' &&
+      needs.build-arch.result == 'success' &&
       ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) ||
        (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true'))
     runs-on: ubuntu-24.04
@@ -532,5 +604,8 @@ jobs:
             dist/modem73_*.rpm
             dist/modem73_*.rpm.sha256
             dist/modem73_*.rpm.sha512
+            dist/modem73_*.pkg.tar.zst
+            dist/modem73_*.pkg.tar.zst.sha256
+            dist/modem73_*.pkg.tar.zst.sha512
           generate_release_notes: true
           fail_on_unmatched_files: false

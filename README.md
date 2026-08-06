@@ -90,7 +90,7 @@ CM108-based USB audio interfaces have GPIO pins that can be used for PTT control
 sudo apt install libhidapi-dev
 ```
 ----
-2. Clone aiocdix DSP libraries and build.
+2. Clone and build
 
 
 

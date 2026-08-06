@@ -114,7 +114,7 @@ help:
 	@echo "  CM108 PTT    - Requires libhidapi-dev (auto-detected)"
 	@echo ""
 	@echo "Example:"
-	@echo "  make AICODIX_DSP=../dsp AICODIX_CODE=../code MODEM_SRC=../modem"
+	@echo "  make"
 	@echo ""
 	@echo "Runtime options:"
 	@echo "  ./modem73            # Run with UI"

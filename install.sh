@@ -32,9 +32,9 @@ echo ""
 # Depending on the distribution style, the naming convention and sources for
 # the dependent packages will be different.
 if [[ $DIST_STYLE == "debian" ]]; then
-    PACKAGES="git build-essential libncurses-dev g++"
+    PACKAGES="git build-essential libncurses-dev g++ pkg-config"
 elif [[ $DIST_STYLE == "arch" ]]; then
-    PACKAGES="git base-devel ncurses"
+    PACKAGES="git base-devel ncurses pkgconf"
 fi
 
 read -rp "Install hamlib for rigctl PTT support? [y/N] " HAMLIB
@@ -62,8 +62,7 @@ if [[ $DIST_STYLE == "debian" ]]; then
     sudo apt-get update
     sudo apt-get install -y $PACKAGES
 elif [[ $DIST_STYLE == "arch" ]]; then
-    sudo pacman -Sy
-    sudo pacman -S $PACKAGES
+    sudo pacman -Syu --needed $PACKAGES
 fi
 
 cd "$PARENT_DIR"
@@ -78,6 +77,15 @@ make -j"$(nproc)"
 
 echo ""
 echo "Build complete."
+
+if [[ "$CM108" =~ ^[Yy]$ ]] && ! ldd modem73 2>/dev/null | grep -q hidapi; then
+    echo ""
+    echo "WARNING: you asked for CM108 USB PTT, but the binary is not linked"
+    echo "against hidapi, so CM108 is disabled. The Makefile detects hidapi"
+    echo "through pkg-config -- check that both pkg-config and the hidapi"
+    echo "development headers installed correctly, then rebuild."
+fi
+
 echo ""
 read -rp "Install modem73 to /usr/local/bin? [y/N] " INSTALL
 if [[ "$INSTALL" =~ ^[Yy]$ ]]; then
