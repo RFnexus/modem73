@@ -236,7 +236,8 @@ public:
         );
 
         if (modem_config_.call_sign < 0) {
-            throw std::runtime_error("Invalid callsign");
+            throw std::runtime_error("Invalid callsign '" + config.callsign +
+                                     "' (A-Z 0-9 / only, 1-9 characters)");
         }
         if (modem_config_.oper_mode < 0) {
             throw std::runtime_error("Invalid modulation or code rate");
@@ -253,9 +254,10 @@ public:
     }
     
     void run() {
-        audio_ = std::make_unique<MiniAudio>(config_.audio_input_device, 
+        audio_ = std::make_unique<MiniAudio>(config_.audio_input_device,
                                              config_.audio_output_device,
                                              config_.sample_rate);
+        audio_->set_log_sink([](const std::string& msg) { ui_log(msg); });
         if (!audio_->open_playback()) {
             throw std::runtime_error("Failed to open audio output");
         }
@@ -485,7 +487,7 @@ public:
                         next_audio_retry_ms = 0;
                     } else {
                         next_audio_retry_ms = audio_now_ms + audio_retry_backoff_ms;
-                        ui_log("Audio reconnect failed, retrying in " +
+                        ui_log("(!) Audio reconnect failed, retrying in " +
                                std::to_string(audio_retry_backoff_ms / 1000) + "s");
                         audio_retry_backoff_ms = std::min<int64_t>(audio_retry_backoff_ms * 2, 60000);
                     }
@@ -1484,7 +1486,7 @@ private:
             ptt_state_.store(false);
             ptt_deadline_ms_.store(0);
             ptt_unkey_retries_ = 0;
-            ui_log("(!) PTT unkey failed repeatedly - check the radio is not stuck in TX");
+            ui_log("(!) PTT unkey failed repeatedly - check the radio is not stuck in TX and that your PTT settings are correct");
         }
 
 #ifdef WITH_UI
@@ -1734,9 +1736,14 @@ public:
         
         // Update callsign if changed
         if (config_.callsign != new_config.callsign) {
-            config_.callsign = new_config.callsign;
-            modem_config_.call_sign = ModemConfig::encode_callsign(config_.callsign.c_str());
-            ui_log("Callsign changed to " + config_.callsign);
+            if (ModemConfig::valid_callsign(new_config.callsign.c_str())) {
+                config_.callsign = new_config.callsign;
+                modem_config_.call_sign = ModemConfig::encode_callsign(config_.callsign.c_str());
+                ui_log("Callsign changed to " + config_.callsign);
+            } else {
+                ui_log("(!) Invalid callsign '" + new_config.callsign +
+                       "' (A-Z 0-9 / only, 1-9 chars), keeping " + config_.callsign);
+            }
         }
         
         // Update center frequency
@@ -2540,6 +2547,8 @@ int main(int argc, char** argv) {
                 // Network settings
                 if (!cli_set.count("port"))
                     config.port = ui_state.port;
+                if (!cli_control_port)
+                    config.control_port = ui_state.control_port;
                 if (!cli_set.count("bind_address"))
                     config.bind_address = ui_state.bind_address;
                 if (!cli_set.count("control_bind_address"))
@@ -2605,6 +2614,7 @@ int main(int argc, char** argv) {
 #endif
                 // Network settings
                 ui_state.port = config.port;
+                ui_state.control_port = config.control_port;
                 ui_state.bind_address = config.bind_address;
                 ui_state.control_bind_address = config.control_bind_address;
 
@@ -2651,6 +2661,7 @@ int main(int argc, char** argv) {
         ui_state.cm108_device = config.cm108_device;
 #endif
         ui_state.port = config.port;
+        ui_state.control_port = config.control_port;
         ui_state.bind_address = config.bind_address;
         ui_state.control_bind_address = config.control_bind_address;
         for (size_t i = 0; i < MODULATION_OPTIONS.size(); ++i) {

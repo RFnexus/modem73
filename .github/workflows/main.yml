@@ -404,8 +404,7 @@ jobs:
               gcc gcc-c++ make pkgconf-pkg-config ncurses-devel \
               rpm-build ruby ruby-devel libhidapi-devel
           fi
-          gem install --no-document --bindir /usr/local/bin fpm
-          echo /usr/local/bin >> "$GITHUB_PATH"
+          gem install --no-document --bindir /usr/bin fpm
 
       - name: Build
         working-directory: m73
@@ -505,9 +504,8 @@ jobs:
       - name: Install build dependencies
         run: |
           pacman -S --needed --noconfirm \
-            gcc make pkgconf ncurses hidapi ruby rubygems zstd fakeroot libarchive
-          gem install --no-document --bindir /usr/local/bin fpm
-          echo /usr/local/bin >> "$GITHUB_PATH"
+            gcc make pkgconf ncurses hidapi ruby rubygems ruby-erb zstd fakeroot libarchive
+          gem install --no-document --bindir /usr/bin fpm
 
       - name: Build
         working-directory: m73

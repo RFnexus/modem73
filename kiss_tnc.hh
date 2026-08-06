@@ -5,6 +5,7 @@
 #include <queue>
 #include <map>
 #include <mutex>
+#include <random>
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -439,7 +440,7 @@ namespace Frag {
 
 class Fragmenter {
 public:
-    Fragmenter() : next_packet_id_(0) {}
+    Fragmenter() : next_packet_id_((uint16_t)std::random_device{}()) {}
     
     std::vector<std::vector<uint8_t>> fragment(const std::vector<uint8_t>& data, size_t max_payload) {
         std::vector<std::vector<uint8_t>> fragments;
@@ -511,9 +512,21 @@ public:
         std::vector<uint8_t> payload(fragment.begin() + Frag::HEADER_SIZE, fragment.end());
         
         std::lock_guard<std::mutex> lock(mutex_);
-        
+
         cleanup_stale();
-        
+
+        {
+            auto pit = pending_.find(packet_id);
+            if (pit != pending_.end()) {
+                auto fit = pit->second.fragments.find(seq);
+                if (fit != pit->second.fragments.end() && fit->second != payload) {
+                    std::cerr << "Reassembler: fragment collision on packet id "
+                              << packet_id << ", discarding pending packet" << std::endl;
+                    pending_.erase(pit);
+                }
+            }
+        }
+
         auto& pkt = pending_[packet_id];
         if (pkt.fragments.empty()) {
             pkt.first_seen = std::chrono::steady_clock::now();

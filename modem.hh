@@ -91,7 +91,31 @@ struct ModemConfig {
     int64_t call_sign = 0;
     int oper_mode = 0;
     
+    static bool valid_callsign(const char* str) {
+        if (!str)
+            return false;
+        size_t len = 0;
+        bool nonspace = false;
+        for (const char* p = str; *p; ++p) {
+            char c = *p;
+            if (++len > 9)
+                return false;
+            if (c == '/' || c == ' ' ||
+                (c >= '0' && c <= '9') ||
+                (c >= 'a' && c <= 'z') ||
+                (c >= 'A' && c <= 'Z')) {
+                if (c != ' ')
+                    nonspace = true;
+                continue;
+            }
+            return false;
+        }
+        return nonspace;
+    }
+
     static int64_t encode_callsign(const char* str) {
+        if (!valid_callsign(str))
+            return -1;
         int64_t acc = 0;
         for (char c = *str++; c; c = *str++) {
             acc *= 40;

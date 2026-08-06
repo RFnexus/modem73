@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <algorithm>
 #include <atomic>
+#include <functional>
 #include <mutex>
 #include <shared_mutex>
 #include <thread>
@@ -109,6 +110,10 @@ public:
 
     const std::string& capture_device() const { return capture_device_id_; }
     const std::string& playback_device() const { return playback_device_id_; }
+
+    void set_log_sink(std::function<void(const std::string&)> sink) {
+        log_sink_ = std::move(sink);
+    }
 
     void set_capture_device(const std::string& device) {
         std::lock_guard<std::mutex> guard(lifecycle_mutex_);
@@ -321,11 +326,16 @@ private:
     static constexpr size_t RING_BUFFER_SIZE = 48000;
     static constexpr size_t CAPTURE_RING_SIZE = 8 * 48000;
 
+    void log_msg(const std::string& msg) {
+        if (log_sink_) log_sink_(msg);
+        else std::cerr << msg << std::endl;
+    }
+
     bool ensure_context() {
         if (context_initialized_) return true;
 
         if (ma_context_init(NULL, 0, NULL, &context_) != MA_SUCCESS) {
-            std::cerr << "Failed to initialize audio context" << std::endl;
+            log_msg("(!) Failed to initialize audio context");
             return false;
         }
         context_initialized_ = true;
@@ -382,24 +392,24 @@ private:
             if (find_device_id(false, playback_device_id_, &stored_playback_id_)) {
                 config.playback.pDeviceID = &stored_playback_id_;
             } else {
-                std::cerr << "Playback device '" << playback_device_id_
-                          << "' not found, using system default" << std::endl;
+                log_msg("(!) Playback device '" + playback_device_id_ +
+                        "' not found, using system default");
             }
         }
 
         if (ma_device_init(&context_, &config, &playback_device_) != MA_SUCCESS) {
-            std::cerr << "Failed to init playback device" << std::endl;
+            log_msg("(!) Failed to init playback device");
             return false;
         }
 
         if (ma_device_start(&playback_device_) != MA_SUCCESS) {
-            std::cerr << "Failed to start playback device" << std::endl;
+            log_msg("(!) Failed to start playback device");
             ma_device_uninit(&playback_device_);
             return false;
         }
 
         playback_open_.store(true, std::memory_order_release);
-        std::cerr << "Playback: " << playback_device_.playback.name << std::endl;
+        log_msg(std::string("Playback: ") + playback_device_.playback.name);
         return true;
     }
 
@@ -420,24 +430,24 @@ private:
             if (find_device_id(true, capture_device_id_, &stored_capture_id_)) {
                 config.capture.pDeviceID = &stored_capture_id_;
             } else {
-                std::cerr << "Capture device '" << capture_device_id_
-                          << "' not found, using system default" << std::endl;
+                log_msg("(!) Capture device '" + capture_device_id_ +
+                        "' not found, using system default");
             }
         }
 
         if (ma_device_init(&context_, &config, &capture_device_) != MA_SUCCESS) {
-            std::cerr << "Failed to initialize capture device" << std::endl;
+            log_msg("(!) Failed to initialize capture device");
             return false;
         }
 
         if (ma_device_start(&capture_device_) != MA_SUCCESS) {
-            std::cerr << "Failed to start capture device" << std::endl;
+            log_msg("(!) Failed to start capture device");
             ma_device_uninit(&capture_device_);
             return false;
         }
 
         capture_open_.store(true, std::memory_order_release);
-        std::cerr << "Capture: " << capture_device_.capture.name << std::endl;
+        log_msg(std::string("Capture: ") + capture_device_.capture.name);
         return true;
     }
 
@@ -526,6 +536,7 @@ private:
     std::string capture_device_id_;
     std::string playback_device_id_;
     int sample_rate_;
+    std::function<void(const std::string&)> log_sink_;
 
     ma_context context_;
     bool context_initialized_ = false;

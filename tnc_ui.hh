@@ -23,6 +23,7 @@
 #include <random>
 #include <unistd.h>
 #include <fcntl.h>
+#include <glob.h>
 
 #include "kiss_tnc.hh"
 #include "phy/mfsk_modem.hh"
@@ -216,6 +217,7 @@ struct TNCUIState {
     
     // Network
     int port = 8001;
+    int control_port = 8073;
     std::string bind_address = "0.0.0.0";
     std::string control_bind_address = "127.0.0.1";
 
@@ -773,6 +775,7 @@ struct TNCUIState {
 #endif
         fprintf(f, "# Network\n");
         fprintf(f, "port=%d\n", port);
+        fprintf(f, "control_port=%d\n", control_port);
         fprintf(f, "bind_address=%s\n", bind_address.c_str());
         fprintf(f, "control_bind_address=%s\n", control_bind_address.c_str());
         fprintf(f, "# Utils\n");
@@ -888,6 +891,10 @@ struct TNCUIState {
                 else if (strcmp(key, "port") == 0) {
                     int v = atoi(value);
                     if (v >= 1 && v <= 65535) port = v;
+                }
+                else if (strcmp(key, "control_port") == 0) {
+                    int v = atoi(value);
+                    if (v >= 1 && v <= 65535) control_port = v;
                 }
                 else if (strcmp(key, "bind_address") == 0) bind_address = value;
                 else if (strcmp(key, "control_bind_address") == 0) control_bind_address = value;
@@ -1081,7 +1088,8 @@ struct TNCUIState {
 
     std::mutex log_mutex;
     std::deque<std::string> log_entries;
-    
+    std::atomic<bool> log_unread_error{false};
+
     std::function<void(TNCUIState&)> on_settings_changed;
     std::function<void()> on_stop_requested;
     std::function<bool()> on_reconnect_audio;  
@@ -1095,6 +1103,7 @@ struct TNCUIState {
         std::stringstream ss;
         ss << std::put_time(&tmv, "%H:%M:%S") << "  " << msg;
         log_entries.push_back(ss.str());
+        if (msg.rfind("(!)", 0) == 0) log_unread_error = true;
         if (log_entries.size() > MAX_LOG_ENTRIES) {
             log_entries.pop_front();
         }
@@ -1386,6 +1395,7 @@ private:
         FIELD_CM108_DEVICE,
 #endif
         FIELD_NET_PORT,
+        FIELD_CONTROL_PORT,
         FIELD_PRESET,
         FIELD_COUNT
     };
@@ -1607,11 +1617,14 @@ private:
 
                         edit_text_field(FIELD_NET_PORT);
 
+                    } else if (current_field_ == FIELD_CONTROL_PORT) {
+
+                        edit_text_field(FIELD_CONTROL_PORT);
 
                     } else if (current_field_ == FIELD_COM_PORT) {
 
 
-                        edit_text_field(FIELD_COM_PORT);
+                        show_com_port_dialog();
 
 #ifdef WITH_CM108
                     } else if (current_field_ == FIELD_CM108_GPIO) {
@@ -1802,15 +1815,15 @@ private:
                         }
                     } else if (field == FIELD_PRESET) {
                         // Click on preset - determine action by position
-                        if (event.x >= 18 && event.x < 22 && !state_.presets.empty()) {
+                        if (event.x >= 15 && event.x < 18 && !state_.presets.empty()) {
                             // Left arrow
                             state_.selected_preset--;
-                            if (state_.selected_preset < 0) 
+                            if (state_.selected_preset < 0)
                                 state_.selected_preset = state_.presets.size() - 1;
-                        } else if (event.x >= 22 && event.x < 38 && !state_.presets.empty()) {
+                        } else if (event.x >= 18 && event.x < 28 && !state_.presets.empty()) {
                             // Name area - load on click
                             load_selected_preset();
-                        } else if (event.x >= 38 && !state_.presets.empty()) {
+                        } else if (event.x >= 28 && event.x < 34 && !state_.presets.empty()) {
                             // Right arrow area
                             state_.selected_preset++;
                             if (state_.selected_preset >= (int)state_.presets.size())
@@ -1882,38 +1895,27 @@ private:
     }
 
     void edit_text_field(int field) {
-        // MODEM:4, Callsign:5, Mod:6, Rate:7, Frame:8, Freq:9
-        // CSMA:11, Enabled:12, Thresh:13, Persist:14
-        // AUDIO:16, Input:17, Output:18, PTT:19
-        // VOX:20-21 (if PTT=VOX), COM:20-22 (if PTT=COM)
-        
-        int row = -1;
         int col = 16;
-        int max_len = 10;
-        
+        int max_len;
+
         if (field == FIELD_CALLSIGN) {
-            row = 5;
-            max_len = 10;
+            max_len = 9;
         } else if (field == FIELD_COM_PORT) {
-            row = 20;  
             max_len = 20;
 #ifdef WITH_CM108
         } else if (field == FIELD_CM108_GPIO) {
-            row = 20;  
             max_len = 1;
 #endif
         } else if (field == FIELD_NET_PORT) {
-            if (state_.ptt_type_index == 2) {  //2 extra rows
-                row = 24;
-            } else if (state_.ptt_type_index == 3) {  
-                row = 25;
-            } else {
-                row = 22;  
-            }
+            max_len = 5;
+        } else if (field == FIELD_CONTROL_PORT) {
             max_len = 5;
         } else {
             return; // not text editable
         }
+
+        int row = 4 + config_field_row(field) - config_scroll_;
+        if (row < 4) return;
         
         // Clear the value area
         move(row, col);
@@ -1946,7 +1948,16 @@ private:
                     int port = std::stoi(buf);
                     if (port >= 1024 && port <= 65535) {
                         state_.port = port;
-                        state_.add_log("(!) Port changed, restart required");
+                        state_.add_log("(!) KISS port changed, restart required");
+                        apply_settings();
+                    }
+                } catch (...) {}
+            } else if (field == FIELD_CONTROL_PORT) {
+                try {
+                    int port = std::stoi(buf);
+                    if (port >= 1024 && port <= 65535) {
+                        state_.control_port = port;
+                        state_.add_log("(!) Control port changed, restart required");
                         apply_settings();
                     }
                 } catch (...) {}
@@ -2124,6 +2135,8 @@ private:
         row++;
         row++;
         if (field == FIELD_NET_PORT) return row;
+        row++;
+        if (field == FIELD_CONTROL_PORT) return row;
         row += 2;
         row++;
         if (field == FIELD_PRESET) return row;
@@ -2342,6 +2355,113 @@ private:
         state_.save_settings();
     }
     
+    void show_com_port_dialog() {
+        std::vector<std::string> ports;
+        std::vector<std::string> labels;
+        const char* patterns[] = {"/dev/serial/by-id/*", "/dev/ttyUSB*", "/dev/ttyACM*"};
+        for (const char* pat : patterns) {
+            glob_t g;
+            if (glob(pat, 0, nullptr, &g) == 0) {
+                for (size_t i = 0; i < g.gl_pathc; i++) {
+                    ports.push_back(g.gl_pathv[i]);
+                    labels.push_back(g.gl_pathv[i]);
+                }
+            }
+            globfree(&g);
+        }
+        ports.push_back("");
+        labels.push_back("[ Type manually ]");
+
+        int rows, cols;
+        getmaxyx(stdscr, rows, cols);
+        int dialog_w = std::min(cols - 4, 66);
+        int max_visible = std::min((int)ports.size(), 12);
+        int dialog_h = max_visible + 3;
+        int dialog_x = (cols - dialog_w) / 2;
+        int dialog_y = (rows - dialog_h) / 2;
+
+        int selection = 0;
+        for (size_t i = 0; i < ports.size(); i++) {
+            if (ports[i] == state_.com_port) { selection = i; break; }
+        }
+        int scroll_offset = 0;
+        if (selection >= max_visible) scroll_offset = selection - max_visible + 1;
+
+        nodelay(stdscr, FALSE);
+
+        bool manual = false;
+        while (true) {
+            for (int y = dialog_y; y < dialog_y + dialog_h; y++) {
+                move(y, dialog_x);
+                for (int x = 0; x < dialog_w; x++) addch(' ');
+            }
+            attron(COLOR_PAIR(4) | A_BOLD);
+            draw_box(dialog_y, dialog_x, dialog_h, dialog_w);
+            const char* title = " Serial Port ";
+            mvaddstr(dialog_y, dialog_x + (dialog_w - strlen(title)) / 2, title);
+            attroff(COLOR_PAIR(4) | A_BOLD);
+
+            int visible_count = std::min((int)ports.size() - scroll_offset, max_visible);
+            for (int i = 0; i < visible_count; i++) {
+                int idx = scroll_offset + i;
+                int y = dialog_y + 1 + i;
+                mvhline(y, dialog_x + 1, ' ', dialog_w - 2);
+                if (idx == selection) {
+                    attron(COLOR_PAIR(4) | A_BOLD);
+                    mvaddstr(y, dialog_x + 1, "> ");
+                } else {
+                    mvaddstr(y, dialog_x + 1, "  ");
+                }
+                std::string label = labels[idx];
+                int max_len = dialog_w - 4;
+                if ((int)label.length() > max_len)
+                    label = label.substr(0, max_len - 2) + "..";
+                addstr(label.c_str());
+                if (idx == selection) attroff(COLOR_PAIR(4) | A_BOLD);
+            }
+
+            attron(A_DIM);
+            if (scroll_offset > 0)
+                mvaddstr(dialog_y, dialog_x + dialog_w - 3, "^");
+            if (scroll_offset + max_visible < (int)ports.size())
+                mvaddstr(dialog_y + dialog_h - 1, dialog_x + dialog_w - 3, "v");
+            mvaddstr(dialog_y + dialog_h - 1, dialog_x + 2, " Enter=OK  Esc=Cancel ");
+            attroff(A_DIM);
+
+            refresh();
+            int ch = getch();
+
+            if (ch == 27 || ch == 'q') {
+                break;
+            } else if (ch == '\n' || ch == KEY_ENTER) {
+                if (selection >= 0 && selection < (int)ports.size()) {
+                    if (ports[selection].empty()) {
+                        manual = true;
+                    } else {
+                        state_.com_port = ports[selection];
+                        state_.add_log("(!) COM port changed, restart required");
+                        apply_settings();
+                    }
+                }
+                break;
+            } else if (ch == KEY_UP || ch == 'k') {
+                if (selection > 0) {
+                    selection--;
+                    if (selection < scroll_offset) scroll_offset = selection;
+                }
+            } else if (ch == KEY_DOWN || ch == 'j') {
+                if (selection < (int)ports.size() - 1) {
+                    selection++;
+                    if (selection >= scroll_offset + max_visible)
+                        scroll_offset = selection - max_visible + 1;
+                }
+            }
+        }
+
+        nodelay(stdscr, TRUE);
+        if (manual) edit_text_field(FIELD_COM_PORT);
+    }
+
     void show_device_select_dialog(bool is_input) {
         int rows, cols;
         getmaxyx(stdscr, rows, cols);
@@ -2866,7 +2986,9 @@ private:
         else
 
             snprintf(utils_tab, sizeof(utils_tab), "UTILS");
-        const char* tabs[] = {"STATUS", "CONFIG", "LOG", utils_tab, "SCOPE", "RIG"};
+        bool log_err = state_.log_unread_error.load() && current_tab_ != 2;
+        const char* log_tab = log_err ? "LOG (!)" : "LOG";
+        const char* tabs[] = {"STATUS", "CONFIG", log_tab, utils_tab, "SCOPE", "RIG"};
         int ntabs = tab_count();
         int tab_width = (cols - 4) / ntabs;
 
@@ -2880,9 +3002,11 @@ private:
                 attroff(A_BOLD);
             } else {
                 if (i == 3 && unread > 0) attron(COLOR_PAIR(4) | A_BOLD);
+                else if (i == 2 && log_err) attron(COLOR_PAIR(3) | A_BOLD);
                 else attron(A_DIM);
                 mvprintw(2, tx, "  %s", tabs[i]);
                 if (i == 3 && unread > 0) attroff(COLOR_PAIR(4) | A_BOLD);
+                else if (i == 2 && log_err) attroff(COLOR_PAIR(3) | A_BOLD);
                 else attroff(A_DIM);
             }
         }
@@ -3999,7 +4123,15 @@ private:
         if (dy >= 0) {
             char port_buf[32];
             snprintf(port_buf, sizeof(port_buf), "%d", state_.port);
-            draw_field(dy, c1, c2, "Port", FIELD_NET_PORT, port_buf, true);
+            draw_field(dy, c1, c2, "KISS Port", FIELD_NET_PORT, port_buf, true);
+        }
+        row++;
+
+        dy = visible_y(row);
+        if (dy >= 0) {
+            char cport_buf[32];
+            snprintf(cport_buf, sizeof(cport_buf), "%d", state_.control_port);
+            draw_field(dy, c1, c2, "Control Port", FIELD_CONTROL_PORT, cport_buf, true);
         }
         row += 2;
         
@@ -4205,11 +4337,17 @@ private:
             attroff(A_DIM);
             y++;
             
-            mvprintw(y, c3, "%s %s %s",
-                     MODULATION_OPTIONS[p.modulation_index].c_str(),
-                     CODE_RATE_OPTIONS[p.code_rate_index].c_str(),
-                     p.frame_size == 0 ? "S" : p.frame_size == 2 ? "L"
-                   : p.frame_size == 3 ? "U" : "N");
+            if (p.modem_type_index == 1) {
+                mvprintw(y, c3, "%s", MFSK_MODE_OPTIONS[p.mfsk_mode_index].c_str());
+            } else if (p.modem_type_index == 2) {
+                mvprintw(y, c3, "%s", ROBUST_MODE_OPTIONS[p.robust_mode_index].c_str());
+            } else {
+                mvprintw(y, c3, "%s %s %s",
+                         MODULATION_OPTIONS[p.modulation_index].c_str(),
+                         CODE_RATE_OPTIONS[p.code_rate_index].c_str(),
+                         p.frame_size == 0 ? "S" : p.frame_size == 2 ? "L"
+                       : p.frame_size == 3 ? "U" : "N");
+            }
             y++;
             
             mvaddstr(y, c3, "PTT ");
@@ -4456,15 +4594,16 @@ private:
         int visible = h - 1;
         int max_scroll = std::max(0, (int)log.size() - visible);
         log_scroll_ = std::min(log_scroll_, max_scroll);
-        
+
         int text_width = cols - 5;
-        
+
         for (int i = 0; i < visible && (log_scroll_ + i) < (int)log.size(); i++) {
             const std::string& line = log[log_scroll_ + i];
-            
+
             int pair = 0;
             bool bold = false;
-            if (line.find("TX:") != std::string::npos) { pair = 2; bold = true; }
+            if (line.size() > 12 && line.compare(10, 3, "(!)") == 0) { pair = 3; bold = true; }
+            else if (line.find("TX:") != std::string::npos) { pair = 2; bold = true; }
             else if (line.find("RX:") != std::string::npos) { pair = 1; bold = true; }
             else if (line.find("CSMA") != std::string::npos) pair = 3;
             else if (line.find("error") != std::string::npos || 
@@ -4484,7 +4623,9 @@ private:
             if (bold) attroff(A_BOLD);
             if (pair) attroff(COLOR_PAIR(pair));
         }
-        
+
+        state_.log_unread_error = false;
+
         // scrollbar based on dims
         if ((int)log.size() > visible && visible > 2) {
             int sb_height = visible;
