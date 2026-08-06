@@ -7,12 +7,12 @@ if [[ $(id -u) -eq 0 ]]; then
 fi
 
 # Check if this is Debian, Ubuntu, or some other distribution that uses APT.
-if apt -h >/dev/null 2>&1; then
+if command -v apt-get >/dev/null 2>&1; then
     echo "APT-based distribution detected"
     DIST_STYLE="debian"
 
 # Check if this is Arch Linux.
-elif stat /etc/arch-release >/dev/null 2>&1; then
+elif command -v pacman >/dev/null 2>&1; then
     echo "Pacman-based distribution detected"
     DIST_STYLE="arch"
 
@@ -59,8 +59,8 @@ echo ""
 echo "Installing packages: $PACKAGES"
 
 if [[ $DIST_STYLE == "debian" ]]; then
-    sudo apt update
-    sudo apt install -y $PACKAGES
+    sudo apt-get update
+    sudo apt-get install -y $PACKAGES
 elif [[ $DIST_STYLE == "arch" ]]; then
     sudo pacman -Sy
     sudo pacman -S $PACKAGES
