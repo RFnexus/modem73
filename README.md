@@ -112,6 +112,8 @@ and run `./modem73`
 
 ## Running & Operations
 
+See [QUICKSTART.md](https://github.com/RFnexus/modem73/blob/master/QUICKSTART.md) for a 5 minute quick start guide
+
 By default, MODEM73 will listen on port 8001
 
 All of the modes provided by the OFDM modem require a bandwidth of 2400 Hz and work over both FM and SSB. 
