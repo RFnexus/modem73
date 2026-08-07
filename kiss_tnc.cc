@@ -1046,6 +1046,8 @@ private:
                 // Leading silence (TXDelay)
                 int lead_frames = config_.tx_delay_ms * config_.sample_rate / 1000;
                 if (config_.tx_lead_tone && config_.tx_delay_ms >= 250) {
+                    int lead_ms = std::max(config_.tx_delay_ms, 500);
+                    lead_frames = lead_ms * config_.sample_rate / 1000;
                     int gap_frames = 150 * config_.sample_rate / 1000;
                     auto lead = ToneDCD::signature_lead(modem_config_.center_freq,
                                                         lead_frames - gap_frames, 0.6f,
@@ -1352,6 +1354,7 @@ private:
             mfsk_callbacks[i] = make_mfsk_callback(mfsk_decoders_[i].get());
 
         bool was_blanking = false;
+        bool was_on_air = false;
 
         while (rx_running_ && g_running) {
             int n = audio_->read(buffer.data(), buffer.size());
@@ -1444,7 +1447,13 @@ private:
                         robust_decoder_n_->process(buffer.data(), n, robust_n_frame_callback);
                     }
 
-                    tone_dcd_->process(buffer.data(), n);
+                    bool on_air = tx_on_air_.load();
+                    if (!on_air) {
+                        if (was_on_air)
+                            tone_dcd_->reset();
+                        tone_dcd_->process(buffer.data(), n);
+                    }
+                    was_on_air = on_air;
                     int64_t tnow = steady_now_ms();
                     uint16_t heard_id;
                     if (tone_dcd_->consume_station_id(&heard_id)) {
