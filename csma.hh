@@ -30,17 +30,21 @@ public:
         int window = std::max(2, cfg_.cw) * slot;
         if (cfg_.idle_credit_ms >= cfg_.cold_channel_ms)
             window = std::max(window / 4, 4 * slot);
+        if (cfg_.sync_only)
+            window *= 2;
         window_ = window;
         std::mt19937 gen(seed);
         if (cfg_.responder) {
             quiet_needed_ = std::min(cfg_.quiet_ms, cfg_.responder_quiet_ms);
             contention_ms_ = cfg_.responder_dither_ms +
-                slot * std::uniform_int_distribution<int>(0, 3)(gen);
+                slot * std::uniform_int_distribution<int>(0, 3)(gen) +
+                std::uniform_int_distribution<int>(0, slot - 1)(gen);
         } else {
             int slots = std::max(2, window / slot);
             quiet_needed_ = cfg_.quiet_ms;
             contention_ms_ = slot *
-                std::uniform_int_distribution<int>(0, slots - 1)(gen);
+                std::uniform_int_distribution<int>(0, slots - 1)(gen) +
+                std::uniform_int_distribution<int>(0, slot - 1)(gen);
         }
         contention_drawn_ = contention_ms_;
         idle_ms_ = std::min(std::max(0, cfg_.idle_credit_ms), quiet_needed_);
