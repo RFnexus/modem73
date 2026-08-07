@@ -25,7 +25,6 @@ MODEM73 is an open source software modem that works with any HF, VHF, or UHF rad
 </table>
 
 
-### [5 minute quickstart guide](https://modem73.app/quickstart.html)
 
 SSB, AM, and FM are all supported. It's plug and play compatible with any KISS application and works with rigctl, CM108 sound devices, and serial PTT out of the box.
 
@@ -50,7 +49,12 @@ On fading/weaker HF paths, use ROBUST modes. For very weak signals or as a backu
 - JSON control port API for status and configuration for writing your own programs
 - lightweight UI that runs straight from the terminal and headless mode for embedded use 
 
+
+### [5 minute quickstart guide](https://modem73.app/quickstart.html)
+
 ## Installation
+
+
 
 Want to try out a demo of modem73 directly from your browser? Try it out here:
 https://rfnexus.github.io/modem73-wasm-demo/
