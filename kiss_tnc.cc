@@ -1402,14 +1402,6 @@ private:
                 if (g_ui_state && ++level_update_counter >= LEVEL_UPDATE_INTERVAL) {
                     level_update_counter = 0;
 
-                    // Calculate RMS level in dB
-                    float sum_sq = 0.0f;
-                    for (int i = 0; i < n; i++) {
-                        sum_sq += buffer[i] * buffer[i];
-                    }
-                    float rms = std::sqrt(sum_sq / n);
-                    g_ui_state->carrier_level_db = 20.0f * std::log10(rms + 1e-10f);
-
                     // Copy decoder stats
                     if (g_ui_state->stats_reset_requested.exchange(false)) {
                         decoder_->stats_sync_count = 0;

@@ -207,6 +207,7 @@ jobs:
               libncurses-dev libhidapi-dev
           fi
           gem install --no-document fpm
+          command -v fpm || { echo "::error::fpm not on PATH after gem install"; exit 1; }
 
       - name: Build
         working-directory: m73
@@ -404,7 +405,13 @@ jobs:
               gcc gcc-c++ make pkgconf-pkg-config ncurses-devel \
               rpm-build ruby ruby-devel libhidapi-devel
           fi
-          gem install --no-document --bindir /usr/bin fpm
+          gem install --no-document --no-user-install --bindir /usr/bin fpm
+          if ! command -v fpm >/dev/null; then
+            FPM_BIN="$(gem environment gemdir)/bin/fpm"
+            [ -x "$FPM_BIN" ] && ln -sf "$FPM_BIN" /usr/bin/fpm
+          fi
+          command -v fpm || { echo "::error::fpm not on PATH after gem install"; exit 1; }
+          fpm --version
 
       - name: Build
         working-directory: m73
@@ -505,7 +512,13 @@ jobs:
         run: |
           pacman -S --needed --noconfirm \
             gcc make pkgconf ncurses hidapi ruby rubygems ruby-erb zstd fakeroot libarchive
-          gem install --no-document --bindir /usr/bin fpm
+          gem install --no-document --no-user-install --bindir /usr/bin fpm
+          if ! command -v fpm >/dev/null; then
+            FPM_BIN="$(gem environment gemdir)/bin/fpm"
+            [ -x "$FPM_BIN" ] && ln -sf "$FPM_BIN" /usr/bin/fpm
+          fi
+          command -v fpm || { echo "::error::fpm not on PATH after gem install"; exit 1; }
+          fpm --version
 
       - name: Build
         working-directory: m73
