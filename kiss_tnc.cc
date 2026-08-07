@@ -1386,7 +1386,11 @@ private:
                             float x = ((loud && !config_.csma_sync_only) ||
                                        blanking || dcd_active_) ? 1.0f : 0.0f;
                             occupancy_ema_ += (x - occupancy_ema_) * a;
-                            occupancy_pct_.store((int)(occupancy_ema_ * 100.0f));
+                            float xo = ((loud && !config_.csma_sync_only) ||
+                                        dcd_active_) ? 1.0f : 0.0f;
+                            occupancy_other_ema_ += (xo - occupancy_other_ema_) * a;
+                            occupancy_pct_.store(
+                                (int)(occupancy_other_ema_ * 100.0f));
                         }
                     }
                     occ_last_ms_ = now_ms;
@@ -1735,6 +1739,7 @@ private:
         return (int)heard_ids_.size();
     }
     float occupancy_ema_ = 0.0f;
+    float occupancy_other_ema_ = 0.0f;
     std::atomic<int> occupancy_pct_{0};
     int64_t occ_last_ms_ = 0;
     bool dcd_active_ = false;
