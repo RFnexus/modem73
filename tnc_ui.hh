@@ -1935,6 +1935,12 @@ private:
         if (strlen(buf) > 0) {
             if (field == FIELD_CALLSIGN) {
                 for (char* p = buf; *p; p++) *p = toupper(*p);
+                if (!ModemConfig::valid_callsign(buf)) {
+                    state_.add_log(std::string("(!) Invalid callsign '") + buf +
+                                   "' (A-Z 0-9 / only, 1-9 chars), keeping " +
+                                   state_.callsign);
+                    return;
+                }
                 state_.callsign = buf;
                 apply_settings();
             } else if (field == FIELD_COM_PORT) {

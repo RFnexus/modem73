@@ -1708,7 +1708,8 @@ public:
     }
 
     // Update config at runtime (called from UI)
-    void update_config(const TNCConfig& new_config) {
+    std::vector<std::string> update_config(const TNCConfig& new_config) {
+        std::vector<std::string> rejected;
         std::lock_guard<std::mutex> lock(config_mutex_);
         {
             config_.csma_enabled = new_config.csma_enabled;
@@ -1739,6 +1740,7 @@ public:
                 modem_config_.call_sign = ModemConfig::encode_callsign(config_.callsign.c_str());
                 ui_log("Callsign changed to " + config_.callsign);
             } else {
+                rejected.push_back("callsign");
                 ui_log("(!) Invalid callsign '" + new_config.callsign +
                        "' (A-Z 0-9 / only, 1-9 chars), keeping " + config_.callsign);
             }
@@ -1784,17 +1786,16 @@ public:
                             config_.frame_size != new_config.frame_size);
 
         if (mode_changed) {
-            config_.modulation = new_config.modulation;
-            config_.code_rate = new_config.code_rate;
-            config_.frame_size = new_config.frame_size;
-
             int new_mode = ModemConfig::encode_mode(
-                config_.modulation.c_str(),
-                config_.code_rate.c_str(),
-                config_.frame_size
+                new_config.modulation.c_str(),
+                new_config.code_rate.c_str(),
+                new_config.frame_size
             );
 
             if (new_mode >= 0) {
+                config_.modulation = new_config.modulation;
+                config_.code_rate = new_config.code_rate;
+                config_.frame_size = new_config.frame_size;
                 modem_config_.oper_mode = new_mode;
                 if (config_.modem_type == 0) {
                     payload_size_ = encoder_->get_payload_size(modem_config_.oper_mode);
@@ -1803,10 +1804,14 @@ public:
                        " " + ModemConfig::frame_size_name(config_.frame_size) +
                        " (" + std::to_string(encoder_->get_payload_size(modem_config_.oper_mode)) + " bytes)");
             } else {
-                ui_log("Invalid OFDM mode " + config_.modulation + " " + config_.code_rate +
-                       " " + ModemConfig::frame_size_name(config_.frame_size) + ", keeping previous");
+                rejected.push_back("modulation/code_rate/frame_size");
+                ui_log("(!) Invalid OFDM mode " + new_config.modulation + " " + new_config.code_rate +
+                       " " + ModemConfig::frame_size_name(new_config.frame_size) +
+                       ", keeping " + config_.modulation + " " + config_.code_rate);
             }
         }
+
+        return rejected;
     }
     
     TNCConfig get_config() {
@@ -2892,8 +2897,14 @@ int main(int argc, char** argv) {
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "robust_mode")) && cJSON_IsNumber(item)
                     && item->valueint >= 0 && item->valueint < ROBUST_MODE_COUNT)
                     new_config.robust_mode = item->valueint;
-                if ((item = cJSON_GetObjectItemCaseSensitive(params, "callsign")) && cJSON_IsString(item))
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "callsign")) && cJSON_IsString(item)) {
+                    if (!ModemConfig::valid_callsign(item->valuestring)) {
+                        ui_log(std::string("(!) Control port: invalid callsign '") +
+                               item->valuestring + "' (A-Z 0-9 / only, 1-9 chars)");
+                        return false;
+                    }
                     new_config.callsign = item->valuestring;
+                }
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "modulation")) && cJSON_IsString(item))
                     new_config.modulation = item->valuestring;
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "code_rate")) && cJSON_IsString(item))
@@ -2938,12 +2949,14 @@ int main(int argc, char** argv) {
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "robust_rx_enabled")) && cJSON_IsBool(item))
                     new_config.robust_rx_enabled = cJSON_IsTrue(item);
 
-                tnc.update_config(new_config);
+                auto rejected = tnc.update_config(new_config);
 
 #ifdef WITH_UI
-                // Sync config back to TUI state so the UI reflects changes
+                // Sync config back to TUI state so the UI reflects changes.
+                // Rejected fields keep whatever the TNC actually kept.
+                TNCConfig applied = tnc.get_config();
                 if (g_ui_state) {
-                    g_ui_state->callsign = new_config.callsign;
+                    g_ui_state->callsign = applied.callsign;
                     g_ui_state->modem_type_index = new_config.modem_type;
                     g_ui_state->mfsk_mode_index = new_config.mfsk_mode;
                     g_ui_state->robust_mode_index = new_config.robust_mode;
@@ -2963,14 +2976,14 @@ int main(int argc, char** argv) {
 
                     // Map modulation string back to index
                     for (size_t i = 0; i < MODULATION_OPTIONS.size(); i++) {
-                        if (MODULATION_OPTIONS[i] == new_config.modulation) {
+                        if (MODULATION_OPTIONS[i] == applied.modulation) {
                             g_ui_state->modulation_index = i;
                             break;
                         }
                     }
                     // Map code rate string back to index
                     for (size_t i = 0; i < CODE_RATE_OPTIONS.size(); i++) {
-                        if (CODE_RATE_OPTIONS[i] == new_config.code_rate) {
+                        if (CODE_RATE_OPTIONS[i] == applied.code_rate) {
                             g_ui_state->code_rate_index = i;
                             break;
                         }
@@ -2979,7 +2992,7 @@ int main(int argc, char** argv) {
                     g_ui_state->update_modem_info();
                 }
 #endif
-                return true;
+                return rejected.empty();
             };
 
             ctrl_iface.rigctl_command = [&tnc](const std::string& cmd) -> std::string {
