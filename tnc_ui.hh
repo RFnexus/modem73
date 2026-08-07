@@ -1092,7 +1092,8 @@ struct TNCUIState {
 
     std::function<void(TNCUIState&)> on_settings_changed;
     std::function<void()> on_stop_requested;
-    std::function<bool()> on_reconnect_audio;  
+    std::function<bool()> on_reconnect_audio;
+    std::function<float()> on_get_audio_level;  
     
     void add_log(const std::string& msg) {
         std::lock_guard<std::mutex> lock(log_mutex);
@@ -1334,6 +1335,7 @@ public:
                 handle_input(ch);
             }
             tick_auto_send();
+            tick_level_history();
             draw();
             if (rx_off_dialog_field_ >= 0)
                 draw_rx_off_dialog();
@@ -1626,6 +1628,10 @@ private:
 
                         show_com_port_dialog();
 
+                    } else if (current_field_ == FIELD_PTT_TYPE) {
+
+                        show_ptt_type_dialog();
+
 #ifdef WITH_CM108
                     } else if (current_field_ == FIELD_CM108_GPIO) {
                         edit_text_field(FIELD_CM108_GPIO);
@@ -1833,6 +1839,8 @@ private:
                         // Value area clicks for other fields
                         if (field == FIELD_CALLSIGN) {
                             edit_text_field(field);
+                        } else if (field == FIELD_PTT_TYPE) {
+                            show_ptt_type_dialog();
                         } else if (field >= FIELD_MODULATION) {
                             if (event.x < 22) adjust_field(-1);
                             else adjust_field(1);
@@ -2282,11 +2290,6 @@ private:
             case FIELD_AUDIO_OUTPUT:
                 break;
             case FIELD_PTT_TYPE:
-#ifdef WITH_CM108
-                state_.ptt_type_index = (state_.ptt_type_index + delta + 5) % 5;
-#else
-                state_.ptt_type_index = (state_.ptt_type_index + delta + 4) % 4;
-#endif
                 break;
             case FIELD_VOX_FREQ:
                 state_.vox_tone_freq += delta * 100;
@@ -2355,6 +2358,94 @@ private:
         state_.save_settings();
     }
     
+    void show_ptt_type_dialog() {
+        int rows, cols;
+        getmaxyx(stdscr, rows, cols);
+
+        static const char* const descriptions[] = {
+            "NONE   - PTT disabled (over the air)",
+            "RIGCTL - Hamlib rigctld (network)",
+            "VOX    - Tone-keyed VOX",
+            "COM    - Serial port DTR/RTS",
+#ifdef WITH_CM108
+            "CM108  - USB HID GPIO",
+#endif
+        };
+        int count = (int)PTT_TYPE_OPTIONS.size();
+
+        int selection = state_.ptt_type_index;
+        if (selection < 0 || selection >= count) selection = 0;
+
+        int dialog_w = std::min(cols - 4, 42);
+        int dialog_h = count + 3;
+        int dialog_x = (cols - dialog_w) / 2;
+        int dialog_y = (rows - dialog_h) / 2;
+
+        nodelay(stdscr, FALSE);
+
+        while (true) {
+            for (int y = dialog_y; y < dialog_y + dialog_h; y++) {
+                move(y, dialog_x);
+                for (int x = 0; x < dialog_w; x++) addch(' ');
+            }
+
+            attron(COLOR_PAIR(4) | A_BOLD);
+            draw_box(dialog_y, dialog_x, dialog_h, dialog_w);
+            const char* title = " PTT Type ";
+            mvaddstr(dialog_y, dialog_x + (dialog_w - (int)strlen(title)) / 2, title);
+            attroff(COLOR_PAIR(4) | A_BOLD);
+
+            for (int i = 0; i < count; i++) {
+                int y = dialog_y + 1 + i;
+                mvhline(y, dialog_x + 1, ' ', dialog_w - 2);
+
+                if (i == selection) {
+                    attron(COLOR_PAIR(4) | A_BOLD);
+                    mvaddstr(y, dialog_x + 1, "> ");
+                } else {
+                    mvaddstr(y, dialog_x + 1, "  ");
+                }
+
+                std::string desc = (i < (int)(sizeof(descriptions) / sizeof(descriptions[0]))) ?
+                    descriptions[i] : PTT_TYPE_OPTIONS[i];
+                int max_len = dialog_w - 4;
+                if ((int)desc.length() > max_len) {
+                    desc = desc.substr(0, max_len - 2) + "..";
+                }
+                addstr(desc.c_str());
+
+                if (i == selection) {
+                    attroff(COLOR_PAIR(4) | A_BOLD);
+                }
+            }
+
+            attron(A_DIM);
+            mvaddstr(dialog_y + dialog_h - 1, dialog_x + 2, " Enter=OK  Esc=Cancel ");
+            attroff(A_DIM);
+
+            refresh();
+
+            int ch = getch();
+
+            if (ch == 27 || ch == 'q') {
+                break;
+            } else if (ch == '\n' || ch == KEY_ENTER) {
+                if (selection != state_.ptt_type_index) {
+                    state_.ptt_type_index = selection;
+                    state_.add_log("PTT: " + PTT_TYPE_OPTIONS[selection]);
+                    apply_settings();
+                }
+                break;
+            } else if (ch == KEY_UP || ch == 'k') {
+                if (selection > 0) selection--;
+            } else if (ch == KEY_DOWN || ch == 'j') {
+                if (selection < count - 1) selection++;
+            }
+        }
+
+        nodelay(stdscr, TRUE);
+    }
+
     void show_com_port_dialog() {
         std::vector<std::string> ports;
         std::vector<std::string> labels;
@@ -4024,8 +4115,8 @@ private:
         row++;
         
         dy = visible_y(row);
-        if (dy >= 0) draw_selector_field(dy, c1, c2, "PTT", FIELD_PTT_TYPE,
-                           PTT_TYPE_OPTIONS[state_.ptt_type_index]);
+        if (dy >= 0) draw_field(dy, c1, c2, "PTT", FIELD_PTT_TYPE,
+                           PTT_TYPE_OPTIONS[state_.ptt_type_index], true);
         row++;
         
         if (state_.ptt_type_index == 2) {  // VOX
@@ -5600,6 +5691,17 @@ private:
             utils_scroll_ = sel_row - vis + 1;
     }
 
+    void tick_level_history() {
+        if (!state_.on_get_audio_level) return;
+        int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (last_level_ms_ != 0 && now - last_level_ms_ < LEVEL_SAMPLE_MS)
+            return;
+        last_level_ms_ = now;
+        float db = state_.on_get_audio_level();
+        state_.update_level(db, state_.dcd_active.load());
+    }
+
     void tick_auto_send() {
         if ((!auto_send_enabled_ && !auto_alt_enabled_) || !state_.on_send_data)
             return;
@@ -6194,6 +6296,8 @@ private:
     bool initialized_ = false;
     std::atomic<bool> running_{false};
     int current_tab_ = 0;
+    static constexpr int LEVEL_SAMPLE_MS = 100;
+    int64_t last_level_ms_ = 0;
     int current_field_ = 0;
     int rx_off_dialog_field_ = -1;
 

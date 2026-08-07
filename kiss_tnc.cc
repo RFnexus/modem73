@@ -1408,9 +1408,7 @@ private:
                         sum_sq += buffer[i] * buffer[i];
                     }
                     float rms = std::sqrt(sum_sq / n);
-                    float db = 20.0f * std::log10(rms + 1e-10f);
-
-                    g_ui_state->update_level(db, dcd_active_);
+                    g_ui_state->carrier_level_db = 20.0f * std::log10(rms + 1e-10f);
 
                     // Copy decoder stats
                     if (g_ui_state->stats_reset_requested.exchange(false)) {
@@ -1894,6 +1892,11 @@ public:
         return false;
     }
     
+    float get_audio_level() {
+        if (!audio_ || !audio_->capture_alive()) return -100.0f;
+        return audio_->instant_level_db(100);
+    }
+
     bool is_audio_healthy() const {
         if (audio_) return audio_->is_healthy();
         return false;
@@ -3051,6 +3054,10 @@ int main(int argc, char** argv) {
             // Set up audio reconnect callback
             ui_state.on_reconnect_audio = [&tnc]() -> bool {
                 return tnc.reconnect_audio();
+            };
+
+            ui_state.on_get_audio_level = [&tnc]() -> float {
+                return tnc.get_audio_level();
             };
 
             ui_state.on_alc_tune = [&tnc]() -> float {
