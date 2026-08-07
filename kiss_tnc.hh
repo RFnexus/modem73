@@ -434,7 +434,8 @@ namespace Frag {
     constexpr size_t HEADER_SIZE = 5;
     constexpr uint8_t FLAG_MORE_FRAGMENTS = 0x01;
     constexpr uint8_t FLAG_FIRST_FRAGMENT = 0x02;
-    constexpr int REASSEMBLY_TIMEOUT_MS = 30000;
+    constexpr int REASSEMBLY_IDLE_MS = 120000;
+    constexpr int REASSEMBLY_MAX_MS = 600000;
     constexpr size_t MAX_PENDING_PACKETS = 64;
 }
 
@@ -528,10 +529,12 @@ public:
         }
 
         auto& pkt = pending_[packet_id];
+        auto arrival = std::chrono::steady_clock::now();
         if (pkt.fragments.empty()) {
-            pkt.first_seen = std::chrono::steady_clock::now();
+            pkt.first_seen = arrival;
         }
-        
+        pkt.last_seen = arrival;
+
         pkt.fragments[seq] = std::move(payload);
         
         if (flags & Frag::FLAG_FIRST_FRAGMENT) {
@@ -584,6 +587,7 @@ private:
     struct PendingPacket {
         std::map<uint8_t, std::vector<uint8_t>> fragments;
         std::chrono::steady_clock::time_point first_seen;
+        std::chrono::steady_clock::time_point last_seen;
         uint8_t last_seq = 0;
         bool has_first = false;
         bool has_last = false;
@@ -592,9 +596,11 @@ private:
     void cleanup_stale() {
         auto now = std::chrono::steady_clock::now();
         for (auto it = pending_.begin(); it != pending_.end();) {
+            auto idle = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - it->second.last_seen).count();
             auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
                 now - it->second.first_seen).count();
-            if (age > Frag::REASSEMBLY_TIMEOUT_MS) {
+            if (idle > Frag::REASSEMBLY_IDLE_MS || age > Frag::REASSEMBLY_MAX_MS) {
                 it = pending_.erase(it);
             } else {
                 ++it;
@@ -602,13 +608,13 @@ private:
         }
         
         while (pending_.size() > Frag::MAX_PENDING_PACKETS) {
-            auto oldest = pending_.begin();
+            auto stalest = pending_.begin();
             for (auto it = pending_.begin(); it != pending_.end(); ++it) {
-                if (it->second.first_seen < oldest->second.first_seen) {
-                    oldest = it;
+                if (it->second.last_seen < stalest->second.last_seen) {
+                    stalest = it;
                 }
             }
-            pending_.erase(oldest);
+            pending_.erase(stalest);
         }
     }
     

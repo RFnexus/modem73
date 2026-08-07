@@ -796,12 +796,12 @@ struct TNCUIState {
         FILE* f = fopen(config_file.c_str(), "r");
         if (!f) return false;
         
-        char line[256];
+        char line[512];
         while (fgets(line, sizeof(line), f)) {
             if (line[0] == '#') continue;
             
-            char key[64], value[192];
-            if (sscanf(line, "%63[^=]=%191[^\n]", key, value) == 2) {
+            char key[64], value[384];
+            if (sscanf(line, "%63[^=]=%383[^\n]", key, value) == 2) {
                 if (strcmp(key, "callsign") == 0) callsign = value;
                 else if (strcmp(key, "modem_type") == 0) {
                     int v = atoi(value);
