@@ -3,6 +3,11 @@ CC = gcc
 CXXFLAGS = -std=c++17 -O3 -march=native -Wall -Wextra
 LDFLAGS = -lpthread  -ltinfo -lncurses -ldl -lm
 
+GIT_EXACT := $(shell git describe --tags --exact-match 2>/dev/null | sed 's/^v//')
+GIT_BASE := $(shell git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//')
+VERSION ?= $(if $(GIT_EXACT),$(GIT_EXACT),$(if $(GIT_BASE),$(GIT_BASE)-dev,dev))
+CXXFLAGS += -DMODEM73_VERSION=\"$(VERSION)\"
+
 # dependencies
 AICODIX_DSP ?= deps/aicodix/dsp
 AICODIX_CODE ?= deps/aicodix/code
@@ -13,7 +18,7 @@ INCLUDES = -I$(AICODIX_DSP) -I$(AICODIX_CODE) -I$(MODEM_SRC)
 TARGET = modem73
 
 SRCS = kiss_tnc.cc
-HDRS = kiss_tnc.hh csma.hh miniaudio_audio.hh rigctl_ptt.hh modem.hh phy/mfsk_modem.hh phy/robust_modem.hh phy/common.hh tnc_ui.hh control_port.hh
+HDRS = kiss_tnc.hh csma.hh tone_dcd.hh miniaudio_audio.hh rigctl_ptt.hh modem.hh phy/mfsk_modem.hh phy/robust_modem.hh phy/common.hh tnc_ui.hh control_port.hh
 OBJS = deps/miniaudio.o deps/cJSON.o
 
 # defualt to build with UI, headless operations through --headless

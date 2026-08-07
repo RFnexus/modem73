@@ -1,5 +1,9 @@
 #pragma once
 
+#ifndef MODEM73_VERSION
+#define MODEM73_VERSION "dev"
+#endif
+
 #include <locale.h>
 #include <ncurses.h>
 #include <string>
@@ -194,6 +198,7 @@ struct TNCUIState {
 
     bool csma_enabled = true;
     bool csma_sync_only = false;
+    bool csma_fast_floor = false;
     float carrier_threshold_db = -30.0f;
     int slot_time_ms = 500;
     int csma_quiet_ms = 0;
@@ -255,6 +260,7 @@ struct TNCUIState {
     std::atomic<int> csma_phase{0};
     std::atomic<int> csma_wait_ms{0};
     std::atomic<int> csma_wait_need{0};
+    std::atomic<int> csma_window_ms{0};
     std::mutex rig_mode_mutex;
     std::string rig_mode;
     
@@ -348,6 +354,7 @@ struct TNCUIState {
     std::mutex level_mutex;
     float level_history[LEVEL_HISTORY_SIZE];
     bool level_dcd[LEVEL_HISTORY_SIZE] = {false};
+    bool level_tone[LEVEL_HISTORY_SIZE] = {false};
     int level_history_pos = 0;
     std::atomic<bool> decoding_active{false};
     
@@ -425,6 +432,7 @@ struct TNCUIState {
     float wf_ring[WF_RING] = {};
     int wf_wpos = 0;
     uint32_t wf_written = 0;
+    std::atomic<int64_t> wf_sig_ms{0};
     float wf_acc = 0.0f;
     int wf_acc_n = 0;
 
@@ -650,11 +658,12 @@ struct TNCUIState {
         }
     }
     
-    void update_level(float db, bool dcd = false) {
+    void update_level(float db, bool dcd = false, bool tone = false) {
         carrier_level_db = db;
         std::lock_guard<std::mutex> lock(level_mutex);
         level_history[level_history_pos] = db;
         level_dcd[level_history_pos] = dcd;
+        level_tone[level_history_pos] = tone;
         level_history_pos = (level_history_pos + 1) % LEVEL_HISTORY_SIZE;
     }
     
@@ -718,6 +727,15 @@ struct TNCUIState {
         }
         return result;
     }
+
+    std::vector<uint8_t> get_level_tone_history() {
+        std::lock_guard<std::mutex> lock(level_mutex);
+        std::vector<uint8_t> result(LEVEL_HISTORY_SIZE);
+        for (int i = 0; i < LEVEL_HISTORY_SIZE; i++) {
+            result[i] = level_tone[(level_history_pos + i) % LEVEL_HISTORY_SIZE];
+        }
+        return result;
+    }
     
     // Save settings
     bool save_settings() {
@@ -742,6 +760,7 @@ struct TNCUIState {
         fprintf(f, "alt_mode_mask=%d\n", alt_mode_mask);
         fprintf(f, "csma_enabled=%d\n", csma_enabled ? 1 : 0);
         fprintf(f, "csma_sync_only=%d\n", csma_sync_only ? 1 : 0);
+        fprintf(f, "csma_fast_floor=%d\n", csma_fast_floor ? 1 : 0);
         fprintf(f, "carrier_threshold_db=%.1f\n", carrier_threshold_db);
         fprintf(f, "slot_time_ms=%d\n", slot_time_ms);
         fprintf(f, "csma_quiet_ms=%d\n", csma_quiet_ms);
@@ -838,6 +857,7 @@ struct TNCUIState {
                 else if (strcmp(key, "postamble") == 0) postamble = atoi(value) != 0;
                 else if (strcmp(key, "csma_enabled") == 0) csma_enabled = atoi(value) != 0;
                 else if (strcmp(key, "csma_sync_only") == 0) csma_sync_only = atoi(value) != 0;
+                else if (strcmp(key, "csma_fast_floor") == 0) csma_fast_floor = atoi(value) != 0;
                 else if (strcmp(key, "carrier_threshold_db") == 0) carrier_threshold_db = atof(value);
                 else if (strcmp(key, "slot_time_ms") == 0) slot_time_ms = atoi(value);
                 else if (strcmp(key, "csma_quiet_ms") == 0) csma_quiet_ms = atoi(value);
@@ -1325,6 +1345,10 @@ public:
                     init_pair(WF_PAIR_BASE + i, COLOR_BLACK, grad[i]);
                 wf_pairs_ = 7;
             }
+            if (COLOR_PAIRS > WF_PAIR_BASE + 32) {
+                init_pair(WF_PAIR_BASE + 32, COLOR_WHITE, COLOR_RED);
+                wf_sig_ok_ = true;
+            }
         }
         
         running_ = true;
@@ -1369,6 +1393,7 @@ private:
         FIELD_CSMA,
         FIELD_THRESHOLD,
         FIELD_SYNC_ONLY,
+        FIELD_SYNC_INFO,
         FIELD_CSMA_BAND,
         FIELD_CSMA_PRESET,
         FIELD_CSMA_ADV,
@@ -1377,6 +1402,7 @@ private:
         FIELD_LEAD_TONE,
         FIELD_RESP_DITHER,
         FIELD_CSMA_BURST,
+        FIELD_FAST_FLOOR,
         FIELD_CSMA_INFO,
         FIELD_FRAGMENTATION,
         FIELD_TX_BLANKING,
@@ -1464,7 +1490,11 @@ private:
             show_csma_help_ = false;
             return;
         }
-        
+        if (show_sync_help_) {
+            show_sync_help_ = false;
+            return;
+        }
+
         switch (ch) {
             case 'q':
             case 'Q':
@@ -1606,6 +1636,8 @@ private:
                 if (current_tab_ == 1) {
                     if (current_field_ == FIELD_CSMA_INFO) {
                         show_csma_help_ = true;
+                    } else if (current_field_ == FIELD_SYNC_INFO) {
+                        show_sync_help_ = true;
                     } else if (current_field_ == FIELD_CSMA_ADV) {
                         state_.csma_advanced_open = !state_.csma_advanced_open;
                     } else if (current_field_ == FIELD_CALLSIGN) {
@@ -1804,6 +1836,8 @@ private:
                 }
                 if (field == FIELD_CSMA_INFO)
                     show_csma_help_ = true;
+                if (field == FIELD_SYNC_INFO)
+                    show_sync_help_ = true;
                 
                 if (field >= 0 && field < FIELD_COUNT) {
                     current_field_ = field;
@@ -2039,7 +2073,14 @@ private:
         if (!state_.csma_advanced_open) {
             if (field == FIELD_CSMA_QUIET || field == FIELD_CSMA_CW ||
                 field == FIELD_LEAD_TONE || field == FIELD_RESP_DITHER ||
-                field == FIELD_CSMA_BURST)
+                field == FIELD_CSMA_BURST || field == FIELD_FAST_FLOOR)
+                return true;
+        }
+        if (state_.csma_sync_only) {
+            if (field == FIELD_THRESHOLD || field == FIELD_CSMA_CW)
+                return true;
+        } else {
+            if (field == FIELD_FAST_FLOOR)
                 return true;
         }
         return false;
@@ -2077,10 +2118,14 @@ private:
         row++;
         if (field == FIELD_CSMA) return row;
         row++;
-        if (field == FIELD_THRESHOLD) return row;
-        row++;
-        row++;
+        if (!state_.csma_sync_only) {
+            if (field == FIELD_THRESHOLD) return row;
+            row++;
+            row++;
+        }
         if (field == FIELD_SYNC_ONLY) return row;
+        row++;
+        if (field == FIELD_SYNC_INFO) return row;
         row++;
         if (field == FIELD_CSMA_BAND) return row;
         row++;
@@ -2091,14 +2136,20 @@ private:
         if (state_.csma_advanced_open) {
             if (field == FIELD_CSMA_QUIET) return row;
             row++;
-            if (field == FIELD_CSMA_CW) return row;
-            row++;
+            if (!state_.csma_sync_only) {
+                if (field == FIELD_CSMA_CW) return row;
+                row++;
+            }
             if (field == FIELD_LEAD_TONE) return row;
             row++;
             if (field == FIELD_RESP_DITHER) return row;
             row++;
             if (field == FIELD_CSMA_BURST) return row;
             row++;
+            if (state_.csma_sync_only) {
+                if (field == FIELD_FAST_FLOOR) return row;
+                row++;
+            }
         }
         if (field == FIELD_CSMA_INFO) return row;
         row += 2;
@@ -2271,6 +2322,9 @@ private:
             case FIELD_CSMA_BURST:
                 state_.csma_burst += delta;
                 state_.csma_burst = std::max(1, std::min(4, state_.csma_burst));
+                break;
+            case FIELD_FAST_FLOOR:
+                state_.csma_fast_floor = !state_.csma_fast_floor;
                 break;
             case FIELD_FRAGMENTATION:
                 state_.fragmentation_enabled = !state_.fragmentation_enabled;
@@ -2983,6 +3037,9 @@ private:
         attron(A_BOLD);
         addstr("MODEM73");
         attroff(A_BOLD);
+        attron(A_DIM);
+        addstr(" v" MODEM73_VERSION);
+        attroff(A_DIM);
         addstr(" ");
         
         // PTT status 
@@ -3018,22 +3075,20 @@ private:
         addstr(state_.callsign.c_str());
         attroff(A_BOLD);
         if (state_.modem_type_index == 1) {
-            printw("  %s %dHz",
-                   MFSK_MODE_OPTIONS[state_.mfsk_mode_index].c_str(),
-                   state_.center_freq);
+            printw(" %s",
+                   MFSK_MODE_OPTIONS[state_.mfsk_mode_index].c_str());
         } else if (state_.modem_type_index == 2) {
-            printw("  %s %s %dHz",
+            printw(" %s %s",
                    ROBUST_MODE_OPTIONS[robust_base_index(state_.robust_mode_index)].c_str(),
-                   RobustParams::is_short((RobustMode)state_.robust_mode_index)
-                       ? "170B" : "510B",
-                   state_.center_freq);
+                   state_.robust_mode_index == 12 
+                       ? "30B" 
+                       : (RobustParams::is_short((RobustMode)state_.robust_mode_index) ? "170B" : "510B"));
         } else {
-            printw("  %s %s %s %dHz",
+            printw(" %s %s %s ",
                    MODULATION_OPTIONS[state_.modulation_index].c_str(),
                    CODE_RATE_OPTIONS[state_.code_rate_index].c_str(),
                    state_.frame_size == 0 ? "S" : state_.frame_size == 2 ? "L"
-                 : state_.frame_size == 3 ? "U" : "N",
-                   state_.center_freq);
+                 : state_.frame_size == 3 ? "U" : "N");
         }
         
         // Stats 
@@ -3155,6 +3210,9 @@ private:
         }
         if (show_csma_help_) {
             draw_csma_help(rows, cols);
+        }
+        if (show_sync_help_) {
+            draw_sync_only_help(rows, cols);
         }
     }
     
@@ -3343,7 +3401,15 @@ private:
         y++;
 
         mvaddstr(y, c1, "Window");
-        mvprintw(y, c2, "%d slots", state_.csma_cw);
+        {
+            int w = state_.csma_window_ms.load();
+            int s = std::max(1, state_.slot_time_ms);
+            if (w > 0) {
+                mvprintw(y, c2, "%d slots (%d ms)", w / s, w);
+            } else {
+                mvprintw(y, c2, "%d slots", state_.csma_cw);
+            }
+        }
         y++;
 
         mvaddstr(y, c1, "Slot");
@@ -3748,6 +3814,7 @@ private:
     void draw_signal_graph(int y, int x, int width, int height) {
         auto history = state_.get_level_history();
         auto dcd_hist = state_.get_level_dcd_history();
+        auto tone_hist = state_.get_level_tone_history();
 
 
         float min_db = -80.0f;
@@ -3770,7 +3837,8 @@ private:
                 float level = history[hist_idx];
                 // magenta marks samples taken while the confirmed sync DCD
                 // held: the segment of the waterfall carrying a real frame
-                int pair = dcd_hist[hist_idx] ? 6 : level > thresh ? 4 : 1;
+                int pair = tone_hist[hist_idx] ? 2
+                         : dcd_hist[hist_idx] ? 6 : level > thresh ? 4 : 1;
 
                 if (level >= row_max) {
                     attron(COLOR_PAIR(pair) | A_BOLD);
@@ -3910,32 +3978,34 @@ private:
         if (dy >= 0) draw_toggle_field(dy, c1, c2, "Enabled", FIELD_CSMA, state_.csma_enabled);
         row++;
         
-        dy = visible_y(row);
-        if (dy >= 0) {
-            char thresh_buf[32];
-            snprintf(thresh_buf, sizeof(thresh_buf), "%.0f dB", state_.carrier_threshold_db);
-            draw_selector_field(dy, c1, c2, "Threshold", FIELD_THRESHOLD, thresh_buf);
-            float lvl = state_.carrier_level_db.load();
-            if (lvl > state_.carrier_threshold_db) {
-                attron(COLOR_PAIR(4) | A_BOLD);
-            } else {
-                attron(A_DIM);
+        if (!state_.csma_sync_only) {
+            dy = visible_y(row);
+            if (dy >= 0) {
+                char thresh_buf[32];
+                snprintf(thresh_buf, sizeof(thresh_buf), "%.0f dB", state_.carrier_threshold_db);
+                draw_selector_field(dy, c1, c2, "Threshold", FIELD_THRESHOLD, thresh_buf);
+                float lvl = state_.carrier_level_db.load();
+                if (lvl > state_.carrier_threshold_db) {
+                    attron(COLOR_PAIR(4) | A_BOLD);
+                } else {
+                    attron(A_DIM);
+                }
+                mvprintw(dy, c2 + 9, "%.0f", lvl);
+                attroff(COLOR_PAIR(4) | A_BOLD);
+                attroff(A_DIM);
             }
-            mvprintw(dy, c2 + 9, "%.0f", lvl);
-            attroff(COLOR_PAIR(4) | A_BOLD);
-            attroff(A_DIM);
+            row++;
+
+            // Level meter bar
+            dy = visible_y(row);
+            if (dy >= 0) {
+                mvaddstr(dy, c1, "Level");
+                move(dy, c2);
+                float lvl = state_.carrier_level_db.load();
+                draw_level_meter(lvl, state_.carrier_threshold_db, 14);
+            }
+            row++;
         }
-        row++;
-        
-        // Level meter bar
-        dy = visible_y(row);
-        if (dy >= 0) {
-            mvaddstr(dy, c1, "Level");
-            move(dy, c2);
-            float lvl = state_.carrier_level_db.load();
-            draw_level_meter(lvl, state_.carrier_threshold_db, 14);
-        }
-        row++;
 
         dy = visible_y(row);
         if (dy >= 0) {
@@ -3943,6 +4013,15 @@ private:
             attron(A_DIM);
             mvaddstr(dy, c2 + 8, "busy = carrier sync only");
             attroff(A_DIM);
+        }
+        row++;
+
+        dy = visible_y(row);
+        if (dy >= 0) {
+            bool sel_sinfo = (current_field_ == FIELD_SYNC_INFO);
+            if (sel_sinfo) attron(A_BOLD); else attron(A_DIM);
+            mvprintw(dy, c1 + 2, "%s[?] What is this?", sel_sinfo ? "> " : "  ");
+            if (sel_sinfo) attroff(A_BOLD); else attroff(A_DIM);
         }
         row++;
 
@@ -3982,13 +4061,15 @@ private:
             }
             row++;
 
-            dy = visible_y(row);
-            if (dy >= 0) {
-                char cw_buf[32];
-                snprintf(cw_buf, sizeof(cw_buf), "%d x %dms", state_.csma_cw, state_.slot_time_ms);
-                draw_selector_field(dy, c1 + 2, c2, "Window", FIELD_CSMA_CW, cw_buf);
+            if (!state_.csma_sync_only) {
+                dy = visible_y(row);
+                if (dy >= 0) {
+                    char cw_buf[32];
+                    snprintf(cw_buf, sizeof(cw_buf), "%d x %dms", state_.csma_cw, state_.slot_time_ms);
+                    draw_selector_field(dy, c1 + 2, c2, "Window", FIELD_CSMA_CW, cw_buf);
+                }
+                row++;
             }
-            row++;
 
             dy = visible_y(row);
             if (dy >= 0) draw_toggle_field(dy, c1 + 2, c2, "Lead Tone", FIELD_LEAD_TONE, state_.tx_lead_tone);
@@ -4015,6 +4096,18 @@ private:
                 draw_selector_field(dy, c1 + 2, c2, "Burst", FIELD_CSMA_BURST, burst_buf);
             }
             row++;
+
+            if (state_.csma_sync_only) {
+                dy = visible_y(row);
+                if (dy >= 0) {
+                    draw_toggle_field(dy, c1 + 2, c2, "Fast Floor", FIELD_FAST_FLOOR,
+                                      state_.csma_fast_floor);
+                    attron(A_DIM);
+                    mvaddstr(dy, c2 + 8, "only if all stations run 2.3>");
+                    attroff(A_DIM);
+                }
+                row++;
+            }
         }
 
         dy = visible_y(row);
@@ -4970,12 +5063,22 @@ private:
         else
             wf_floor_db_ += (med - wf_floor_db_) * 0.02f;
 
-        std::array<uint8_t, WF_BINS> row;
+        int64_t sig = state_.wf_sig_ms.load();
+        if (sig != wf_sig_seen_) {
+            wf_sig_seen_ = sig;
+            for (auto& rw : wf_rows_)
+                if (rw.ms > sig - 420 && rw.ms <= sig + 60)
+                    rw.sig = true;
+        }
+        WFRow nr;
+        nr.ms = now_ms;
+        nr.sig = wf_sig_seen_ != 0 && now_ms > wf_sig_seen_ - 420 &&
+                 now_ms <= wf_sig_seen_ + 60;
         for (int i = 0; i < WF_BINS; i++) {
             float v = (db[i] - wf_floor_db_ + 6.0f) * (255.0f / 50.0f);
-            row[i] = (uint8_t)std::max(0.0f, std::min(255.0f, v));
+            nr.bins[i] = (uint8_t)std::max(0.0f, std::min(255.0f, v));
         }
-        wf_rows_.push_front(row);
+        wf_rows_.push_front(nr);
         if ((int)wf_rows_.size() > WF_MAX_ROWS)
             wf_rows_.pop_back();
     }
@@ -5016,6 +5119,8 @@ private:
         }
 
         int nrows = std::min((int)wf_rows_.size(), h);
+        int fb0 = std::max(0, (cf - 110) * WF_BINS / 3000);
+        int fb1 = std::min(WF_BINS - 1, (cf + 110) * WF_BINS / 3000);
         for (int r = 0; r < nrows; r++) {
             const auto& row = wf_rows_[r];
             move(y + 1 + r, x);
@@ -5025,9 +5130,12 @@ private:
                 int b1 = std::max(b0 + 1, (col + 1) * WF_BINS / w);
                 int q = 0;
                 for (int b = b0; b < b1 && b < WF_BINS; b++)
-                    q = std::max(q, (int)row[b]);
+                    q = std::max(q, (int)row.bins[b]);
+                bool mark = row.sig && b0 <= fb1 && b1 > fb0;
                 if (wf_pairs_ > 0) {
-                    int attr = COLOR_PAIR(WF_PAIR_BASE + q * wf_pairs_ / 256);
+                    int attr = mark && wf_sig_ok_
+                        ? (COLOR_PAIR(WF_PAIR_BASE + 32) | A_BOLD)
+                        : COLOR_PAIR(WF_PAIR_BASE + q * wf_pairs_ / 256);
                     if (attr != cur) {
                         if (cur != -1) attroff(cur);
                         attron(attr);
@@ -5036,7 +5144,7 @@ private:
                     addch(' ');
                 } else {
                     static const char ramp[] = " .:-=+*xX";
-                    addch(ramp[q * 9 / 256]);
+                    addch(mark ? 'S' : ramp[q * 9 / 256]);
                 }
             }
             if (cur != -1) attroff(cur);
@@ -5705,7 +5813,9 @@ private:
             return;
         last_level_ms_ = now;
         float db = state_.on_get_audio_level();
-        state_.update_level(db, state_.dcd_active.load());
+        int64_t sig = state_.wf_sig_ms.load();
+        state_.update_level(db, state_.dcd_active.load(),
+                            sig != 0 && now - sig < 450);
     }
 
     void tick_auto_send() {
@@ -6217,7 +6327,49 @@ private:
         item("Lead Tone", "keyup tone so others hear us sooner");
         item("Dither",    "callsign delay that separates replies");
         item("Burst",     "packets sent per channel win");
+        item("FastFloor", "shorter sync waits, version 2.3>");
         y++;
+        attron(A_DIM);
+        mvaddstr(y, lx, "any key to close");
+        attroff(A_DIM);
+    }
+
+    void draw_sync_only_help(int rows, int cols) {
+        int w = 58, h = 20;
+        int x0 = (cols - w) / 2, y0 = (rows - h) / 2;
+        attron(COLOR_PAIR(4));
+        for (int y = y0; y < y0 + h && y < rows; y++)
+            mvhline(y, x0, ' ', w);
+        mvhline(y0, x0, ACS_HLINE, w);
+        mvhline(y0 + h - 1, x0, ACS_HLINE, w);
+        mvvline(y0, x0, ACS_VLINE, h);
+        mvvline(y0, x0 + w - 1, ACS_VLINE, h);
+        mvaddch(y0, x0, ACS_ULCORNER);
+        mvaddch(y0, x0 + w - 1, ACS_URCORNER);
+        mvaddch(y0 + h - 1, x0, ACS_LLCORNER);
+        mvaddch(y0 + h - 1, x0 + w - 1, ACS_LRCORNER);
+        attron(A_BOLD);
+        mvaddstr(y0, x0 + 3, " SYNC ONLY ");
+        attroff(A_BOLD);
+        attroff(COLOR_PAIR(4));
+        int y = y0 + 2, lx = x0 + 2;
+        mvaddstr(y++, lx, "How the radio decides the channel is busy.");
+        y++;
+        attron(A_BOLD); mvaddstr(y, lx, "OFF"); attroff(A_BOLD);
+        mvaddstr(y++, lx + 5, "any sound louder than Threshold counts as");
+        mvaddstr(y++, lx + 5, "busy. Reacts fast, but noise fools it.");
+        attron(A_BOLD); mvaddstr(y, lx, "ON"); attroff(A_BOLD);
+        mvaddstr(y++, lx + 5, "only a real modem transmission counts as");
+        mvaddstr(y++, lx + 5, "busy. Static and noise are ignored.");
+        y++;
+        attron(A_BOLD); mvaddstr(y++, lx, "Why use it on HF:"); attroff(A_BOLD);
+        mvaddstr(y++, lx, "HF is full of static, fading and nearby signals.");
+        mvaddstr(y++, lx, "With Sync Only OFF that noise looks busy, so your");
+        mvaddstr(y++, lx, "radio can wait forever for a quiet that never");
+        mvaddstr(y++, lx, "comes. ON waits only for actual stations, at the");
+        mvaddstr(y++, lx, "cost of noticing them a little later.");
+        y++;
+        mvaddstr(y++, lx, "VHF/UHF FM is usually quiet, so OFF works there.");
         attron(A_DIM);
         mvaddstr(y, lx, "any key to close");
         attroff(A_DIM);
@@ -6384,7 +6536,14 @@ private:
     static constexpr int WF_ROW_MS = 100;
     static constexpr int WF_PAIR_BASE = 20;
     int wf_pairs_ = 0;
-    std::deque<std::array<uint8_t, WF_BINS>> wf_rows_;
+    bool wf_sig_ok_ = false;
+    int64_t wf_sig_seen_ = 0;
+    struct WFRow {
+        std::array<uint8_t, WF_BINS> bins;
+        int64_t ms = 0;
+        bool sig = false;
+    };
+    std::deque<WFRow> wf_rows_;
     int64_t wf_row_ms_ = 0;
     uint32_t wf_seen_ = 0;
     float wf_floor_db_ = -80.0f;
@@ -6414,6 +6573,7 @@ private:
     int frame_counter_ = 0;  
     bool show_help_ = false;  
     bool show_csma_help_ = false;
+    bool show_sync_help_ = false;
     
     bool calibrating_threshold_ = false;
     int calibration_start_frame_ = 0;

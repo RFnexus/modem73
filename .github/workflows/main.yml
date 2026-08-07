@@ -225,6 +225,7 @@ jobs:
           make -f packaging/Makefile.pkg \
                CC="$CC" CXX="$CXX" \
                ARCH_FLAGS="${{ matrix.arch_flags }}" \
+               VERSION="${{ needs.prep.outputs.version }}" \
                -j"$(nproc)"
 
       - name: Verify CM108 support is compiled in
@@ -424,6 +425,7 @@ jobs:
           make -f packaging/Makefile.pkg \
                CC="${{ matrix.cc }}" CXX="${{ matrix.cxx }}" \
                ARCH_FLAGS="${{ matrix.arch_flags }}" \
+               VERSION="${{ needs.prep.outputs.version }}" \
                -j"$(nproc)"
 
       - name: Verify CM108 support is compiled in
@@ -536,6 +538,7 @@ jobs:
           make -f packaging/Makefile.pkg \
                CC=gcc CXX=g++ \
                ARCH_FLAGS="${{ matrix.arch_flags }}" \
+               VERSION="${{ needs.prep.outputs.version }}" \
                -j"$(nproc)"
 
       - name: Verify CM108 support is compiled in

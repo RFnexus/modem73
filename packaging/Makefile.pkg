@@ -3,6 +3,11 @@ CC  ?= gcc
 
 ARCH_FLAGS ?= -O2
 CXXFLAGS = -std=c++17 -O3 $(ARCH_FLAGS) -Wall -Wextra
+
+GIT_EXACT := $(shell git describe --tags --exact-match 2>/dev/null | sed 's/^v//')
+GIT_BASE := $(shell git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//')
+VERSION ?= $(if $(GIT_EXACT),$(GIT_EXACT),$(if $(GIT_BASE),$(GIT_BASE)-dev,dev))
+CXXFLAGS += -DMODEM73_VERSION=\"$(VERSION)\"
 LDFLAGS = -lpthread -ltinfo -lncurses -ldl -lm
 
 PREFIX ?= /usr
@@ -16,7 +21,7 @@ INCLUDES = -I$(AICODIX_DSP) -I$(AICODIX_CODE) -I$(MODEM_SRC)
 
 TARGET = modem73
 SRCS = kiss_tnc.cc
-HDRS = kiss_tnc.hh miniaudio_audio.hh rigctl_ptt.hh modem.hh phy/mfsk_modem.hh tnc_ui.hh control_port.hh
+HDRS = kiss_tnc.hh csma.hh tone_dcd.hh miniaudio_audio.hh rigctl_ptt.hh modem.hh phy/mfsk_modem.hh phy/robust_modem.hh phy/common.hh tnc_ui.hh control_port.hh
 OBJS = deps/miniaudio.o deps/cJSON.o
 
 UI_FLAGS = -DWITH_UI
