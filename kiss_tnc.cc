@@ -792,7 +792,7 @@ private:
                         if (busy_episodes >= 2) {
                             csma_stage = std::min(csma_stage + 2, 2);
                             csma_clean = 0;
-                        } else if (busy_episodes == 0 && ++csma_clean >= 3) {
+                        } else if (busy_episodes <= 1 && ++csma_clean >= 3) {
                             csma_clean = 0;
                             csma_stage = std::max(csma_stage - 1, 0);
                         }
