@@ -3075,22 +3075,20 @@ private:
         addstr(state_.callsign.c_str());
         attroff(A_BOLD);
         if (state_.modem_type_index == 1) {
-            printw("  %s %dHz",
-                   MFSK_MODE_OPTIONS[state_.mfsk_mode_index].c_str(),
-                   state_.center_freq);
+            printw(" %s",
+                   MFSK_MODE_OPTIONS[state_.mfsk_mode_index].c_str());
         } else if (state_.modem_type_index == 2) {
-            printw("  %s %s %dHz",
+            printw(" %s %s",
                    ROBUST_MODE_OPTIONS[robust_base_index(state_.robust_mode_index)].c_str(),
-                   RobustParams::is_short((RobustMode)state_.robust_mode_index)
-                       ? "170B" : "510B",
-                   state_.center_freq);
+                   state_.robust_mode_index == 12 
+                       ? "30B" 
+                       : (RobustParams::is_short((RobustMode)state_.robust_mode_index) ? "170B" : "510B"));
         } else {
-            printw("  %s %s %s %dHz",
+            printw(" %s %s %s ",
                    MODULATION_OPTIONS[state_.modulation_index].c_str(),
                    CODE_RATE_OPTIONS[state_.code_rate_index].c_str(),
                    state_.frame_size == 0 ? "S" : state_.frame_size == 2 ? "L"
-                 : state_.frame_size == 3 ? "U" : "N",
-                   state_.center_freq);
+                 : state_.frame_size == 3 ? "U" : "N");
         }
         
         // Stats 
