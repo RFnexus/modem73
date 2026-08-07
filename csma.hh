@@ -18,6 +18,7 @@ struct CsmaConfig {
     int busy_limit_ms = 60000;
     int idle_credit_ms = 0;
     int cold_channel_ms = 10000;
+    int dcd_detect_ms = 780;
 };
 
 class CsmaGate {
@@ -25,26 +26,28 @@ public:
     enum class Verdict { WAIT, TRANSMIT };
     enum class Reason { NONE, CLEAR, RESPONDER, BUSY_OVERRIDE, NO_AUDIO };
 
-    CsmaGate(const CsmaConfig& cfg, uint32_t seed) : cfg_(cfg) {
+    CsmaGate(const CsmaConfig& cfg, uint32_t seed) : cfg_(cfg), gen_(seed) {
         int slot = std::max(1, cfg_.slot_ms);
         int window = std::max(2, cfg_.cw) * slot;
-        if (cfg_.idle_credit_ms >= cfg_.cold_channel_ms)
+        if (cfg_.sync_only) {
+            window = std::max(window * 2, 16 * std::max(1, cfg_.dcd_detect_ms));
+            if (cfg_.idle_credit_ms >= cfg_.cold_channel_ms)
+                window = std::max(window / 4, 4 * slot);
+        } else if (cfg_.idle_credit_ms >= cfg_.cold_channel_ms) {
             window = std::max(window / 4, 4 * slot);
-        if (cfg_.sync_only)
-            window *= 2;
+        }
         window_ = window;
-        std::mt19937 gen(seed);
         if (cfg_.responder) {
             quiet_needed_ = std::min(cfg_.quiet_ms, cfg_.responder_quiet_ms);
             contention_ms_ = cfg_.responder_dither_ms +
-                slot * std::uniform_int_distribution<int>(0, 3)(gen) +
-                std::uniform_int_distribution<int>(0, slot - 1)(gen);
+                slot * std::uniform_int_distribution<int>(0, 3)(gen_) +
+                std::uniform_int_distribution<int>(0, slot - 1)(gen_);
         } else {
             int slots = std::max(2, window / slot);
             quiet_needed_ = cfg_.quiet_ms;
             contention_ms_ = slot *
-                std::uniform_int_distribution<int>(0, slots - 1)(gen) +
-                std::uniform_int_distribution<int>(0, slot - 1)(gen);
+                std::uniform_int_distribution<int>(0, slots - 1)(gen_) +
+                std::uniform_int_distribution<int>(0, slot - 1)(gen_);
         }
         contention_drawn_ = contention_ms_;
         idle_ms_ = std::min(std::max(0, cfg_.idle_credit_ms), quiet_needed_);
@@ -54,6 +57,7 @@ public:
         if (!capture_alive) {
             idle_ms_ = 0;
             deaf_ms_ += cfg_.poll_ms;
+            redraw_pending_ = false;
             if (deaf_ms_ >= cfg_.deaf_limit_ms) {
                 reason_ = Reason::NO_AUDIO;
                 return Verdict::TRANSMIT;
@@ -64,12 +68,24 @@ public:
         if (!tx_allowed || (!cfg_.sync_only && level_db > cfg_.threshold_db)) {
             idle_ms_ = 0;
             busy_ms_ += cfg_.poll_ms;
+            redraw_pending_ = true;
             if (busy_ms_ >= cfg_.busy_limit_ms) {
                 reason_ = Reason::BUSY_OVERRIDE;
                 return Verdict::TRANSMIT;
             }
             return Verdict::WAIT;
         }
+        if (redraw_pending_ && cfg_.sync_only && !cfg_.responder) {
+            episodes_ = std::min(episodes_ + 1, 1);
+            int slot = std::max(1, cfg_.slot_ms);
+            int w = (int)std::min<long long>((long long)window_ << episodes_, 60000);
+            int slots = std::max(2, w / slot);
+            contention_ms_ = slot *
+                std::uniform_int_distribution<int>(0, slots - 1)(gen_) +
+                std::uniform_int_distribution<int>(0, slot - 1)(gen_);
+            contention_drawn_ = contention_ms_;
+        }
+        redraw_pending_ = false;
         busy_ms_ = 0;
         idle_ms_ += cfg_.poll_ms;
         if (idle_ms_ < quiet_needed_)
@@ -94,6 +110,7 @@ public:
 
 private:
     CsmaConfig cfg_;
+    std::mt19937 gen_;
     int window_ = 0;
     int quiet_needed_ = 0;
     int contention_ms_ = 0;
@@ -101,5 +118,7 @@ private:
     int idle_ms_ = 0;
     int deaf_ms_ = 0;
     int busy_ms_ = 0;
+    int episodes_ = 0;
+    bool redraw_pending_ = false;
     Reason reason_ = Reason::NONE;
 };

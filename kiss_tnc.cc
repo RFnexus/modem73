@@ -619,7 +619,7 @@ private:
 #endif
                 // CSMA
                 bool csma_enabled, csma_sync_only;
-                int carrier_sense_ms, slot_time_ms, csma_quiet_ms, csma_cw, csma_dither, csma_burst;
+                int carrier_sense_ms, slot_time_ms, csma_quiet_ms, csma_cw, csma_dither, csma_burst, modem_type;
                 float carrier_threshold_db;
                 std::string csma_callsign;
                 {
@@ -634,6 +634,7 @@ private:
                     csma_dither = config_.csma_responder_dither;
                     csma_burst = std::max(1, std::min(4, config_.csma_burst));
                     csma_callsign = config_.callsign;
+                    modem_type = config_.modem_type;
                     if (config_.modem_type == 0) {
                         bool short_ofdm = pkt.oper_mode >= 0
                             ? (pkt.oper_mode & 1) == 0
@@ -660,6 +661,7 @@ private:
                     gcfg.quiet_ms = csma_quiet_ms > 0 ? csma_quiet_ms : auto_quiet_ms();
                     gcfg.cw = csma_cw;
                     gcfg.slot_ms = slot_time_ms;
+                    gcfg.dcd_detect_ms = modem_type == 2 ? 780 : 1310;
                     gcfg.busy_limit_ms = std::max(30000, 8 * channel_air_ms());
                     int64_t idle_since = steady_now_ms() - last_channel_busy_ms_.load();
                     gcfg.idle_credit_ms = (int)std::max<int64_t>(0,
@@ -677,6 +679,9 @@ private:
                                      pkt.enqueue_ms - rx_ms <= 2000 &&
                                      steady_now_ms() - rx_ms <= 5000;
                     CsmaGate gate(gcfg, (uint32_t)gen());
+#ifdef WITH_UI
+                    if (g_ui_state) g_ui_state->csma_window_ms = gate.window_ms();
+#endif
 
                     if (gcfg.responder) {
                         std::cerr << "CSMA: responder priority, quiet "

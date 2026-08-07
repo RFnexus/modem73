@@ -255,6 +255,7 @@ struct TNCUIState {
     std::atomic<int> csma_phase{0};
     std::atomic<int> csma_wait_ms{0};
     std::atomic<int> csma_wait_need{0};
+    std::atomic<int> csma_window_ms{0};
     std::mutex rig_mode_mutex;
     std::string rig_mode;
     
@@ -3343,7 +3344,15 @@ private:
         y++;
 
         mvaddstr(y, c1, "Window");
-        mvprintw(y, c2, "%d slots", state_.csma_cw);
+        {
+            int w = state_.csma_window_ms.load();
+            int s = std::max(1, state_.slot_time_ms);
+            if (w > 0) {
+                mvprintw(y, c2, "%d slots (%d ms)", w / s, w);
+            } else {
+                mvprintw(y, c2, "%d slots", state_.csma_cw);
+            }
+        }
         y++;
 
         mvaddstr(y, c1, "Slot");
