@@ -1519,7 +1519,10 @@ private:
                         current_field_ = (current_field_ + FIELD_COUNT - 1) % FIELD_COUNT;
                     } while (should_skip_field(current_field_));
                 } else if (current_tab_ == 2) {
-                    if (log_scroll_ > 0) log_scroll_--;
+                    if (log_scroll_ > 0) {
+                        log_scroll_--;
+                        log_follow_ = false;
+                    }
                 } else if (current_tab_ == 3) {
                     if (utils_selection_ == 0 && utils_scroll_ > 0) {
                         utils_scroll_--;
@@ -1614,8 +1617,10 @@ private:
                 break;
                 
             case KEY_PPAGE:
-                if (current_tab_ == 2) log_scroll_ = std::max(0, log_scroll_ - 10);
-                else if (current_tab_ == 3) utils_scroll_ = std::max(0, utils_scroll_ - 5);
+                if (current_tab_ == 2) {
+                    log_scroll_ = std::max(0, log_scroll_ - 10);
+                    log_follow_ = false;
+                } else if (current_tab_ == 3) utils_scroll_ = std::max(0, utils_scroll_ - 5);
                 break;
 
             case KEY_NPAGE:
@@ -1624,7 +1629,10 @@ private:
                 break;
                 
             case KEY_HOME:
-                if (current_tab_ == 2) log_scroll_ = 0;
+                if (current_tab_ == 2) {
+                    log_scroll_ = 0;
+                    log_follow_ = false;
+                }
                 break;
                 
             case KEY_END:
@@ -1887,7 +1895,10 @@ private:
         // Scroll wheel in log
         if (current_tab_ == 2) {
             if (event.bstate & BUTTON4_PRESSED) {
-                if (log_scroll_ > 0) log_scroll_--;
+                if (log_scroll_ > 0) {
+                    log_scroll_--;
+                    log_follow_ = false;
+                }
             } else if (event.bstate & BUTTON5_PRESSED) {
                 log_scroll_++;
             }
@@ -4783,7 +4794,12 @@ private:
         auto log = state_.get_log();
         int visible = h - 1;
         int max_scroll = std::max(0, (int)log.size() - visible);
-        log_scroll_ = std::min(log_scroll_, max_scroll);
+        if (log_follow_)
+            log_scroll_ = max_scroll;
+        else
+            log_scroll_ = std::min(log_scroll_, max_scroll);
+        if (log_scroll_ >= max_scroll)
+            log_follow_ = true;
 
         int text_width = cols - 5;
 
@@ -6550,6 +6566,7 @@ private:
     DSP::RealToHalfComplexTransform<WF_FFT, std::complex<float>> wf_fft_;
     int config_scroll_ = 0;
     int log_scroll_ = 0;
+    bool log_follow_ = true;
     int utils_selection_ = 0;
     int utils_scroll_ = 0;
     int utils_max_scroll_ = 0;
