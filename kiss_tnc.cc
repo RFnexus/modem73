@@ -878,6 +878,13 @@ private:
         return q;
     }
 
+    int tx_lead_ms() const {
+        if (config_.tx_lead_tone && config_.tx_delay_ms >= 250)
+            return std::max(config_.tx_delay_ms,
+                            ToneDCD::MIN_LEAD_MS + TONE_LEAD_GAP_MS);
+        return config_.tx_delay_ms;
+    }
+
     bool transmit(const std::vector<uint8_t>& data, int oper_mode_override = -1,
                   bool first = true, bool last = true) {
         while (alc_tune_active_.load() && g_running)
@@ -971,7 +978,7 @@ private:
         float duration = samples.size() / (float)config_.sample_rate;
         float total_tx_duration = duration;
 
-        int64_t overhead_ms = config_.tx_delay_ms + config_.ptt_tail_ms +
+        int64_t overhead_ms = tx_lead_ms() + config_.ptt_tail_ms +
                               config_.vox_lead_ms + config_.vox_tail_ms + BURST_GAP_MS;
         arm_ptt_watchdog((int64_t)(duration * 1000.0f) + overhead_ms);
 
@@ -1025,7 +1032,7 @@ private:
 #endif
         } else {
             // RIGCTL, COM, or NONE mode
-            total_tx_duration += (first ? config_.tx_delay_ms : BURST_GAP_MS) / 1000.0f;
+            total_tx_duration += (first ? tx_lead_ms() : BURST_GAP_MS) / 1000.0f;
             if (last)
                 total_tx_duration += config_.ptt_tail_ms / 1000.0f;
             
@@ -1044,13 +1051,12 @@ private:
                 }
 
                 // Leading silence (TXDelay)
-                int lead_frames = config_.tx_delay_ms * config_.sample_rate / 1000;
+                int lead_frames = tx_lead_ms() * config_.sample_rate / 1000;
                 if (config_.tx_lead_tone && config_.tx_delay_ms >= 250) {
-                    int lead_ms = std::max(config_.tx_delay_ms, 500);
-                    lead_frames = lead_ms * config_.sample_rate / 1000;
-                    int gap_frames = 150 * config_.sample_rate / 1000;
+                    int gap_frames = TONE_LEAD_GAP_MS * config_.sample_rate / 1000;
                     auto lead = ToneDCD::signature_lead(modem_config_.center_freq,
-                                                        lead_frames - gap_frames, 0.6f,
+                                                        lead_frames - gap_frames,
+                                                        ToneDCD::LEAD_AMPLITUDE,
                                                         config_.sample_rate,
                                                         station_id_);
                     for (size_t i = 0; i < lead.size(); i += 1024) {
@@ -1473,10 +1479,9 @@ private:
                         }
                     }
                     if (tone_dcd_->consume_id_failure()) {
-                        last_unattrib_ms_.store(tnow);
                         if (g_debug)
                             ui_log("TONE: signature ID unreadable, "
-                                   "population unknown for 90s");
+                                   "population unchanged");
                     }
                     if (tone_dcd_->consume_signature()) {
                         if (tnow >= tone_hold_until_ms_)
@@ -1669,6 +1674,7 @@ private:
     }
     
     static constexpr int BURST_GAP_MS = 200;
+    static constexpr int TONE_LEAD_GAP_MS = 150;
 
     TNCConfig config_;
     ModemConfig modem_config_;

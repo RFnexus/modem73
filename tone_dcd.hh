@@ -18,6 +18,11 @@ public:
     static constexpr int RUN_BLOCKS = 15;
     static constexpr float PURITY_MIN = 0.45f;
     static constexpr float ENERGY_FLOOR = 1e-7f;
+    static constexpr float LEAD_AMPLITUDE = 0.8f;
+    static constexpr int PREROLL_BLOCKS = 15;
+    static constexpr int TRAIL_BLOCKS = 16;
+    static constexpr int MIN_LEAD_MS =
+        (PREROLL_BLOCKS + SEQ_BLOCKS + ID_SYMBOLS + TRAIL_BLOCKS) * BLOCK_MS;
 
     static const int* code() {
         static const int c[CODE_LEN] = {1, 1, 1, 0, 0, 0, 1, 0, 0, 1, 0};
@@ -119,14 +124,15 @@ public:
         int keyed = chip * CODE_LEN + sym * ID_SYMBOLS;
         int gramp = sample_rate / 100;
         bool key = num_samples >= keyed;
+        int pre = key ? std::max(0, num_samples - keyed - TRAIL_BLOCKS * sym) : 0;
         uint32_t word = ((uint32_t)station_id << 8) | crc8(station_id, ID_BITS);
         float phase = 0.0f;
         for (int i = 0; i < num_samples; i++) {
             int f = freq_hz;
-            if (key && i < chip * CODE_LEN) {
-                f = code()[i / chip] ? freq_hz + FSK_DEV : freq_hz - FSK_DEV;
-            } else if (key && i < keyed) {
-                int s = (i - chip * CODE_LEN) / sym;
+            if (key && i >= pre && i < pre + chip * CODE_LEN) {
+                f = code()[(i - pre) / chip] ? freq_hz + FSK_DEV : freq_hz - FSK_DEV;
+            } else if (key && i >= pre && i < pre + keyed) {
+                int s = (i - pre - chip * CODE_LEN) / sym;
                 int val = (int)((word >> (2 * (ID_SYMBOLS - 1 - s))) & 3);
                 f = freq_hz + (val * 100 - 150);
             }
