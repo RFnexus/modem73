@@ -20,6 +20,8 @@ struct CsmaConfig {
     int cold_channel_ms = 10000;
     int dcd_detect_ms = 780;
     int contenders = -1;
+    int rank = -1;
+    int rank_n = 0;
 };
 
 class CsmaGate {
@@ -44,7 +46,13 @@ public:
             window = std::max(window / 4, 4 * slot);
         }
         window_ = window;
-        if (cfg_.responder) {
+        if (cfg_.sync_only && !cfg_.responder && cfg_.rank >= 0) {
+            int det = std::max(1, cfg_.dcd_detect_ms);
+            rank_slot_ = std::max(slot, det + 150);
+            window_ = std::max(1, cfg_.rank_n) * rank_slot_;
+            quiet_needed_ = cfg_.quiet_ms;
+            contention_ms_ = cfg_.rank * rank_slot_;
+        } else if (cfg_.responder) {
             quiet_needed_ = std::min(cfg_.quiet_ms, cfg_.responder_quiet_ms);
             contention_ms_ = cfg_.responder_dither_ms +
                 slot * std::uniform_int_distribution<int>(0, 3)(gen_) +
@@ -83,15 +91,19 @@ public:
             return Verdict::WAIT;
         }
         if (redraw_pending_ && cfg_.sync_only && !cfg_.responder) {
-            episodes_ = std::min(episodes_ + 1, 1);
-            int slot = std::max(1, cfg_.slot_ms);
-            int w = cfg_.contenders >= 0 && cfg_.contenders <= 1
-                ? window_
-                : (int)std::min<long long>((long long)window_ << episodes_, 60000);
-            int slots = std::max(2, w / slot);
-            contention_ms_ = slot *
-                std::uniform_int_distribution<int>(0, slots - 1)(gen_) +
-                std::uniform_int_distribution<int>(0, slot - 1)(gen_);
+            if (rank_slot_ > 0) {
+                contention_ms_ = cfg_.rank * rank_slot_;
+            } else {
+                episodes_ = std::min(episodes_ + 1, 1);
+                int slot = std::max(1, cfg_.slot_ms);
+                int w = cfg_.contenders >= 0 && cfg_.contenders <= 1
+                    ? window_
+                    : (int)std::min<long long>((long long)window_ << episodes_, 60000);
+                int slots = std::max(2, w / slot);
+                contention_ms_ = slot *
+                    std::uniform_int_distribution<int>(0, slots - 1)(gen_) +
+                    std::uniform_int_distribution<int>(0, slot - 1)(gen_);
+            }
             contention_drawn_ = contention_ms_;
         }
         redraw_pending_ = false;
@@ -105,6 +117,21 @@ public:
         }
         reason_ = cfg_.responder ? Reason::RESPONDER : Reason::CLEAR;
         return Verdict::TRANSMIT;
+    }
+
+    void set_rank(int rank, int n) {
+        cfg_.rank = rank;
+        cfg_.rank_n = n;
+        if (rank < 0) {
+            rank_slot_ = 0;
+            return;
+        }
+        if (rank_slot_ == 0) {
+            int slot = std::max(1, cfg_.slot_ms);
+            int det = std::max(1, cfg_.dcd_detect_ms);
+            rank_slot_ = std::max(slot, det + 150);
+        }
+        window_ = std::max(1, cfg_.rank_n) * rank_slot_;
     }
 
     Reason reason() const { return reason_; }
@@ -121,6 +148,7 @@ private:
     CsmaConfig cfg_;
     std::mt19937 gen_;
     int window_ = 0;
+    int rank_slot_ = 0;
     int quiet_needed_ = 0;
     int contention_ms_ = 0;
     int contention_drawn_ = 0;

@@ -199,6 +199,7 @@ struct TNCUIState {
     bool csma_enabled = true;
     bool csma_sync_only = false;
     bool csma_fast_floor = false;
+    bool csma_ranked = false;
     float carrier_threshold_db = -30.0f;
     int slot_time_ms = 500;
     int csma_quiet_ms = 0;
@@ -260,6 +261,8 @@ struct TNCUIState {
     std::atomic<int> csma_phase{0};
     std::atomic<int> csma_wait_ms{0};
     std::atomic<int> csma_wait_need{0};
+    std::atomic<int> csma_rank{-1};
+    std::atomic<int> csma_rank_n{0};
     std::atomic<int> csma_window_ms{0};
     std::mutex rig_mode_mutex;
     std::string rig_mode;
@@ -761,6 +764,7 @@ struct TNCUIState {
         fprintf(f, "csma_enabled=%d\n", csma_enabled ? 1 : 0);
         fprintf(f, "csma_sync_only=%d\n", csma_sync_only ? 1 : 0);
         fprintf(f, "csma_fast_floor=%d\n", csma_fast_floor ? 1 : 0);
+        fprintf(f, "csma_ranked=%d\n", csma_ranked ? 1 : 0);
         fprintf(f, "carrier_threshold_db=%.1f\n", carrier_threshold_db);
         fprintf(f, "slot_time_ms=%d\n", slot_time_ms);
         fprintf(f, "csma_quiet_ms=%d\n", csma_quiet_ms);
@@ -858,6 +862,7 @@ struct TNCUIState {
                 else if (strcmp(key, "csma_enabled") == 0) csma_enabled = atoi(value) != 0;
                 else if (strcmp(key, "csma_sync_only") == 0) csma_sync_only = atoi(value) != 0;
                 else if (strcmp(key, "csma_fast_floor") == 0) csma_fast_floor = atoi(value) != 0;
+                else if (strcmp(key, "csma_ranked") == 0) csma_ranked = atoi(value) != 0;
                 else if (strcmp(key, "carrier_threshold_db") == 0) carrier_threshold_db = atof(value);
                 else if (strcmp(key, "slot_time_ms") == 0) slot_time_ms = atoi(value);
                 else if (strcmp(key, "csma_quiet_ms") == 0) csma_quiet_ms = atoi(value);
@@ -1394,6 +1399,8 @@ private:
         FIELD_THRESHOLD,
         FIELD_SYNC_ONLY,
         FIELD_SYNC_INFO,
+        FIELD_RANKED,
+        FIELD_RANKED_INFO,
         FIELD_CSMA_BAND,
         FIELD_CSMA_PRESET,
         FIELD_CSMA_ADV,
@@ -1492,6 +1499,10 @@ private:
         }
         if (show_sync_help_) {
             show_sync_help_ = false;
+            return;
+        }
+        if (show_ranked_help_) {
+            show_ranked_help_ = false;
             return;
         }
 
@@ -1646,6 +1657,8 @@ private:
                         show_csma_help_ = true;
                     } else if (current_field_ == FIELD_SYNC_INFO) {
                         show_sync_help_ = true;
+                    } else if (current_field_ == FIELD_RANKED_INFO) {
+                        show_ranked_help_ = true;
                     } else if (current_field_ == FIELD_CSMA_ADV) {
                         state_.csma_advanced_open = !state_.csma_advanced_open;
                     } else if (current_field_ == FIELD_CALLSIGN) {
@@ -1846,6 +1859,8 @@ private:
                     show_csma_help_ = true;
                 if (field == FIELD_SYNC_INFO)
                     show_sync_help_ = true;
+                if (field == FIELD_RANKED_INFO)
+                    show_ranked_help_ = true;
                 
                 if (field >= 0 && field < FIELD_COUNT) {
                     current_field_ = field;
@@ -2091,7 +2106,8 @@ private:
             if (field == FIELD_THRESHOLD || field == FIELD_CSMA_CW)
                 return true;
         } else {
-            if (field == FIELD_FAST_FLOOR)
+            if (field == FIELD_FAST_FLOOR || field == FIELD_RANKED ||
+                field == FIELD_RANKED_INFO)
                 return true;
         }
         return false;
@@ -2138,6 +2154,12 @@ private:
         row++;
         if (field == FIELD_SYNC_INFO) return row;
         row++;
+        if (state_.csma_sync_only) {
+            if (field == FIELD_RANKED) return row;
+            row++;
+            if (field == FIELD_RANKED_INFO) return row;
+            row++;
+        }
         if (field == FIELD_CSMA_BAND) return row;
         row++;
         if (field == FIELD_CSMA_PRESET) return row;
@@ -2336,6 +2358,13 @@ private:
                 break;
             case FIELD_FAST_FLOOR:
                 state_.csma_fast_floor = !state_.csma_fast_floor;
+                break;
+            case FIELD_RANKED:
+                state_.csma_ranked = !state_.csma_ranked;
+                if (state_.csma_ranked && !state_.tx_lead_tone) {
+                    state_.tx_lead_tone = true;
+                    state_.add_log("Ranked: lead tone enabled");
+                }
                 break;
             case FIELD_FRAGMENTATION:
                 state_.fragmentation_enabled = !state_.fragmentation_enabled;
@@ -3225,6 +3254,9 @@ private:
         if (show_sync_help_) {
             draw_sync_only_help(rows, cols);
         }
+        if (show_ranked_help_) {
+            draw_ranked_help(rows, cols);
+        }
     }
     
     void draw_status(int y, int h, int cols) {
@@ -3415,7 +3447,10 @@ private:
         {
             int w = state_.csma_window_ms.load();
             int s = std::max(1, state_.slot_time_ms);
-            if (w > 0) {
+            int rk = state_.csma_rank.load();
+            if (state_.csma_ranked && rk >= 0 && state_.csma_rank_n.load() > 0) {
+                mvprintw(y, c2, "%d turns (%d ms)", state_.csma_rank_n.load(), w);
+            } else if (w > 0) {
                 mvprintw(y, c2, "%d slots (%d ms)", w / s, w);
             } else {
                 mvprintw(y, c2, "%d slots", state_.csma_cw);
@@ -3447,7 +3482,15 @@ private:
                 attroff(COLOR_PAIR(3));
             } else if (phase == 3) {
                 attron(COLOR_PAIR(4));
-                printw("contending %d ms", state_.csma_wait_ms.load());
+                {
+                    int rk = state_.csma_rank.load();
+                    if (rk >= 0)
+                        printw("turn %d/%d in %d ms", rk + 1,
+                               state_.csma_rank_n.load(),
+                               state_.csma_wait_ms.load());
+                    else
+                        printw("contending %d ms", state_.csma_wait_ms.load());
+                }
                 attroff(COLOR_PAIR(4));
             } else {
                 attron(A_DIM);
@@ -4035,6 +4078,22 @@ private:
             if (sel_sinfo) attroff(A_BOLD); else attroff(A_DIM);
         }
         row++;
+
+        if (state_.csma_sync_only) {
+            dy = visible_y(row);
+            if (dy >= 0) draw_toggle_field(dy, c1, c2, "Ranked", FIELD_RANKED,
+                                           state_.csma_ranked);
+            row++;
+
+            dy = visible_y(row);
+            if (dy >= 0) {
+                bool sel_rinfo = (current_field_ == FIELD_RANKED_INFO);
+                if (sel_rinfo) attron(A_BOLD); else attron(A_DIM);
+                mvprintw(dy, c1 + 2, "%s[?] What is this?", sel_rinfo ? "> " : "  ");
+                if (sel_rinfo) attroff(A_BOLD); else attroff(A_DIM);
+            }
+            row++;
+        }
 
         dy = visible_y(row);
         if (dy >= 0) draw_selector_field(dy, c1, c2, "Band", FIELD_CSMA_BAND,
@@ -6350,8 +6409,47 @@ private:
         attroff(A_DIM);
     }
 
+    void draw_ranked_help(int rows, int cols) {
+        int w = 58, h = 17;
+        int x0 = (cols - w) / 2, y0 = (rows - h) / 2;
+        attron(COLOR_PAIR(4));
+        for (int y = y0; y < y0 + h && y < rows; y++)
+            mvhline(y, x0, ' ', w);
+        mvhline(y0, x0, ACS_HLINE, w);
+        mvhline(y0 + h - 1, x0, ACS_HLINE, w);
+        mvvline(y0, x0, ACS_VLINE, h);
+        mvvline(y0, x0 + w - 1, ACS_VLINE, h);
+        mvaddch(y0, x0, ACS_ULCORNER);
+        mvaddch(y0, x0 + w - 1, ACS_URCORNER);
+        mvaddch(y0 + h - 1, x0, ACS_LLCORNER);
+        mvaddch(y0 + h - 1, x0 + w - 1, ACS_LRCORNER);
+        attron(A_BOLD);
+        mvaddstr(y0, x0 + 3, " RANKED ");
+        attroff(A_BOLD);
+        attroff(COLOR_PAIR(4));
+        int y = y0 + 2, lx = x0 + 2;
+        mvaddstr(y++, lx, "Take turns instead of gambling.");
+        y++;
+        attron(A_BOLD); mvaddstr(y, lx, "OFF"); attroff(A_BOLD);
+        mvaddstr(y++, lx + 5, "every station waits a random time before");
+        mvaddstr(y++, lx + 5, "keying up, sometimes colliding anyway.");
+        attron(A_BOLD); mvaddstr(y, lx, "ON"); attroff(A_BOLD);
+        mvaddstr(y++, lx + 5, "stations that hear each other agree on an");
+        mvaddstr(y++, lx + 5, "order from their ID tones and go in turn.");
+        y++;
+        mvaddstr(y++, lx, "Usually 3-7x faster channel access when two or");
+        mvaddstr(y++, lx, "more stations share the frequency.");
+        y++;
+        mvaddstr(y++, lx, "All stations need Ranked AND Lead Tone on. Ones");
+        mvaddstr(y++, lx, "without it still work with their random waits,");
+        mvaddstr(y++, lx, "they are just left out of the turn order.");
+        attron(A_DIM);
+        mvaddstr(y, lx, "any key to close");
+        attroff(A_DIM);
+    }
+
     void draw_sync_only_help(int rows, int cols) {
-        int w = 58, h = 20;
+        int w = 58, h = 22;
         int x0 = (cols - w) / 2, y0 = (rows - h) / 2;
         attron(COLOR_PAIR(4));
         for (int y = y0; y < y0 + h && y < rows; y++)
@@ -6386,6 +6484,8 @@ private:
         mvaddstr(y++, lx, "cost of noticing them a little later.");
         y++;
         mvaddstr(y++, lx, "VHF/UHF FM is usually quiet, so OFF works there.");
+        mvaddstr(y++, lx, "Ranked takes TX turns in station ID order instead");
+        mvaddstr(y++, lx, "of random waits. Needs the lead tone on.");
         attron(A_DIM);
         mvaddstr(y, lx, "any key to close");
         attroff(A_DIM);
@@ -6591,6 +6691,7 @@ private:
     bool show_help_ = false;  
     bool show_csma_help_ = false;
     bool show_sync_help_ = false;
+    bool show_ranked_help_ = false;
     
     bool calibrating_threshold_ = false;
     int calibration_start_frame_ = 0;

@@ -615,6 +615,8 @@ private:
             station_id_ = (uint16_t)((gen() % 0xFFFE) + 1);
         int csma_stage = 0;
         int csma_clean = 0;
+        int boot_attempt = 0;
+        bool last_tx_responder = false;
         int64_t last_burst_end = -1000000;
 
         while (tx_running_ && g_running) {
@@ -626,7 +628,8 @@ private:
                 }
 #endif
                 // CSMA
-                bool csma_enabled, csma_sync_only, csma_fast_floor;
+                bool csma_enabled, csma_sync_only, csma_fast_floor, csma_ranked;
+                bool this_tx_responder = false;
                 int carrier_sense_ms, slot_time_ms, csma_quiet_ms, csma_cw, csma_dither, csma_burst, modem_type;
                 float carrier_threshold_db;
                 std::string csma_callsign;
@@ -635,6 +638,8 @@ private:
                     csma_enabled = config_.csma_enabled;
                     csma_sync_only = config_.csma_sync_only;
                     csma_fast_floor = config_.csma_fast_floor;
+                    csma_ranked = config_.csma_ranked && config_.tx_lead_tone &&
+                                  config_.tx_delay_ms >= 250;
                     carrier_sense_ms = config_.carrier_sense_ms;
                     carrier_threshold_db = config_.carrier_threshold_db;
                     slot_time_ms = config_.slot_time_ms;
@@ -673,6 +678,7 @@ private:
                     gcfg.dcd_detect_ms = csma_fast_floor ? 550
                                        : modem_type == 2 ? 780 : 1310;
                     gcfg.contenders = csma_sync_only ? n_contenders() : -1;
+                    int raw_pop = gcfg.contenders;
                     if (occupancy_pct_.load() > 55 || csma_stage >= 1 ||
                         gcfg.contenders > 1)
                         gcfg.contenders = -1;
@@ -684,13 +690,33 @@ private:
                     if (csma_sync_only && csma_quiet_ms <= 0 &&
                         gcfg.contenders >= 0 && gcfg.contenders <= 1)
                         gcfg.quiet_ms = std::min(gcfg.quiet_ms, 1000);
+                    int boot_rank = -1;
+                    if (csma_ranked && csma_sync_only) {
+                        gcfg.rank = ranked_slot(&gcfg.rank_n);
+                        if (gcfg.rank < 0) {
+                            uint32_t h = (uint32_t)station_id_.load() ^
+                                         (uint32_t)(boot_attempt * 0x9E37u);
+                            h *= 0x9E3779B1u;
+                            h ^= h >> 16;
+                            h *= 0x85EBCA6Bu;
+                            h ^= h >> 13;
+                            boot_rank = (int)(h % 4);
+                            boot_attempt++;
+                            gcfg.rank = boot_rank;
+                            gcfg.rank_n = 4;
+                        } else {
+                            boot_attempt = 0;
+                        }
+                    }
                     if (g_debug && csma_sync_only) {
                         char dbg[128];
                         snprintf(dbg, sizeof dbg,
-                                 "CSMA: contenders %d stage %d occupancy %d%% "
-                                 "quiet %d ms",
-                                 gcfg.contenders, csma_stage,
-                                 occupancy_pct_.load(), gcfg.quiet_ms);
+                                 "CSMA: pop %d stage %d occupancy %d%% "
+                                 "quiet %d ms rank %d/%d winner %04X",
+                                 raw_pop, csma_stage,
+                                 occupancy_pct_.load(), gcfg.quiet_ms,
+                                 gcfg.rank, gcfg.rank_n,
+                                 last_winner_id_.load());
                         ui_log(dbg);
                     }
                     gcfg.busy_limit_ms = std::max(30000, 8 * channel_air_ms());
@@ -709,6 +735,13 @@ private:
                     gcfg.responder = rx_ms > 0 && pkt.enqueue_ms >= rx_ms &&
                                      pkt.enqueue_ms - rx_ms <= 5000 &&
                                      steady_now_ms() - rx_ms <= 8000;
+                    if (gcfg.responder && csma_ranked && csma_sync_only &&
+                        last_tx_responder && known_others() >= 2) {
+                        gcfg.responder = false;
+                        if (g_debug)
+                            ui_log("CSMA: responder cap, taking ranked turn");
+                    }
+                    this_tx_responder = gcfg.responder;
                     CsmaGate gate(gcfg, (uint32_t)gen());
 #ifdef WITH_UI
                     if (g_ui_state) g_ui_state->csma_window_ms = gate.window_ms();
@@ -725,10 +758,19 @@ private:
 
                     bool was_busy = false, was_deaf = false, quiet_logged = false;
                     int busy_episodes = 0;
+                    int cur_rank = -1, cur_rank_n = 0;
                     while (g_running) {
                         bool alive = audio_->capture_alive();
                         float level_db = audio_->instant_level_db(carrier_sense_ms);
                         bool allowed = is_tx_allowed();
+                        if (csma_ranked && csma_sync_only) {
+                            cur_rank = ranked_slot(&cur_rank_n);
+                            if (cur_rank < 0 && boot_rank >= 0) {
+                                cur_rank = boot_rank;
+                                cur_rank_n = 4;
+                            }
+                            gate.set_rank(cur_rank, cur_rank_n);
+                        }
                         auto v = gate.step(level_db, alive, allowed);
                         if (v == CsmaGate::Verdict::TRANSMIT) {
                             switch (gate.reason()) {
@@ -775,6 +817,8 @@ private:
                         }
 #ifdef WITH_UI
                         if (g_ui_state) {
+                            g_ui_state->csma_rank = cur_rank;
+                            g_ui_state->csma_rank_n = cur_rank_n;
                             if (gate.quiet_met()) {
                                 g_ui_state->csma_phase = 3;
                                 g_ui_state->csma_wait_ms = gate.contention_left_ms();
@@ -818,6 +862,11 @@ private:
                     bool sent = transmit(cur.data, cur.oper_mode, first, !have_next);
                     if (!have_next) {
                         last_burst_end = steady_now_ms();
+                        if (sent) {
+                            last_tx_responder = this_tx_responder;
+                            if (csma_ranked)
+                                last_winner_id_.store(station_id_.load());
+                        }
                         break;
                     }
                     std::cerr << "CSMA: burst continuation ("
@@ -1464,6 +1513,12 @@ private:
                     uint16_t heard_id;
                     if (tone_dcd_->consume_station_id(&heard_id)) {
                         size_t pop;
+                        if (heard_id == station_id_.load()) {
+                            std::random_device rd;
+                            station_id_.store((uint16_t)((rd() % 0xFFFE) + 1));
+                            ui_log("TONE: station ID collision, re-rolled");
+                        }
+                        last_winner_id_.store(heard_id);
                         {
                             std::lock_guard<std::mutex> hl(heard_mutex_);
                             heard_ids_[heard_id] = tnow;
@@ -1522,10 +1577,16 @@ private:
                             pending_unattrib_ms_ = -1;
                         } else if (tnow - pending_unattrib_ms_ > 1200) {
                             pending_unattrib_ms_ = -1;
-                            last_unattrib_ms_.store(tnow);
-                            if (g_debug)
+                            if (tnow - unattrib_seen_ms_ <= 30000) {
+                                last_unattrib_ms_.store(tnow);
+                                if (g_debug)
+                                    ui_log("TONE: carrier without station ID, "
+                                           "population unknown for 90s");
+                            } else if (g_debug) {
                                 ui_log("TONE: carrier without station ID, "
-                                       "population unknown for 90s");
+                                       "ignored once");
+                            }
+                            unattrib_seen_ms_ = tnow;
                         }
                     }
                 }
@@ -1733,12 +1794,14 @@ private:
     std::unique_ptr<ToneDCD> tone_dcd_;
     int64_t tone_hold_until_ms_ = 0;
     int64_t tone_run_start_ms_ = -1;
-    uint16_t station_id_ = 0;
+    std::atomic<uint16_t> station_id_{0};
+    std::atomic<uint16_t> last_winner_id_{0};
     std::mutex heard_mutex_;
     std::map<uint16_t, int64_t> heard_ids_;
     int64_t last_id_ms_ = -1000000;
     int64_t last_dcd_ms_ = -1000000;
     int64_t pending_unattrib_ms_ = -1;
+    int64_t unattrib_seen_ms_ = -1000000;
     std::atomic<int64_t> last_unattrib_ms_{-1000000};
 
     int n_contenders() {
@@ -1753,6 +1816,47 @@ private:
                 ++it;
         }
         return (int)heard_ids_.size();
+    }
+
+    int known_others() {
+        int64_t now = steady_now_ms();
+        std::lock_guard<std::mutex> hl(heard_mutex_);
+        int c = 0;
+        for (const auto& kv : heard_ids_)
+            if (now - kv.second <= 90000)
+                c++;
+        return c;
+    }
+
+    int ranked_slot(int* n_out) {
+        int64_t now = steady_now_ms();
+        std::lock_guard<std::mutex> hl(heard_mutex_);
+        for (auto it = heard_ids_.begin(); it != heard_ids_.end();) {
+            if (now - it->second > 90000)
+                it = heard_ids_.erase(it);
+            else
+                ++it;
+        }
+        if (heard_ids_.empty())
+            return -1;
+        uint16_t self = station_id_.load();
+        std::vector<uint16_t> ids;
+        ids.push_back(self);
+        for (const auto& kv : heard_ids_)
+            if (kv.first != self)
+                ids.push_back(kv.first);
+        std::sort(ids.begin(), ids.end());
+        int n = (int)ids.size();
+        int i = (int)(std::find(ids.begin(), ids.end(), self) - ids.begin());
+        *n_out = n;
+        auto w = std::find(ids.begin(), ids.end(), last_winner_id_.load());
+        if (w == ids.end())
+            return i;
+        if (*w == self) {
+            *n_out = 2 * n - 1;
+            return n - 1 + i;
+        }
+        return (i - (int)(w - ids.begin()) - 1 + n) % n;
     }
     float occupancy_ema_ = 0.0f;
     float occupancy_other_ema_ = 0.0f;
@@ -1870,6 +1974,7 @@ public:
             config_.csma_enabled = new_config.csma_enabled;
             config_.csma_sync_only = new_config.csma_sync_only;
             config_.csma_fast_floor = new_config.csma_fast_floor;
+            config_.csma_ranked = new_config.csma_ranked;
             config_.postamble = new_config.postamble;
             config_.carrier_threshold_db = new_config.carrier_threshold_db;
             config_.p_persistence = new_config.p_persistence;
@@ -2172,6 +2277,7 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
         else if (!strcmp(key, "csma_enabled") && take(key)) config.csma_enabled = atoi(value) != 0;
         else if (!strcmp(key, "csma_sync_only") && take(key)) config.csma_sync_only = atoi(value) != 0;
         else if (!strcmp(key, "csma_fast_floor") && take(key)) config.csma_fast_floor = atoi(value) != 0;
+        else if (!strcmp(key, "csma_ranked") && take(key)) config.csma_ranked = atoi(value) != 0;
         else if (!strcmp(key, "carrier_threshold_db") && take(key)) {
             float v = atof(value);
             if (std::isfinite(v) && v >= -80.0f && v <= 0.0f)
@@ -2639,6 +2745,7 @@ int main(int argc, char** argv) {
                     config.csma_enabled = ui_state.csma_enabled;
                 config.csma_sync_only = ui_state.csma_sync_only;
                 config.csma_fast_floor = ui_state.csma_fast_floor;
+                config.csma_ranked = ui_state.csma_ranked;
                 if (!cli_set.count("carrier_threshold_db"))
                     config.carrier_threshold_db = ui_state.carrier_threshold_db;
                 if (!cli_set.count("slot_time_ms"))
@@ -2756,6 +2863,7 @@ int main(int argc, char** argv) {
                 ui_state.csma_enabled = config.csma_enabled;
                 ui_state.csma_sync_only = config.csma_sync_only;
                 ui_state.csma_fast_floor = config.csma_fast_floor;
+                ui_state.csma_ranked = config.csma_ranked;
                 ui_state.carrier_threshold_db = config.carrier_threshold_db;
                 ui_state.slot_time_ms = config.slot_time_ms;
                 ui_state.csma_quiet_ms = config.csma_quiet_ms;
@@ -2824,6 +2932,7 @@ int main(int argc, char** argv) {
         ui_state.csma_enabled = config.csma_enabled;
         ui_state.csma_sync_only = config.csma_sync_only;
         ui_state.csma_fast_floor = config.csma_fast_floor;
+        ui_state.csma_ranked = config.csma_ranked;
         ui_state.carrier_threshold_db = config.carrier_threshold_db;
         ui_state.slot_time_ms = config.slot_time_ms;
         ui_state.csma_quiet_ms = config.csma_quiet_ms;
@@ -3042,6 +3151,7 @@ int main(int argc, char** argv) {
                 cJSON_AddBoolToObject(j, "csma_enabled", cfg.csma_enabled);
                 cJSON_AddBoolToObject(j, "csma_sync_only", cfg.csma_sync_only);
                 cJSON_AddBoolToObject(j, "csma_fast_floor", cfg.csma_fast_floor);
+                cJSON_AddBoolToObject(j, "csma_ranked", cfg.csma_ranked);
                 cJSON_AddNumberToObject(j, "carrier_threshold_db", cfg.carrier_threshold_db);
                 cJSON_AddNumberToObject(j, "p_persistence", cfg.p_persistence);
                 cJSON_AddNumberToObject(j, "slot_time_ms", cfg.slot_time_ms);
@@ -3099,6 +3209,8 @@ int main(int argc, char** argv) {
                     new_config.csma_sync_only = cJSON_IsTrue(item);
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "csma_fast_floor")) && cJSON_IsBool(item))
                     new_config.csma_fast_floor = cJSON_IsTrue(item);
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "csma_ranked")) && cJSON_IsBool(item))
+                    new_config.csma_ranked = cJSON_IsTrue(item);
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "carrier_threshold_db")) && cJSON_IsNumber(item))
                     new_config.carrier_threshold_db = (float)item->valuedouble;
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "p_persistence")) && cJSON_IsNumber(item))
@@ -3206,6 +3318,7 @@ int main(int argc, char** argv) {
                 new_config.csma_enabled = state.csma_enabled;
                 new_config.csma_sync_only = state.csma_sync_only;
                 new_config.csma_fast_floor = state.csma_fast_floor;
+                new_config.csma_ranked = state.csma_ranked;
                 new_config.carrier_threshold_db = state.carrier_threshold_db;
                 new_config.p_persistence = state.p_persistence;
                 new_config.slot_time_ms = state.slot_time_ms;

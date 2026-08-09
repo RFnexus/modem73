@@ -106,6 +106,7 @@ struct TNCConfig {
     float carrier_threshold_db = -30.0f;
     bool csma_sync_only = false;
     bool csma_fast_floor = false;
+    bool csma_ranked = false;
     int carrier_sense_ms = 100;
     int max_backoff_slots = 10;
     int csma_quiet_ms = 0;
