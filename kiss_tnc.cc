@@ -2138,6 +2138,10 @@ public:
 
     size_t tx_queue_depth() const { return tx_queue_.size(); }
 
+    int channel_population() { return known_others(); }
+
+    int channel_occupancy() const { return occupancy_pct_.load(); }
+
     bool is_receiving() const {
         std::lock_guard<std::mutex> lock(lockout_mutex_);
         return std::chrono::steady_clock::now() < tx_lockout_until_;
@@ -3120,6 +3124,8 @@ int main(int argc, char** argv) {
                 cJSON_AddNumberToObject(j, "client_count", tnc.get_client_count());
                 cJSON_AddBoolToObject(j, "rigctl_connected", tnc.is_rigctl_connected());
                 cJSON_AddBoolToObject(j, "audio_connected", tnc.is_audio_healthy());
+                cJSON_AddNumberToObject(j, "population", tnc.channel_population());
+                cJSON_AddNumberToObject(j, "occupancy_pct", tnc.channel_occupancy());
 
                 return j;
             };
