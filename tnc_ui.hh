@@ -5337,10 +5337,11 @@ private:
         int show = std::min((int)msgs.size(), 4);
 
         int total_rows = 10 + utils_visible_slots() + std::max(1, show);
-        if (state_.perf_logger) {
-            int right_rows = 4 + std::max(1, (int)state_.perf_logger->snapshot().size());
-            total_rows = std::max(total_rows, right_rows);
-        }
+        int right_rows = 0;
+        if (state_.perf_logger)
+            right_rows = 5 + std::max(1, (int)state_.perf_logger->snapshot().size());
+        right_rows += 2 + (int)state_.get_recent_packets().size();
+        total_rows = std::max(total_rows, right_rows);
         int max_scroll = std::max(0, total_rows - h);
         utils_max_scroll_ = max_scroll;
         if (utils_scroll_ > max_scroll) utils_scroll_ = max_scroll;
@@ -5352,23 +5353,25 @@ private:
             return start_y + screen_row;
         };
 
+        int rn = 0;
+        int rw = std::max(0, cols - c2 - 2);
         if (state_.perf_logger) {
-            int ry = start_y;
-            auto rrow = [&](int r) -> int {
-                int screen_row = r - utils_scroll_;
-                if (screen_row < 0 || screen_row >= h) return -1;
-                return start_y + screen_row;
-            };
+            auto rrow = [&](int r) -> int { return vy(r); };
             int r = 0, dy2;
+            char rbuf[256];
+            auto rput = [&](int ry2, const char* s) {
+                mvaddnstr(ry2, c2, s, rw);
+            };
             if ((dy2 = rrow(r++)) >= 0) {
                 attron(COLOR_PAIR(4) | A_BOLD);
-                mvaddstr(dy2, c2, "[ RX PERFORMANCE ]");
+                rput(dy2, "[ RX PERFORMANCE ]");
                 attroff(COLOR_PAIR(4) | A_BOLD);
             }
             if ((dy2 = rrow(r++)) >= 0) {
                 attron(A_DIM);
-                mvprintw(dy2, c2, "%-13s %4s %4s %6s %6s %6s %6s",
+                snprintf(rbuf, sizeof(rbuf), "%-13s %4s %4s %6s %6s %6s %6s",
                          "MODE", "N", "LOST", "SNRav", "SNRmn", "SNRmx", "BERav");
+                rput(dy2, rbuf);
                 attroff(A_DIM);
             }
             auto rows = state_.perf_logger->snapshot();
@@ -5378,32 +5381,40 @@ private:
                 char mode[14];
                 snprintf(mode, sizeof(mode), "%s", a.mode.c_str());
                 if (a.ber_avg() >= 0)
-                    mvprintw(dy2, c2, "%-13s %4d %4d %5.1f  %5.1f  %5.1f  %5.2f%%",
+                    snprintf(rbuf, sizeof(rbuf),
+                             "%-13s %4d %4d %5.1f  %5.1f  %5.1f  %5.2f%%",
                              mode, a.frames, a.lost, a.snr_avg(), a.snr_min,
                              a.snr_max, a.ber_avg());
                 else
-                    mvprintw(dy2, c2, "%-13s %4d %4d %5.1f  %5.1f  %5.1f      -",
+                    snprintf(rbuf, sizeof(rbuf),
+                             "%-13s %4d %4d %5.1f  %5.1f  %5.1f      -",
                              mode, a.frames, a.lost, a.snr_avg(), a.snr_min,
                              a.snr_max);
+                rput(dy2, rbuf);
             }
             if (rows.empty() && (dy2 = rrow(r++)) >= 0) {
                 attron(A_DIM);
-                mvaddstr(dy2, c2, "(no frames decoded yet)");
+                rput(dy2, "(no frames decoded yet)");
                 attroff(A_DIM);
             }
             r++;
             if ((dy2 = rrow(r++)) >= 0) {
                 attron(A_DIM);
-                if (state_.perf_logger->csv_enabled())
-                    mvprintw(dy2, c2, "CSV: ON  %d rows  %s",
-                             state_.perf_logger->total(),
-                             state_.perf_logger->csv_path().c_str());
-                else
-                    mvprintw(dy2, c2, "CSV: OFF (%d frames tracked)",
+                if (state_.perf_logger->csv_enabled()) {
+                    const std::string& p = state_.perf_logger->csv_path();
+                    size_t slash = p.find_last_of('/');
+                    const char* base = slash == std::string::npos
+                        ? p.c_str() : p.c_str() + slash + 1;
+                    snprintf(rbuf, sizeof(rbuf), "CSV: ON  %d rows  %s",
+                             state_.perf_logger->total(), base);
+                } else {
+                    snprintf(rbuf, sizeof(rbuf), "CSV: OFF (%d frames tracked)",
                              state_.perf_logger->total());
+                }
+                rput(dy2, rbuf);
                 attroff(A_DIM);
             }
-            (void)ry;
+            rn = r;
         }
 
         int dy = vy(row);
@@ -5472,7 +5483,7 @@ private:
                     attroff(COLOR_PAIR(4) | A_BOLD);
                 }
             }
-            if (i == 10) {
+            if (i == 9) {
                 if (auto_alt_enabled_) {
                     attron(COLOR_PAIR(1) | A_BOLD);
                     printw("  [x]");
@@ -5493,7 +5504,7 @@ private:
                 printw("  [%ds...]", 3 - elapsed);
                 attroff(COLOR_PAIR(4) | A_BOLD);
             }
-            if (i == 8 && state_.perf_logger) {
+            if (i == 7 && state_.perf_logger) {
                 if (state_.perf_logger->csv_enabled()) {
                     attron(COLOR_PAIR(1) | A_BOLD);
                     printw("  [x]");
@@ -5502,7 +5513,7 @@ private:
                     printw("  [ ]");
                 }
             }
-            if (i == 7) {
+            if (i == 6) {
                 if (auto_send_enabled_) {
                     attron(COLOR_PAIR(1) | A_BOLD);
                     printw("  [x]");
@@ -5638,49 +5649,54 @@ private:
             }
         }
 
-        int ry = 4;
-        attron(COLOR_PAIR(4) | A_BOLD);
-        mvaddstr(ry, c2, "[ RECENT ACTIVITY ]");
-        attroff(COLOR_PAIR(4) | A_BOLD);
-        ry++;
-        
+        if (rn > 0) rn++;
+        int ry = vy(rn++);
+        if (ry >= 0) {
+            attron(COLOR_PAIR(4) | A_BOLD);
+            mvaddnstr(ry, c2, "[ RECENT ACTIVITY ]", rw);
+            attroff(COLOR_PAIR(4) | A_BOLD);
+        }
+
         auto packets = state_.get_recent_packets();
-        int display_count = std::min((int)packets.size(), h - 3);
-        
-        for (int i = packets.size() - display_count; i < (int)packets.size(); i++) {
+        for (int i = 0; i < (int)packets.size(); i++) {
+            ry = vy(rn++);
+            if (ry < 0) continue;
             const auto& pkt = packets[i];
             auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::steady_clock::now() - pkt.timestamp).count();
-            
+
             if (pkt.is_tx) {
                 attron(COLOR_PAIR(2) | A_BOLD);
-                mvaddstr(ry, c2, "TX");
+                mvaddnstr(ry, c2, "TX", rw);
                 attroff(COLOR_PAIR(2) | A_BOLD);
             } else {
                 attron(COLOR_PAIR(1) | A_BOLD);
-                mvaddstr(ry, c2, "RX");
+                mvaddnstr(ry, c2, "RX", rw);
                 attroff(COLOR_PAIR(1) | A_BOLD);
             }
-            
-            mvprintw(ry, c2 + 3, "%4dB", pkt.size);
-            
-            // Time ago
+
+            char pbuf[64];
+            if (rw > 3) {
+                snprintf(pbuf, sizeof(pbuf), "%4dB", pkt.size);
+                mvaddnstr(ry, c2 + 3, pbuf, rw - 3);
+            }
+
             attron(A_DIM);
-            if (elapsed < 60) {
-                mvprintw(ry, c2 + 10, "%lds ago", elapsed);
-            } else {
-                mvprintw(ry, c2 + 10, "%ldm ago", elapsed / 60);
+            if (rw > 10) {
+                if (elapsed < 60)
+                    snprintf(pbuf, sizeof(pbuf), "%llds ago", (long long)elapsed);
+                else
+                    snprintf(pbuf, sizeof(pbuf), "%lldm ago", (long long)(elapsed / 60));
+                mvaddnstr(ry, c2 + 10, pbuf, rw - 10);
             }
             attroff(A_DIM);
-            
-            // SNR for RX
-            if (!pkt.is_tx && pkt.snr > 0) {
+
+            if (!pkt.is_tx && pkt.snr > 0 && rw > 20) {
                 attron(COLOR_PAIR(4) | A_BOLD);
-                mvprintw(ry, c2 + 20, "%.0fdB", pkt.snr);
+                snprintf(pbuf, sizeof(pbuf), "%.0fdB", pkt.snr);
+                mvaddnstr(ry, c2 + 20, pbuf, rw - 20);
                 attroff(COLOR_PAIR(4) | A_BOLD);
             }
-            
-            ry++;
         }
         
         if (packets.empty()) {
