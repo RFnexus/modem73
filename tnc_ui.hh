@@ -328,6 +328,13 @@ struct TNCUIState {
         bool com_invert_rts;
     };
     static constexpr int MAX_PRESETS = 10;
+    static constexpr int MAX_FREQ_PRESETS = 12;
+
+    struct FreqPreset {
+        long long hz;
+        std::string label;
+    };
+    std::vector<FreqPreset> freq_presets;
     std::vector<Preset> presets;
     int selected_preset = -1;
     int loaded_preset_index = -1;  
@@ -761,6 +768,8 @@ struct TNCUIState {
         fprintf(f, "robust_mode=%d\n", robust_mode_index);
         fprintf(f, "tx_drive=%.2f\n", tx_drive.load());
         fprintf(f, "alt_mode_mask=%d\n", alt_mode_mask);
+        for (const auto& fp : freq_presets)
+            fprintf(f, "freq_preset=%lld|%s\n", fp.hz, fp.label.c_str());
         fprintf(f, "csma_enabled=%d\n", csma_enabled ? 1 : 0);
         fprintf(f, "csma_sync_only=%d\n", csma_sync_only ? 1 : 0);
         fprintf(f, "csma_fast_floor=%d\n", csma_fast_floor ? 1 : 0);
@@ -819,13 +828,23 @@ struct TNCUIState {
         FILE* f = fopen(config_file.c_str(), "r");
         if (!f) return false;
         
+        freq_presets.clear();
+
         char line[512];
         while (fgets(line, sizeof(line), f)) {
             if (line[0] == '#') continue;
-            
+
             char key[64], value[384];
             if (sscanf(line, "%63[^=]=%383[^\n]", key, value) == 2) {
-                if (strcmp(key, "callsign") == 0) callsign = value;
+                if (strcmp(key, "freq_preset") == 0) {
+                    const char* bar = strchr(value, '|');
+                    if (bar && (int)freq_presets.size() < MAX_FREQ_PRESETS) {
+                        long long hz = atoll(std::string(value, bar - value).c_str());
+                        if (hz > 0 && bar[1])
+                            freq_presets.push_back({hz, std::string(bar + 1)});
+                    }
+                }
+                else if (strcmp(key, "callsign") == 0) callsign = value;
                 else if (strcmp(key, "modem_type") == 0) {
                     int v = atoi(value);
                     if (v >= 0 && v <= 2) modem_type_index = v;
@@ -1438,6 +1457,7 @@ private:
     enum RigField {
         RIG_FIELD_FREQ = 0,
         RIG_FIELD_STEP,
+        RIG_FIELD_PRESET,
         RIG_FIELD_MODE,
         RIG_FIELD_POWER,
         RIG_FIELD_DRIVE,
@@ -1734,14 +1754,22 @@ private:
 
                     save_preset_dialog();
 
+                } else if (current_tab_ == 5 && rig_field_ == RIG_FIELD_PRESET) {
+
+                    save_freq_preset_dialog();
+
                 }
                 break;
-            
-            case KEY_DC:  
+
+            case KEY_DC:
             case 'x':
                 if (current_tab_ == 1 && current_field_ == FIELD_PRESET) {
 
                     delete_selected_preset();
+
+                } else if (current_tab_ == 5 && rig_field_ == RIG_FIELD_PRESET) {
+
+                    delete_selected_freq_preset();
 
                 }
                 break;
@@ -5980,6 +6008,12 @@ private:
                 set_rig_freq(nf);
                 break;
             }
+            case RIG_FIELD_PRESET: {
+                int n = (int)state_.freq_presets.size();
+                if (n > 0)
+                    rig_preset_index_ = (rig_preset_index_ + delta % n + n) % n;
+                break;
+            }
             case RIG_FIELD_STEP:
                 rig_step_index_ = (rig_step_index_ + delta + RIG_STEP_COUNT) % RIG_STEP_COUNT;
                 break;
@@ -6046,6 +6080,14 @@ private:
     void rig_enter_action() {
         if (rig_field_ == RIG_FIELD_FREQ) {
             edit_rig_freq();
+        } else if (rig_field_ == RIG_FIELD_PRESET) {
+            if (state_.freq_presets.empty()) {
+                state_.add_log("Rig: no frequency presets, press s to save one");
+            } else if (rig_preset_index_ < (int)state_.freq_presets.size()) {
+                const auto& fp = state_.freq_presets[rig_preset_index_];
+                set_rig_freq(fp.hz);
+                state_.add_log("Rig: " + fp.label + " " + format_freq(fp.hz));
+            }
         } else if (rig_field_ == RIG_FIELD_DRIVE) {
             if (!state_.on_alc_tune) {
                 state_.add_log("ALC tune: unavailable");
@@ -6079,6 +6121,65 @@ private:
             }
             state_.rig_refresh_requested = true;
         }
+    }
+
+    void save_freq_preset_dialog() {
+        if ((int)state_.freq_presets.size() >= TNCUIState::MAX_FREQ_PRESETS) {
+            state_.add_log("Rig: maximum frequency presets reached");
+            return;
+        }
+        long long hz = state_.rig_freq_hz.load();
+        if (hz <= 0) {
+            state_.add_log("Rig: no frequency read from rig yet");
+            return;
+        }
+
+        int rows, cols;
+        getmaxyx(stdscr, rows, cols);
+        int dialog_w = 44, dialog_h = 5;
+        int dx = (cols - dialog_w) / 2, dy = (rows - dialog_h) / 2;
+
+        attron(COLOR_PAIR(4));
+        for (int i = dy; i < dy + dialog_h && i < rows; i++)
+            mvhline(i, dx, ' ', dialog_w);
+        draw_box(dy, dx, dialog_h, dialog_w);
+        attron(A_BOLD);
+        mvaddstr(dy, dx + 3, " SAVE PRESET ");
+        attroff(A_BOLD);
+        attroff(COLOR_PAIR(4));
+        attron(A_DIM);
+        mvprintw(dy + 1, dx + 2, "%s  label:", format_freq(hz).c_str());
+        attroff(A_DIM);
+
+        char buf[21] = {0};
+        if (!prompt_input(dy + 2, dx + 2, buf, 20))
+            return;
+        std::string label = buf;
+        while (!label.empty() && label.back() == ' ') label.pop_back();
+        if (label.empty()) {
+            state_.add_log("Rig: preset not saved, label was empty");
+            return;
+        }
+
+        state_.freq_presets.push_back({hz, label});
+        rig_preset_index_ = (int)state_.freq_presets.size() - 1;
+        state_.save_settings();
+        state_.add_log("Rig: preset saved, " + label + " " + format_freq(hz));
+    }
+
+    void delete_selected_freq_preset() {
+        if (state_.freq_presets.empty()) {
+            state_.add_log("Rig: no frequency presets to delete");
+            return;
+        }
+        if (rig_preset_index_ >= (int)state_.freq_presets.size())
+            rig_preset_index_ = (int)state_.freq_presets.size() - 1;
+        std::string label = state_.freq_presets[rig_preset_index_].label;
+        state_.freq_presets.erase(state_.freq_presets.begin() + rig_preset_index_);
+        if (rig_preset_index_ >= (int)state_.freq_presets.size())
+            rig_preset_index_ = std::max(0, (int)state_.freq_presets.size() - 1);
+        state_.save_settings();
+        state_.add_log("Rig: preset deleted, " + label);
     }
 
     void edit_rig_freq() {
@@ -6184,6 +6285,23 @@ private:
                                RIG_STEP_LABELS[rig_step_index_]);
         y++;
 
+        {
+            char pbuf[80];
+            if (state_.freq_presets.empty()) {
+                snprintf(pbuf, sizeof(pbuf), "(none)  s=save current");
+            } else {
+                if (rig_preset_index_ >= (int)state_.freq_presets.size())
+                    rig_preset_index_ = 0;
+                const auto& fp = state_.freq_presets[rig_preset_index_];
+                snprintf(pbuf, sizeof(pbuf), "%s  %s  (%d/%d)",
+                         format_freq(fp.hz).c_str(), fp.label.c_str(),
+                         rig_preset_index_ + 1, (int)state_.freq_presets.size());
+            }
+            draw_selector_field_ex(y, c1, c2, "Preset",
+                                   rig_field_ == RIG_FIELD_PRESET, pbuf);
+            y++;
+        }
+
         std::string mode = state_.get_rig_mode();
         draw_selector_field_ex(y, c1, c2, "Mode", rig_field_ == RIG_FIELD_MODE,
                                mode.empty() ? "---" : mode);
@@ -6246,7 +6364,7 @@ private:
         }
 
         attron(A_DIM);
-        mvaddstr(y, c1, "Freq: Enter=type, </> step");
+        mvaddstr(y, c1, "Freq: Enter=type, </> step   Preset: Enter=go, s=save, x=del");
         attroff(A_DIM);
 
         int ry = top;
@@ -6702,6 +6820,7 @@ private:
     int occ_hist_pos_ = 0;
     int64_t occ_hist_ms_ = 0;
     int rig_step_index_ = 2;
+    int rig_preset_index_ = 0;
     int saved_stderr_ = -1;
     int frame_counter_ = 0;  
     bool show_help_ = false;  
