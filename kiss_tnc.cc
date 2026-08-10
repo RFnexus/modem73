@@ -794,7 +794,12 @@ private:
                     bool was_busy = false, was_deaf = false, quiet_logged = false;
                     int busy_episodes = 0;
                     int cur_rank = -1, cur_rank_n = 0;
+                    bool beacon_yield = false;
                     while (g_running) {
+                        if (pkt.beacon && !tx_queue_.empty()) {
+                            beacon_yield = true;
+                            break;
+                        }
                         bool alive = audio_->capture_alive();
                         float level_db = audio_->instant_level_db(carrier_sense_ms);
                         bool allowed = is_tx_allowed();
@@ -866,6 +871,14 @@ private:
                         }
 #endif
                         std::this_thread::sleep_for(std::chrono::milliseconds(gcfg.poll_ms));
+                    }
+                    if (beacon_yield) {
+#ifdef WITH_UI
+                        if (g_ui_state) g_ui_state->csma_phase = 0;
+#endif
+                        beacon_anchor_ms = steady_now_ms();
+                        beacon_due_ms = beacon_due();
+                        continue;
                     }
                     if (csma_sync_only) {
                         if (busy_episodes >= 2) {
