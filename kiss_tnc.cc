@@ -723,15 +723,19 @@ private:
                         if (gcfg.rank >= gcfg.rank_n)
                             yield_attempt_++;
                         if (gcfg.rank < 0) {
-                            boot_rank = (int)(id_mix(station_id_.load(),
-                                                     boot_attempt) % 4);
-                            boot_attempt++;
-                            int known = known_others() + 1;
-                            gcfg.rank = std::max(4, known) + boot_rank;
-                            gcfg.rank_n = gcfg.rank + 1;
-                            if (g_debug && forgotten)
-                                ui_log("CSMA: silent too long, entering after "
-                                       "known turns");
+                            int known = known_others();
+                            if (known > 0) {
+                                boot_rank = (int)(id_mix(station_id_.load(),
+                                                         boot_attempt) % 4);
+                                boot_attempt++;
+                                gcfg.rank = std::max(4, known + 1) + boot_rank;
+                                gcfg.rank_n = gcfg.rank + 1;
+                                if (g_debug && forgotten)
+                                    ui_log("CSMA: silent too long, entering "
+                                           "after known turns");
+                            } else {
+                                gcfg.rank_n = 0;
+                            }
                         } else {
                             boot_attempt = 0;
                         }
