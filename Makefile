@@ -4,8 +4,8 @@ CXXFLAGS = -std=c++17 -O3 -march=native -Wall -Wextra
 LDFLAGS = -lpthread  -ltinfo -lncurses -ldl -lm
 
 GIT_EXACT := $(shell git describe --tags --exact-match 2>/dev/null | sed 's/^v//')
-GIT_BASE := $(shell git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//')
-VERSION ?= $(if $(GIT_EXACT),$(GIT_EXACT),$(if $(GIT_BASE),$(GIT_BASE)-dev,dev))
+BASE_VERSION := 2.3.0
+VERSION ?= $(if $(GIT_EXACT),$(GIT_EXACT),$(BASE_VERSION))
 CXXFLAGS += -DMODEM73_VERSION=\"$(VERSION)\"
 
 # dependencies

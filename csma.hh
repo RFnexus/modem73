@@ -36,12 +36,12 @@ public:
         int window = std::max(2, cfg_.cw) * slot;
         if (cfg_.sync_only) {
             int det = std::max(1, cfg_.dcd_detect_ms);
-            if (cfg_.contenders >= 0 && cfg_.contenders <= 1)
-                window = std::max(4 * det, 4 * slot);
-            else if (cfg_.contenders == 2)
-                window = std::max(8 * det, 4 * slot);
-            else
+            if (cfg_.contenders >= 0) {
+                int slots = std::min(16, std::max(6, 3 * (cfg_.contenders + 1)));
+                window = std::max(slots * (det + 150), 4 * slot);
+            } else {
                 window = std::max(window * 2, 16 * det);
+            }
             if (cfg_.idle_credit_ms >= cfg_.cold_channel_ms)
                 window = std::max(window / 4, 4 * slot);
         } else if (cfg_.idle_credit_ms >= cfg_.cold_channel_ms) {
@@ -97,7 +97,7 @@ public:
             } else {
                 episodes_ = std::min(episodes_ + 1, 1);
                 int slot = std::max(1, cfg_.slot_ms);
-                int w = cfg_.contenders >= 0 && cfg_.contenders <= 1
+                int w = cfg_.contenders >= 0
                     ? window_
                     : (int)std::min<long long>((long long)window_ << episodes_, 60000);
                 int slots = std::max(2, w / slot);
