@@ -616,11 +616,12 @@ private:
         int csma_stage = 0;
         int csma_clean = 0;
         int boot_attempt = 0;
-        int64_t last_burst_end = -1000000;
+        int64_t last_burst_end = steady_now_ms() - PARTICIPATION_MS - 1;
         auto beacon_due = [&]() {
             return BEACON_INTERVAL_MS * (70 + (int64_t)(gen() % 61)) / 100;
         };
         int64_t last_id_air_ms = steady_now_ms() - BEACON_INTERVAL_MS / 2;
+        int64_t beacon_anchor_ms = last_id_air_ms;
         int64_t beacon_due_ms = beacon_due();
         int64_t tx_start_ms = steady_now_ms();
 
@@ -640,7 +641,7 @@ private:
                                      config_.csma_ranked;
                     }
                     if (!still_want || !tx_queue_.empty() || !is_tx_allowed()) {
-                        last_id_air_ms = steady_now_ms();
+                        beacon_anchor_ms = steady_now_ms();
                         beacon_due_ms = beacon_due();
                         continue;
                     }
@@ -900,6 +901,7 @@ private:
                             last_burst_end = steady_now_ms();
                         if (sent) {
                             last_id_air_ms = steady_now_ms();
+                            beacon_anchor_ms = last_id_air_ms;
                             beacon_due_ms = beacon_due();
                             if (csma_ranked)
                                 last_winner_id_.store(station_id_.load());
@@ -915,7 +917,7 @@ private:
                 }
             } else {
                 int64_t bnow = steady_now_ms();
-                if (bnow - last_id_air_ms >= beacon_due_ms) {
+                if (bnow - beacon_anchor_ms >= beacon_due_ms) {
                     bool want;
                     {
                         std::lock_guard<std::mutex> lock(config_mutex_);
@@ -933,7 +935,7 @@ private:
                         b.beacon = true;
                         tx_queue_.push(std::move(b));
                     } else {
-                        last_id_air_ms = bnow;
+                        beacon_anchor_ms = bnow;
                         beacon_due_ms = beacon_due();
                     }
                 }
