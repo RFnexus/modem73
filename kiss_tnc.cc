@@ -618,6 +618,11 @@ private:
         int boot_attempt = 0;
         bool last_tx_responder = false;
         int64_t last_burst_end = -1000000;
+        auto beacon_due = [&]() {
+            return BEACON_INTERVAL_MS * (70 + (int64_t)(gen() % 61)) / 100;
+        };
+        int64_t last_id_air_ms = steady_now_ms() - BEACON_INTERVAL_MS / 2;
+        int64_t beacon_due_ms = beacon_due();
 
         while (tx_running_ && g_running) {
             TxPacket pkt;
@@ -627,6 +632,8 @@ private:
                     g_ui_state->tx_queue_size = tx_queue_.size();
                 }
 #endif
+                if (pkt.beacon && (!tx_queue_.empty() || !is_tx_allowed()))
+                    continue;
                 // CSMA
                 bool csma_enabled, csma_sync_only, csma_fast_floor, csma_ranked;
                 bool this_tx_responder = false;
@@ -690,9 +697,19 @@ private:
                     if (csma_sync_only && csma_quiet_ms <= 0 &&
                         gcfg.contenders >= 0 && gcfg.contenders <= 1)
                         gcfg.quiet_ms = std::min(gcfg.quiet_ms, 1000);
+                    if (pkt.beacon) {
+                        gcfg.quiet_ms = RANKED_QUIET_MS;
+                        gcfg.contenders = 0;
+                        gcfg.slot_ms = 500;
+                        gcfg.extra_delay_ms = std::max(4, known_others() + 1) *
+                                              CsmaGate::RANKED_SLOT_MS;
+                    }
                     int boot_rank = -1;
-                    if (csma_ranked && csma_sync_only) {
+                    if (csma_ranked && csma_sync_only && !pkt.beacon) {
+                        gcfg.quiet_ms = RANKED_QUIET_MS;
                         gcfg.rank = ranked_slot(&gcfg.rank_n);
+                        if (gcfg.rank >= gcfg.rank_n)
+                            yield_attempt_++;
                         if (gcfg.rank < 0) {
                             uint32_t h = (uint32_t)station_id_.load() ^
                                          (uint32_t)(boot_attempt * 0x9E37u);
@@ -710,13 +727,20 @@ private:
                     }
                     if (g_debug && csma_sync_only) {
                         char dbg[128];
+                        char rankbuf[24];
+                        if (gcfg.rank < 0)
+                            snprintf(rankbuf, sizeof rankbuf, "none");
+                        else if (gcfg.rank >= gcfg.rank_n)
+                            snprintf(rankbuf, sizeof rankbuf, "yield/%d", gcfg.rank_n);
+                        else
+                            snprintf(rankbuf, sizeof rankbuf, "%d/%d",
+                                     gcfg.rank, gcfg.rank_n);
                         snprintf(dbg, sizeof dbg,
                                  "CSMA: pop %d stage %d occupancy %d%% "
-                                 "quiet %d ms rank %d/%d winner %04X",
+                                 "quiet %d ms rank %s winner %04X",
                                  raw_pop, csma_stage,
                                  occupancy_pct_.load(), gcfg.quiet_ms,
-                                 gcfg.rank, gcfg.rank_n,
-                                 last_winner_id_.load());
+                                 rankbuf, last_winner_id_.load());
                         ui_log(dbg);
                     }
                     gcfg.busy_limit_ms = std::max(30000, 8 * channel_air_ms());
@@ -732,7 +756,8 @@ private:
                         gcfg.responder_dither_ms = (int)(hash % (uint32_t)csma_dither);
                     }
                     int64_t rx_ms = last_rx_done_ms_.load();
-                    gcfg.responder = rx_ms > 0 && pkt.enqueue_ms >= rx_ms &&
+                    gcfg.responder = !pkt.beacon && rx_ms > 0 &&
+                                     pkt.enqueue_ms >= rx_ms &&
                                      pkt.enqueue_ms - rx_ms <= 5000 &&
                                      steady_now_ms() - rx_ms <= 8000;
                     if (gcfg.responder && csma_ranked && csma_sync_only &&
@@ -850,7 +875,7 @@ private:
 #endif
                 TxPacket cur = std::move(pkt);
                 bool first = true;
-                int remaining = csma_burst - 1;
+                int remaining = cur.beacon ? 0 : csma_burst - 1;
                 while (true) {
                     TxPacket next;
                     bool have_next = remaining > 0 && tx_queue_.pop(next);
@@ -859,11 +884,16 @@ private:
                         g_ui_state->tx_queue_size = tx_queue_.size();
                     }
 #endif
-                    bool sent = transmit(cur.data, cur.oper_mode, first, !have_next);
+                    bool sent = transmit(cur.data, cur.oper_mode, first, !have_next,
+                                         cur.beacon);
                     if (!have_next) {
-                        last_burst_end = steady_now_ms();
+                        if (!cur.beacon)
+                            last_burst_end = steady_now_ms();
                         if (sent) {
-                            last_tx_responder = this_tx_responder;
+                            last_id_air_ms = steady_now_ms();
+                            beacon_due_ms = beacon_due();
+                            if (!cur.beacon)
+                                last_tx_responder = this_tx_responder;
                             if (csma_ranked)
                                 last_winner_id_.store(station_id_.load());
                         }
@@ -877,11 +907,28 @@ private:
                     --remaining;
                 }
             } else {
+                int64_t bnow = steady_now_ms();
+                if (bnow - last_id_air_ms >= beacon_due_ms) {
+                    bool want;
+                    {
+                        std::lock_guard<std::mutex> lock(config_mutex_);
+                        want = config_.csma_enabled && config_.csma_sync_only &&
+                               config_.csma_ranked && config_.csma_beacon;
+                    }
+                    if (want) {
+                        TxPacket b;
+                        b.beacon = true;
+                        tx_queue_.push(std::move(b));
+                    } else {
+                        last_id_air_ms = bnow;
+                        beacon_due_ms = beacon_due();
+                    }
+                }
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
         }
     }
-    
+
     int frame_air_ms() {
         int ps = payload_size_.load();
         uint64_t key = ((uint64_t)config_.modem_type << 48) ^
@@ -935,12 +982,14 @@ private:
     }
 
     bool transmit(const std::vector<uint8_t>& data, int oper_mode_override = -1,
-                  bool first = true, bool last = true) {
+                  bool first = true, bool last = true, bool beacon = false) {
         while (alc_tune_active_.load() && g_running)
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         int tx_mode = (oper_mode_override >= 0) ? oper_mode_override : modem_config_.oper_mode;
 
-        if (oper_mode_override >= 0) {
+        if (beacon) {
+            ui_log("TX: beacon");
+        } else if (oper_mode_override >= 0) {
             ui_log("TX: " + std::to_string(data.size()) + " bytes (mode override)");
         } else {
             ui_log("TX: " + std::to_string(data.size()) + " bytes");
@@ -955,7 +1004,7 @@ private:
         }
 
 #ifdef WITH_UI
-        if (g_ui_state) {
+        if (g_ui_state && !beacon) {
             g_ui_state->transmitting = true;
             g_ui_state->tx_frame_count++;
             std::string mname = config_.modem_type == 2
@@ -974,7 +1023,9 @@ private:
 
         // Encode to audio
         std::vector<float> samples;
-        if (config_.modem_type == 1) {
+        if (beacon) {
+            // tone only, no data frame
+        } else if (config_.modem_type == 1) {
             samples = mfsk_encoder_->encode(
                 framed_data.data(), framed_data.size(),
                 modem_config_.center_freq,
@@ -1000,7 +1051,7 @@ private:
             );
         }
         
-        if (samples.empty()) {
+        if (samples.empty() && !beacon) {
             ui_log("TX: Encoding failed");
             if (!first && last && config_.ptt_type != PTTType::VOX) {
                 audio_->write_silence(config_.ptt_tail_ms * config_.sample_rate / 1000);
@@ -1101,7 +1152,10 @@ private:
 
                 // Leading silence (TXDelay)
                 int lead_frames = tx_lead_ms() * config_.sample_rate / 1000;
-                if (config_.tx_lead_tone && config_.tx_delay_ms >= 250) {
+                if (beacon)
+                    lead_frames = (ToneDCD::MIN_LEAD_MS + TONE_LEAD_GAP_MS) *
+                                  config_.sample_rate / 1000;
+                if (beacon || (config_.tx_lead_tone && config_.tx_delay_ms >= 250)) {
                     int gap_frames = TONE_LEAD_GAP_MS * config_.sample_rate / 1000;
                     auto lead = ToneDCD::signature_lead(modem_config_.center_freq,
                                                         lead_frames - gap_frames,
@@ -1797,6 +1851,12 @@ private:
     std::atomic<uint16_t> station_id_{0};
     std::atomic<uint16_t> last_winner_id_{0};
     std::mutex heard_mutex_;
+    static constexpr int64_t HEARD_EXPIRY_MS = 120000;
+    static constexpr int64_t UNATTRIB_DISTRUST_MS = 90000;
+    static constexpr int RANKED_QUIET_MS = 1000;
+    static constexpr int64_t BEACON_INTERVAL_MS = 45000;
+    static constexpr int YIELD_BUCKETS = 4;
+    int yield_attempt_ = 0;
     std::map<uint16_t, int64_t> heard_ids_;
     int64_t last_id_ms_ = -1000000;
     int64_t last_dcd_ms_ = -1000000;
@@ -1806,11 +1866,11 @@ private:
 
     int n_contenders() {
         int64_t now = steady_now_ms();
-        if (now - last_unattrib_ms_.load() <= 90000)
+        if (now - last_unattrib_ms_.load() <= UNATTRIB_DISTRUST_MS)
             return -1;
         std::lock_guard<std::mutex> hl(heard_mutex_);
         for (auto it = heard_ids_.begin(); it != heard_ids_.end();) {
-            if (now - it->second > 90000)
+            if (now - it->second > HEARD_EXPIRY_MS)
                 it = heard_ids_.erase(it);
             else
                 ++it;
@@ -1823,7 +1883,7 @@ private:
         std::lock_guard<std::mutex> hl(heard_mutex_);
         int c = 0;
         for (const auto& kv : heard_ids_)
-            if (now - kv.second <= 90000)
+            if (now - kv.second <= HEARD_EXPIRY_MS)
                 c++;
         return c;
     }
@@ -1832,7 +1892,7 @@ private:
         int64_t now = steady_now_ms();
         std::lock_guard<std::mutex> hl(heard_mutex_);
         for (auto it = heard_ids_.begin(); it != heard_ids_.end();) {
-            if (now - it->second > 90000)
+            if (now - it->second > HEARD_EXPIRY_MS)
                 it = heard_ids_.erase(it);
             else
                 ++it;
@@ -1853,10 +1913,20 @@ private:
         if (w == ids.end())
             return i;
         if (*w == self) {
-            *n_out = 2 * n - 1;
-            return n - 1 + i;
+            *n_out = n;
+            return n - 1 + (int)(id_mix(self, yield_attempt_) % YIELD_BUCKETS);
         }
+        yield_attempt_ = 0;
         return (i - (int)(w - ids.begin()) - 1 + n) % n;
+    }
+
+    static uint32_t id_mix(uint16_t id, int attempt) {
+        uint32_t h = (uint32_t)id ^ (uint32_t)(attempt * 0x9E37u);
+        h *= 0x9E3779B1u;
+        h ^= h >> 16;
+        h *= 0x85EBCA6Bu;
+        h ^= h >> 13;
+        return h;
     }
     float occupancy_ema_ = 0.0f;
     float occupancy_other_ema_ = 0.0f;
@@ -1975,6 +2045,7 @@ public:
             config_.csma_sync_only = new_config.csma_sync_only;
             config_.csma_fast_floor = new_config.csma_fast_floor;
             config_.csma_ranked = new_config.csma_ranked;
+            config_.csma_beacon = new_config.csma_beacon;
             config_.postamble = new_config.postamble;
             config_.carrier_threshold_db = new_config.carrier_threshold_db;
             config_.p_persistence = new_config.p_persistence;
@@ -2282,6 +2353,7 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
         else if (!strcmp(key, "csma_sync_only") && take(key)) config.csma_sync_only = atoi(value) != 0;
         else if (!strcmp(key, "csma_fast_floor") && take(key)) config.csma_fast_floor = atoi(value) != 0;
         else if (!strcmp(key, "csma_ranked") && take(key)) config.csma_ranked = atoi(value) != 0;
+        else if (!strcmp(key, "csma_beacon") && take(key)) config.csma_beacon = atoi(value) != 0;
         else if (!strcmp(key, "carrier_threshold_db") && take(key)) {
             float v = atof(value);
             if (std::isfinite(v) && v >= -80.0f && v <= 0.0f)
@@ -2750,6 +2822,7 @@ int main(int argc, char** argv) {
                 config.csma_sync_only = ui_state.csma_sync_only;
                 config.csma_fast_floor = ui_state.csma_fast_floor;
                 config.csma_ranked = ui_state.csma_ranked;
+                config.csma_beacon = ui_state.csma_beacon;
                 if (!cli_set.count("carrier_threshold_db"))
                     config.carrier_threshold_db = ui_state.carrier_threshold_db;
                 if (!cli_set.count("slot_time_ms"))
@@ -2868,6 +2941,8 @@ int main(int argc, char** argv) {
                 ui_state.csma_sync_only = config.csma_sync_only;
                 ui_state.csma_fast_floor = config.csma_fast_floor;
                 ui_state.csma_ranked = config.csma_ranked;
+        ui_state.csma_beacon = config.csma_beacon;
+                ui_state.csma_beacon = config.csma_beacon;
                 ui_state.carrier_threshold_db = config.carrier_threshold_db;
                 ui_state.slot_time_ms = config.slot_time_ms;
                 ui_state.csma_quiet_ms = config.csma_quiet_ms;
@@ -3158,6 +3233,7 @@ int main(int argc, char** argv) {
                 cJSON_AddBoolToObject(j, "csma_sync_only", cfg.csma_sync_only);
                 cJSON_AddBoolToObject(j, "csma_fast_floor", cfg.csma_fast_floor);
                 cJSON_AddBoolToObject(j, "csma_ranked", cfg.csma_ranked);
+                cJSON_AddBoolToObject(j, "csma_beacon", cfg.csma_beacon);
                 cJSON_AddNumberToObject(j, "carrier_threshold_db", cfg.carrier_threshold_db);
                 cJSON_AddNumberToObject(j, "p_persistence", cfg.p_persistence);
                 cJSON_AddNumberToObject(j, "slot_time_ms", cfg.slot_time_ms);
@@ -3217,6 +3293,8 @@ int main(int argc, char** argv) {
                     new_config.csma_fast_floor = cJSON_IsTrue(item);
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "csma_ranked")) && cJSON_IsBool(item))
                     new_config.csma_ranked = cJSON_IsTrue(item);
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "csma_beacon")) && cJSON_IsBool(item))
+                    new_config.csma_beacon = cJSON_IsTrue(item);
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "carrier_threshold_db")) && cJSON_IsNumber(item))
                     new_config.carrier_threshold_db = (float)item->valuedouble;
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "p_persistence")) && cJSON_IsNumber(item))
@@ -3325,6 +3403,7 @@ int main(int argc, char** argv) {
                 new_config.csma_sync_only = state.csma_sync_only;
                 new_config.csma_fast_floor = state.csma_fast_floor;
                 new_config.csma_ranked = state.csma_ranked;
+                new_config.csma_beacon = state.csma_beacon;
                 new_config.carrier_threshold_db = state.carrier_threshold_db;
                 new_config.p_persistence = state.p_persistence;
                 new_config.slot_time_ms = state.slot_time_ms;

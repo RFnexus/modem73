@@ -107,6 +107,7 @@ struct TNCConfig {
     bool csma_sync_only = false;
     bool csma_fast_floor = false;
     bool csma_ranked = false;
+    bool csma_beacon = true;
     int carrier_sense_ms = 100;
     int max_backoff_slots = 10;
     int csma_quiet_ms = 0;
@@ -426,6 +427,7 @@ struct TxPacket {
     std::vector<uint8_t> data;
     int oper_mode;  // -1 = use default mode
     int64_t enqueue_ms;
+    bool beacon = false;
     TxPacket() : oper_mode(-1), enqueue_ms(steady_now_ms()) {}
     TxPacket(std::vector<uint8_t> d, int mode = -1)
         : data(std::move(d)), oper_mode(mode), enqueue_ms(steady_now_ms()) {}

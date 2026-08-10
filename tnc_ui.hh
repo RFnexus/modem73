@@ -38,6 +38,7 @@
 #endif
 
 constexpr size_t MAX_LOG_ENTRIES = 500;
+constexpr int RANKED_QUIET_DISPLAY_MS = 1000;
 
 const std::vector<std::string> MODEM_TYPE_OPTIONS = {"OFDM", "MFSK", "ROBUST"};
 const std::vector<std::string> ROBUST_MODE_OPTIONS = {"RDM-1200", "RDM-800", "RDM-600", "RDM-300", "RDMN-300", "RDMN-150", "RDM-QB"};
@@ -200,6 +201,7 @@ struct TNCUIState {
     bool csma_sync_only = false;
     bool csma_fast_floor = false;
     bool csma_ranked = false;
+    bool csma_beacon = true;
     float carrier_threshold_db = -30.0f;
     int slot_time_ms = 500;
     int csma_quiet_ms = 0;
@@ -774,6 +776,7 @@ struct TNCUIState {
         fprintf(f, "csma_sync_only=%d\n", csma_sync_only ? 1 : 0);
         fprintf(f, "csma_fast_floor=%d\n", csma_fast_floor ? 1 : 0);
         fprintf(f, "csma_ranked=%d\n", csma_ranked ? 1 : 0);
+        fprintf(f, "csma_beacon=%d\n", csma_beacon ? 1 : 0);
         fprintf(f, "carrier_threshold_db=%.1f\n", carrier_threshold_db);
         fprintf(f, "slot_time_ms=%d\n", slot_time_ms);
         fprintf(f, "csma_quiet_ms=%d\n", csma_quiet_ms);
@@ -882,6 +885,7 @@ struct TNCUIState {
                 else if (strcmp(key, "csma_sync_only") == 0) csma_sync_only = atoi(value) != 0;
                 else if (strcmp(key, "csma_fast_floor") == 0) csma_fast_floor = atoi(value) != 0;
                 else if (strcmp(key, "csma_ranked") == 0) csma_ranked = atoi(value) != 0;
+                else if (strcmp(key, "csma_beacon") == 0) csma_beacon = atoi(value) != 0;
                 else if (strcmp(key, "carrier_threshold_db") == 0) carrier_threshold_db = atof(value);
                 else if (strcmp(key, "slot_time_ms") == 0) slot_time_ms = atoi(value);
                 else if (strcmp(key, "csma_quiet_ms") == 0) csma_quiet_ms = atoi(value);
@@ -1419,6 +1423,7 @@ private:
         FIELD_SYNC_ONLY,
         FIELD_SYNC_INFO,
         FIELD_RANKED,
+        FIELD_BEACON,
         FIELD_RANKED_INFO,
         FIELD_CSMA_BAND,
         FIELD_CSMA_PRESET,
@@ -2135,7 +2140,7 @@ private:
                 return true;
         } else {
             if (field == FIELD_FAST_FLOOR || field == FIELD_RANKED ||
-                field == FIELD_RANKED_INFO)
+                field == FIELD_BEACON || field == FIELD_RANKED_INFO)
                 return true;
         }
         return false;
@@ -2185,6 +2190,10 @@ private:
         if (state_.csma_sync_only) {
             if (field == FIELD_RANKED) return row;
             row++;
+            if (state_.csma_ranked) {
+                if (field == FIELD_BEACON) return row;
+                row++;
+            }
             if (field == FIELD_RANKED_INFO) return row;
             row++;
         }
@@ -2386,6 +2395,9 @@ private:
                 break;
             case FIELD_FAST_FLOOR:
                 state_.csma_fast_floor = !state_.csma_fast_floor;
+                break;
+            case FIELD_BEACON:
+                state_.csma_beacon = !state_.csma_beacon;
                 break;
             case FIELD_RANKED:
                 state_.csma_ranked = !state_.csma_ranked;
@@ -3461,7 +3473,10 @@ private:
         y++;
 
         mvaddstr(y, c1, "Quiet");
-        if (state_.csma_quiet_ms > 0) {
+        if (state_.csma_ranked && state_.csma_sync_only &&
+            state_.csma_rank.load() >= 0) {
+            mvprintw(y, c2, "%d ms (ranked)", RANKED_QUIET_DISPLAY_MS);
+        } else if (state_.csma_quiet_ms > 0) {
             mvprintw(y, c2, "%d ms", state_.csma_quiet_ms);
         } else {
             int q = (int)(state_.airtime_seconds * 1000.0f) / 4;
@@ -3512,9 +3527,11 @@ private:
                 attron(COLOR_PAIR(4));
                 {
                     int rk = state_.csma_rank.load();
-                    if (rk >= 0)
-                        printw("turn %d/%d in %d ms", rk + 1,
-                               state_.csma_rank_n.load(),
+                    int rn = state_.csma_rank_n.load();
+                    if (rk >= rn && rk >= 0)
+                        printw("yielding %d ms", state_.csma_wait_ms.load());
+                    else if (rk >= 0)
+                        printw("turn %d/%d in %d ms", rk + 1, rn,
                                state_.csma_wait_ms.load());
                     else
                         printw("contending %d ms", state_.csma_wait_ms.load());
@@ -4112,6 +4129,18 @@ private:
             if (dy >= 0) draw_toggle_field(dy, c1, c2, "Ranked", FIELD_RANKED,
                                            state_.csma_ranked);
             row++;
+
+            if (state_.csma_ranked) {
+                dy = visible_y(row);
+                if (dy >= 0) {
+                    draw_toggle_field(dy, c1 + 2, c2, "Beacon", FIELD_BEACON,
+                                      state_.csma_beacon);
+                    attron(A_DIM);
+                    mvaddstr(dy, c2 + 8, "ID tone every 45s when idle");
+                    attroff(A_DIM);
+                }
+                row++;
+            }
 
             dy = visible_y(row);
             if (dy >= 0) {

@@ -22,12 +22,14 @@ struct CsmaConfig {
     int contenders = -1;
     int rank = -1;
     int rank_n = 0;
+    int extra_delay_ms = 0;
 };
 
 class CsmaGate {
 public:
     enum class Verdict { WAIT, TRANSMIT };
     enum class Reason { NONE, CLEAR, RESPONDER, BUSY_OVERRIDE, NO_AUDIO };
+    static constexpr int RANKED_SLOT_MS = 1500;
 
     CsmaGate(const CsmaConfig& cfg, uint32_t seed) : cfg_(cfg), gen_(seed) {
         int slot = std::max(1, cfg_.slot_ms);
@@ -47,8 +49,7 @@ public:
         }
         window_ = window;
         if (cfg_.sync_only && !cfg_.responder && cfg_.rank >= 0) {
-            int det = std::max(1, cfg_.dcd_detect_ms);
-            rank_slot_ = std::max(slot, det + 150);
+            rank_slot_ = RANKED_SLOT_MS;
             window_ = std::max(1, cfg_.rank_n) * rank_slot_;
             quiet_needed_ = cfg_.quiet_ms;
             contention_ms_ = cfg_.rank * rank_slot_;
@@ -60,7 +61,7 @@ public:
         } else {
             int slots = std::max(2, window / slot);
             quiet_needed_ = cfg_.quiet_ms;
-            contention_ms_ = slot *
+            contention_ms_ = cfg_.extra_delay_ms + slot *
                 std::uniform_int_distribution<int>(0, slots - 1)(gen_) +
                 std::uniform_int_distribution<int>(0, slot - 1)(gen_);
         }
@@ -100,7 +101,7 @@ public:
                     ? window_
                     : (int)std::min<long long>((long long)window_ << episodes_, 60000);
                 int slots = std::max(2, w / slot);
-                contention_ms_ = slot *
+                contention_ms_ = cfg_.extra_delay_ms + slot *
                     std::uniform_int_distribution<int>(0, slots - 1)(gen_) +
                     std::uniform_int_distribution<int>(0, slot - 1)(gen_);
             }
@@ -126,11 +127,7 @@ public:
             rank_slot_ = 0;
             return;
         }
-        if (rank_slot_ == 0) {
-            int slot = std::max(1, cfg_.slot_ms);
-            int det = std::max(1, cfg_.dcd_detect_ms);
-            rank_slot_ = std::max(slot, det + 150);
-        }
+        rank_slot_ = RANKED_SLOT_MS;
         window_ = std::max(1, cfg_.rank_n) * rank_slot_;
     }
 
