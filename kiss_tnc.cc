@@ -1003,7 +1003,8 @@ private:
     }
 
     int tx_lead_ms() const {
-        if (config_.tx_lead_tone && config_.tx_delay_ms >= 250)
+        if (config_.csma_enabled && config_.tx_lead_tone &&
+            config_.tx_delay_ms >= 250)
             return std::max(config_.tx_delay_ms,
                             ToneDCD::MIN_LEAD_MS + TONE_LEAD_GAP_MS);
         return config_.tx_delay_ms;
@@ -1181,9 +1182,11 @@ private:
                 // Leading silence (TXDelay)
                 int lead_frames = tx_lead_ms() * config_.sample_rate / 1000;
                 if (beacon)
-                    lead_frames = (ToneDCD::MIN_LEAD_MS + TONE_LEAD_GAP_MS) *
+                    lead_frames = std::max(tx_lead_ms(),
+                                           ToneDCD::MIN_LEAD_MS + TONE_LEAD_GAP_MS) *
                                   config_.sample_rate / 1000;
-                if (beacon || (config_.tx_lead_tone && config_.tx_delay_ms >= 250)) {
+                if (beacon || (config_.csma_enabled && config_.tx_lead_tone &&
+                               config_.tx_delay_ms >= 250)) {
                     int gap_frames = TONE_LEAD_GAP_MS * config_.sample_rate / 1000;
                     auto lead = ToneDCD::signature_lead(modem_config_.center_freq,
                                                         lead_frames - gap_frames,
@@ -2409,6 +2412,10 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
             int v = atoi(value);
             if (v >= 300 && v <= 3000) config.vox_tone_freq = v;
         }
+        else if (!strcmp(key, "tx_delay_ms") && take(key)) {
+            int v = atoi(value);
+            if (v >= 250 && v <= 2500) config.tx_delay_ms = v;
+        }
         else if (!strcmp(key, "vox_lead_ms") && take(key)) {
             int v = atoi(value);
             if (v >= 50 && v <= 2000) config.vox_lead_ms = v;
@@ -2914,6 +2921,8 @@ int main(int argc, char** argv) {
                     config.vox_tone_freq = ui_state.vox_tone_freq;
                 if (!cli_set.count("vox_lead_ms"))
                     config.vox_lead_ms = ui_state.vox_lead_ms;
+                if (!cli_set.count("tx_delay_ms"))
+                    config.tx_delay_ms = ui_state.tx_delay_ms;
                 if (!cli_set.count("vox_tail_ms"))
                     config.vox_tail_ms = ui_state.vox_tail_ms;
 
@@ -3000,6 +3009,7 @@ int main(int argc, char** argv) {
                 ui_state.vox_tone_freq = config.vox_tone_freq;
                 ui_state.vox_lead_ms = config.vox_lead_ms;
                 ui_state.vox_tail_ms = config.vox_tail_ms;
+                ui_state.tx_delay_ms = config.tx_delay_ms;
                 // COM PTT settings
                 ui_state.com_port = config.com_port;
                 ui_state.com_ptt_line = config.com_ptt_line;
@@ -3096,6 +3106,7 @@ int main(int argc, char** argv) {
         ui_state.vox_tone_freq = config.vox_tone_freq;
         ui_state.vox_lead_ms = config.vox_lead_ms;
         ui_state.vox_tail_ms = config.vox_tail_ms;
+        ui_state.tx_delay_ms = config.tx_delay_ms;
         
 
 
@@ -3455,6 +3466,7 @@ int main(int argc, char** argv) {
                 new_config.vox_tone_freq = state.vox_tone_freq;
                 new_config.vox_lead_ms = state.vox_lead_ms;
                 new_config.vox_tail_ms = state.vox_tail_ms;
+                new_config.tx_delay_ms = state.tx_delay_ms;
                 // COM PTT settings
                 new_config.com_port = state.com_port;
                 new_config.com_ptt_line = state.com_ptt_line;

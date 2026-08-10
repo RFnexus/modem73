@@ -292,6 +292,7 @@ struct TNCUIState {
     int random_data_size = 0;
     bool fragmentation_enabled = false;
     bool tx_blanking_enabled = false;
+    int tx_delay_ms = 500;
     
     // stats
     std::atomic<float> total_tx_time{0.0f};  
@@ -797,6 +798,7 @@ struct TNCUIState {
         fprintf(f, "vox_tone_freq=%d\n", vox_tone_freq);
         fprintf(f, "vox_lead_ms=%d\n", vox_lead_ms);
         fprintf(f, "vox_tail_ms=%d\n", vox_tail_ms);
+        fprintf(f, "tx_delay_ms=%d\n", tx_delay_ms);
         fprintf(f, "# COM PTT\n");
         fprintf(f, "com_port=%s\n", com_port.c_str());
         fprintf(f, "com_ptt_line=%d\n", com_ptt_line);
@@ -911,6 +913,10 @@ struct TNCUIState {
                 else if (strcmp(key, "vox_tone_freq") == 0) {
                     int v = atoi(value);
                     if (v >= 300 && v <= 3000) vox_tone_freq = v;
+                }
+                else if (strcmp(key, "tx_delay_ms") == 0) {
+                    int v = atoi(value);
+                    if (v >= 250 && v <= 2500) tx_delay_ms = v;
                 }
                 else if (strcmp(key, "vox_lead_ms") == 0) {
                     int v = atoi(value);
@@ -1449,6 +1455,7 @@ private:
         FIELD_CM108_GPIO,
         FIELD_CM108_DEVICE,
 #endif
+        FIELD_TX_DELAY,
         FIELD_NET_PORT,
         FIELD_CONTROL_PORT,
         FIELD_PRESET,
@@ -2401,6 +2408,8 @@ private:
             row++;
         }
 #endif
+        if (field == FIELD_TX_DELAY) return row;
+        row++;
         row++;
         row++;
         if (field == FIELD_NET_PORT) return row;
@@ -2558,6 +2567,10 @@ private:
             case FIELD_VOX_FREQ:
                 state_.vox_tone_freq += delta * 100;
                 state_.vox_tone_freq = std::max(300, std::min(2500, state_.vox_tone_freq));
+                break;
+            case FIELD_TX_DELAY:
+                state_.tx_delay_ms += delta * 50;
+                state_.tx_delay_ms = std::max(250, std::min(2500, state_.tx_delay_ms));
                 break;
             case FIELD_VOX_LEAD:
                 state_.vox_lead_ms += delta * 50;
@@ -4538,6 +4551,13 @@ private:
             row++;
         }
 #endif
+        dy = visible_y(row);
+        if (dy >= 0) {
+            char txd_buf[24];
+            snprintf(txd_buf, sizeof(txd_buf), "%d ms", state_.tx_delay_ms);
+            draw_selector_field(dy, c1, c2, "TX Delay", FIELD_TX_DELAY, txd_buf);
+        }
+        row++;
         row++;
         
         // Network section
