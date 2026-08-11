@@ -620,10 +620,13 @@ private:
         auto beacon_due = [&]() {
             return BEACON_INTERVAL_MS * (70 + (int64_t)(gen() % 61)) / 100;
         };
-        int64_t last_id_air_ms = steady_now_ms() - BEACON_INTERVAL_MS / 2;
-        int64_t beacon_anchor_ms = last_id_air_ms;
+
+        int64_t last_id_air_ms = steady_now_ms() - HEARD_EXPIRY_MS - 1;
+        int64_t beacon_anchor_ms = steady_now_ms() - BEACON_INTERVAL_MS / 2;
         int64_t beacon_due_ms = beacon_due();
         int64_t tx_start_ms = steady_now_ms();
+
+        
 
         while (tx_running_ && g_running) {
             TxPacket pkt;
@@ -712,8 +715,10 @@ private:
                         gcfg.quiet_ms = RANKED_QUIET_MS;
                         gcfg.contenders = 0;
                         gcfg.slot_ms = 500;
-                        gcfg.extra_delay_ms = std::max(4, known_others() + 1) *
-                                              CsmaGate::RANKED_SLOT_MS;
+                        gcfg.dcd_detect_ms = 550;
+                        gcfg.extra_delay_ms =
+                            std::min(7, std::max(4, known_others() + 1)) *
+                            CsmaGate::RANKED_SLOT_MS;
                     }
                     int boot_rank = -1;
                     if (csma_ranked && csma_sync_only && !pkt.beacon) {
@@ -1882,7 +1887,7 @@ private:
     std::atomic<uint16_t> station_id_{0};
     std::atomic<uint16_t> last_winner_id_{0};
     std::mutex heard_mutex_;
-    static constexpr int64_t HEARD_EXPIRY_MS = 120000;
+    static constexpr int64_t HEARD_EXPIRY_MS = 150000;
     static constexpr int64_t UNATTRIB_DISTRUST_MS = 90000;
     static constexpr int RANKED_QUIET_MS = 1000;
     static constexpr int64_t BEACON_INTERVAL_MS = 45000;

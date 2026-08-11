@@ -88,7 +88,6 @@ sudo apt install git build-essential libncurses-dev g++
 
 
 ##### CM108 USB PTT Support
-
 CM108-based USB audio interfaces have GPIO pins that can be used for PTT control. To enable CM108 support, install libhidapi-dev before building. The Makefile will auto-detect it and enable the feature.
 ```
 # Debian/Ubuntu/Pi - install before building 
@@ -193,7 +192,21 @@ control_port = 8073
 ```
 
 
+## Platform Specific Notes
 
+### Pi Zero 2
+
+If you are building from source on a memory constrained device like the Pi Zero 2, you will need to increase swap space. On the Pi Zero 2, and similar this can be done with:
+
+ ```bash
+  sudo fallocate -l 2G /swapfile
+  sudo chmod 600 /swapfile
+  sudo mkswap /swapfile
+  sudo swapon /swapfile
+  free -h                    # confirm the 2G appeared
+ ```
+
+The Pi Zero 2 with its SoC can only support 1 decoder at a time. If you are tight on CPU, turn off the decoders you aren't using under CONFIG. 
 
 ## Updating
 

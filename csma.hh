@@ -92,6 +92,8 @@ public:
             return Verdict::WAIT;
         }
         if (redraw_pending_ && cfg_.sync_only && !cfg_.responder) {
+            
+
             if (rank_slot_ > 0) {
                 contention_ms_ = cfg_.rank * rank_slot_;
             } else {
