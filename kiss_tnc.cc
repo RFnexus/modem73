@@ -617,12 +617,16 @@ private:
         int csma_clean = 0;
         int boot_attempt = 0;
         int64_t last_burst_end = steady_now_ms() - PARTICIPATION_MS - 1;
+        auto beacon_interval_ms = [&]() {
+            std::lock_guard<std::mutex> lock(config_mutex_);
+            return (int64_t)config_.beacon_interval_s * 1000;
+        };
         auto beacon_due = [&]() {
-            return BEACON_INTERVAL_MS * (70 + (int64_t)(gen() % 61)) / 100;
+            return beacon_interval_ms() * (70 + (int64_t)(gen() % 61)) / 100;
         };
 
         int64_t last_id_air_ms = steady_now_ms() - HEARD_EXPIRY_MS - 1;
-        int64_t beacon_anchor_ms = steady_now_ms() - BEACON_INTERVAL_MS / 2;
+        int64_t beacon_anchor_ms = steady_now_ms() - beacon_interval_ms() / 2;
         int64_t beacon_due_ms = beacon_due();
         int64_t tx_start_ms = steady_now_ms();
 
@@ -1887,10 +1891,9 @@ private:
     std::atomic<uint16_t> station_id_{0};
     std::atomic<uint16_t> last_winner_id_{0};
     std::mutex heard_mutex_;
-    static constexpr int64_t HEARD_EXPIRY_MS = 150000;
+    static constexpr int64_t HEARD_EXPIRY_MS = 300000;
     static constexpr int64_t UNATTRIB_DISTRUST_MS = 90000;
     static constexpr int RANKED_QUIET_MS = 1000;
-    static constexpr int64_t BEACON_INTERVAL_MS = 45000;
     static constexpr int YIELD_BUCKETS = 4;
     static constexpr int64_t PARTICIPATION_MS = 1200000;
     int yield_attempt_ = 0;
@@ -2421,6 +2424,10 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
             int v = atoi(value);
             if (v >= 250 && v <= 2500) config.tx_delay_ms = v;
         }
+        else if (!strcmp(key, "beacon_interval_s") && take(key)) {
+            int v = atoi(value);
+            if (v >= 45 && v <= 90) config.beacon_interval_s = v;
+        }
         else if (!strcmp(key, "vox_lead_ms") && take(key)) {
             int v = atoi(value);
             if (v >= 50 && v <= 2000) config.vox_lead_ms = v;
@@ -2928,6 +2935,8 @@ int main(int argc, char** argv) {
                     config.vox_lead_ms = ui_state.vox_lead_ms;
                 if (!cli_set.count("tx_delay_ms"))
                     config.tx_delay_ms = ui_state.tx_delay_ms;
+                if (!cli_set.count("beacon_interval_s"))
+                    config.beacon_interval_s = ui_state.beacon_interval_s;
                 if (!cli_set.count("vox_tail_ms"))
                     config.vox_tail_ms = ui_state.vox_tail_ms;
 
@@ -3015,6 +3024,7 @@ int main(int argc, char** argv) {
                 ui_state.vox_lead_ms = config.vox_lead_ms;
                 ui_state.vox_tail_ms = config.vox_tail_ms;
                 ui_state.tx_delay_ms = config.tx_delay_ms;
+                ui_state.beacon_interval_s = config.beacon_interval_s;
                 // COM PTT settings
                 ui_state.com_port = config.com_port;
                 ui_state.com_ptt_line = config.com_ptt_line;
@@ -3112,6 +3122,7 @@ int main(int argc, char** argv) {
         ui_state.vox_lead_ms = config.vox_lead_ms;
         ui_state.vox_tail_ms = config.vox_tail_ms;
         ui_state.tx_delay_ms = config.tx_delay_ms;
+        ui_state.beacon_interval_s = config.beacon_interval_s;
         
 
 
@@ -3472,6 +3483,7 @@ int main(int argc, char** argv) {
                 new_config.vox_lead_ms = state.vox_lead_ms;
                 new_config.vox_tail_ms = state.vox_tail_ms;
                 new_config.tx_delay_ms = state.tx_delay_ms;
+                new_config.beacon_interval_s = state.beacon_interval_s;
                 // COM PTT settings
                 new_config.com_port = state.com_port;
                 new_config.com_ptt_line = state.com_ptt_line;

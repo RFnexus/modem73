@@ -202,6 +202,7 @@ struct TNCUIState {
     bool csma_sync_only = false;
     bool csma_fast_floor = true;
     bool csma_ranked = false;
+    int beacon_interval_s = 45;
     float carrier_threshold_db = -30.0f;
     int slot_time_ms = 500;
     int csma_quiet_ms = 0;
@@ -777,6 +778,7 @@ struct TNCUIState {
         fprintf(f, "csma_sync_only=%d\n", csma_sync_only ? 1 : 0);
         fprintf(f, "csma_fast_floor=%d\n", csma_fast_floor ? 1 : 0);
         fprintf(f, "csma_ranked=%d\n", csma_ranked ? 1 : 0);
+        fprintf(f, "beacon_interval_s=%d\n", beacon_interval_s);
         fprintf(f, "carrier_threshold_db=%.1f\n", carrier_threshold_db);
         fprintf(f, "slot_time_ms=%d\n", slot_time_ms);
         fprintf(f, "csma_quiet_ms=%d\n", csma_quiet_ms);
@@ -886,6 +888,10 @@ struct TNCUIState {
                 else if (strcmp(key, "csma_sync_only") == 0) csma_sync_only = atoi(value) != 0;
                 else if (strcmp(key, "csma_fast_floor") == 0) csma_fast_floor = atoi(value) != 0;
                 else if (strcmp(key, "csma_ranked") == 0) csma_ranked = atoi(value) != 0;
+                else if (strcmp(key, "beacon_interval_s") == 0) {
+                    int v = atoi(value);
+                    if (v >= 45 && v <= 90) beacon_interval_s = v;
+                }
                 else if (strcmp(key, "carrier_threshold_db") == 0) carrier_threshold_db = atof(value);
                 else if (strcmp(key, "slot_time_ms") == 0) slot_time_ms = atoi(value);
                 else if (strcmp(key, "csma_quiet_ms") == 0) csma_quiet_ms = atoi(value);
@@ -1436,6 +1442,7 @@ private:
         FIELD_RESP_DITHER,
         FIELD_CSMA_BURST,
         FIELD_FAST_FLOOR,
+        FIELD_BEACON_INT,
         FIELD_CSMA_INFO,
         FIELD_FRAGMENTATION,
         FIELD_TX_BLANKING,
@@ -2269,7 +2276,8 @@ private:
         if (!state_.csma_advanced_open) {
             if (field == FIELD_CSMA_QUIET || field == FIELD_CSMA_CW ||
                 field == FIELD_LEAD_TONE || field == FIELD_RESP_DITHER ||
-                field == FIELD_CSMA_BURST || field == FIELD_FAST_FLOOR)
+                field == FIELD_CSMA_BURST || field == FIELD_FAST_FLOOR ||
+                field == FIELD_BEACON_INT)
                 return true;
         }
         {
@@ -2277,6 +2285,8 @@ private:
             if (m != 0 && (field == FIELD_THRESHOLD || field == FIELD_CSMA_CW))
                 return true;
             if (m != 1 && field == FIELD_FAST_FLOOR)
+                return true;
+            if (m != 2 && field == FIELD_BEACON_INT)
                 return true;
             if (m == 2 && (field == FIELD_CSMA_QUIET ||
                            field == FIELD_LEAD_TONE ||
@@ -2359,6 +2369,10 @@ private:
             row++;
             if (m == 1) {
                 if (field == FIELD_FAST_FLOOR) return row;
+                row++;
+            }
+            if (m == 2) {
+                if (field == FIELD_BEACON_INT) return row;
                 row++;
             }
         }
@@ -2538,6 +2552,10 @@ private:
                 break;
             case FIELD_FAST_FLOOR:
                 state_.csma_fast_floor = !state_.csma_fast_floor;
+                break;
+            case FIELD_BEACON_INT:
+                state_.beacon_interval_s += delta * 15;
+                state_.beacon_interval_s = std::max(45, std::min(90, state_.beacon_interval_s));
                 break;
             case FIELD_FRAGMENTATION:
                 state_.fragmentation_enabled = !state_.fragmentation_enabled;
@@ -4359,6 +4377,15 @@ private:
                     attron(A_DIM);
                     mvaddstr(dy, c2 + 8, "only if all stations run 2.3>");
                     attroff(A_DIM);
+                }
+                row++;
+            }
+            if (m == 2) {
+                dy = visible_y(row);
+                if (dy >= 0) {
+                    char bi_buf[16];
+                    snprintf(bi_buf, sizeof(bi_buf), "%d s", state_.beacon_interval_s);
+                    draw_selector_field(dy, c1 + 2, c2, "Presence Ivl", FIELD_BEACON_INT, bi_buf);
                 }
                 row++;
             }
