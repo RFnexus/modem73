@@ -130,9 +130,23 @@ Every mode decodes at once, which costs CPU. On a Pi Zero 2 or anything else wit
 
 ### 5. CSMA
 
-Carrier sense multiple access means listening for stations already talking before you transmit. modem73 is designed for multiple users sharing a channel, so this is worth setting.
+Carrier-sense multiple access (CSMA) simply means listening before we transmit. This helps prevent collisions and lets each station take a turn transmitting. But CSMA is a tricky problem when using a shared resource with minimal bandwidth like the RF spectrum.
 
-Pick a preset by selecting your band and how busy the channel is. From there you can choose between an audio threshold and sync detection. **Enable "Sync only" when you are running modem73 over HF.**
+modem73 implements several CSMA strategies that can be configured in the config. They are Threshold, Sync, and Ranked.
+
+Threshold means simply listening for the level of audio coming in. This is useful for quiet FM links where we know our signal will always be louder than the noise floor.
+
+Sync waits and listens for a frame coming in. Instead of measuring how loud the audio is, it looks for the start of a real signal. This matters on HF, where the noise floor moves around all day. With Threshold on a noisy band you can end up waiting forever for a quiet that never comes, because the band itself is never quiet. Sync only waits for actual stations.
+
+Sync still picks a random wait before it transmits. That wait is called the contention window, and its size is worked out from how many stations we have heard recently. With two stations on frequency the window stays short. With six or more it opens up, because more stations need more room to avoid landing on the same moment. Picking at random is simple and it always works, but it is a gamble. Two stations can draw the same moment, and a lost frame is expensive.
+
+Ranked builds on Sync and takes the guessing out. Every transmission already starts with a short signature tone, and that tone carries a 16 bit station ID. Every station listening keeps a list of the IDs it has heard. Each one sorts that list the same way, so all of them work out the same order without sending anything extra. Your turn is a time slot, your position out of the stations on frequency. Whoever transmitted last moves to the back of the line, so nobody takes two turns while someone else is still waiting.
+
+Because the order is worked out instead of drawn at random, stations that can hear each other stop colliding. Two stations passing traffic back and forth settle into clean alternation, and the reply comes back at the start of the next slot rather than after a random wait. On a channel with several users this is where most of the speed comes from.
+
+Ranked has two requirements. Every station needs to be running it, with Lead Tone and the presence tone that goes out every 45 to 90 seconds while a station is idle, or the order will not form. Selecting Ranked turns both on.
+
+And every station needs to hear every other one. Ranked does not solve the hidden station problem. Good fits for Ranked are an HF NVIS net in one region, VHF simplex, or everyone on a shared repeater.
 
 ### 6. Fragmentation and TX blanking
 
@@ -140,5 +154,5 @@ Pick a preset by selecting your band and how busy the channel is. From there you
 
 **TX blanking** stops you from hearing your own packets.
 
-
+Turn Fragmentation ON when another external application like Winlink is sending out PACLEN frames that exceed the modems frame size or your incoming frame size is unknown. It is ideal to have fragmentation OFF, but enable it where neccessary. 
 

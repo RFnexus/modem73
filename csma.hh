@@ -118,6 +118,7 @@ public:
             contention_ms_ -= cfg_.poll_ms;
             return Verdict::WAIT;
         }
+        
         reason_ = cfg_.responder ? Reason::RESPONDER : Reason::CLEAR;
         return Verdict::TRANSMIT;
     }

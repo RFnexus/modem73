@@ -293,6 +293,7 @@ struct TNCUIState {
     int random_data_size = 0;
     bool fragmentation_enabled = false;
     bool tx_blanking_enabled = false;
+    int tx_blanking_auto = 0;
     int tx_delay_ms = 500;
     
     // stats
@@ -790,6 +791,7 @@ struct TNCUIState {
         fprintf(f, "csma_band=%d\n", csma_band);
         fprintf(f, "fragmentation_enabled=%d\n", fragmentation_enabled ? 1 : 0);
         fprintf(f, "tx_blanking_enabled=%d\n", tx_blanking_enabled ? 1 : 0);
+        fprintf(f, "tx_blanking_auto=%d\n", tx_blanking_auto);
         fprintf(f, "ofdm_rx_enabled=%d\n", ofdm_rx_enabled ? 1 : 0);
         fprintf(f, "robust_rx_enabled=%d\n", robust_rx_enabled ? 1 : 0);
         fprintf(f, "mfsk_rx_enabled=%d\n", mfsk_rx_enabled ? 1 : 0);
@@ -903,6 +905,7 @@ struct TNCUIState {
                 else if (strcmp(key, "csma_band") == 0) csma_band = atoi(value) != 0 ? 1 : 0;
                 else if (strcmp(key, "fragmentation_enabled") == 0) fragmentation_enabled = atoi(value) != 0;
                 else if (strcmp(key, "tx_blanking_enabled") == 0) tx_blanking_enabled = atoi(value) != 0;
+                else if (strcmp(key, "tx_blanking_auto") == 0) tx_blanking_auto = atoi(value) != 0 ? 1 : 0;
                 else if (strcmp(key, "ofdm_rx_enabled") == 0) ofdm_rx_enabled = atoi(value) != 0;
                 else if (strcmp(key, "robust_rx_enabled") == 0) robust_rx_enabled = atoi(value) != 0;
                 else if (strcmp(key, "mfsk_rx_enabled") == 0) mfsk_rx_enabled = atoi(value) != 0;

@@ -429,6 +429,7 @@ struct TxPacket {
     int oper_mode;  // -1 = use default mode
     int64_t enqueue_ms;
     bool beacon = false;
+    bool manual = false;
     TxPacket() : oper_mode(-1), enqueue_ms(steady_now_ms()) {}
     TxPacket(std::vector<uint8_t> d, int mode = -1)
         : data(std::move(d)), oper_mode(mode), enqueue_ms(steady_now_ms()) {}
