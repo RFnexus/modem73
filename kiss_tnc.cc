@@ -53,6 +53,7 @@ std::string g_fatal_error;
 TNCConfig g_config;
 bool g_verbose = false;
 bool g_debug = false;
+static bool g_tx_blanking_configured = false;
 #ifdef WITH_UI
 bool g_use_ui = true;  
 #else
@@ -560,37 +561,30 @@ private:
         } else {
             std::lock_guard<std::mutex> lock(config_mutex_);
             switch (cmd) {
+                // unused handled by modem73 config
             case KISS::CMD_TXDELAY:
                 if (!data.empty()) {
-                    config_.tx_delay_ms = data[0] * 10;
-                    ui_log("TXDelay set to " + std::to_string(config_.tx_delay_ms) + " ms");
+                    //
                 }
                 break;
             case KISS::CMD_P:
                 if (!data.empty()) {
-                    ui_log("KISS P-persistence " + std::to_string(data[0]) +
-                           " ignored (unused)");
+                    // 
                 }
                 break;
             case KISS::CMD_SLOTTIME:
                 if (!data.empty()) {
-                    int prev = config_.slot_time_ms;
-                    config_.slot_time_ms = data[0] * 10;
-                    ui_log("KISS client set slot time to " +
-                           std::to_string(config_.slot_time_ms) + " ms (was " +
-                           std::to_string(prev) + " ms)");
+                    //
                 }
                 break;
             case KISS::CMD_TXTAIL:
                 if (!data.empty()) {
-                    config_.ptt_tail_ms = data[0] * 10;
-                    ui_log("TXTail set to " + std::to_string(config_.ptt_tail_ms) + " ms");
+                    //
                 }
                 break;
             case KISS::CMD_FULLDUPLEX:
                 if (!data.empty()) {
-                    config_.full_duplex = data[0] != 0;
-                    ui_log(std::string("Full duplex ") + (config_.full_duplex ? "enabled" : "disabled"));
+                    ui_log("KISS full duplex request ignored");
                 }
                 break;
             case KISS::CMD_SETHW:
@@ -645,9 +639,12 @@ private:
                     {
                         std::lock_guard<std::mutex> lock(config_mutex_);
                         still_want = config_.csma_enabled && config_.csma_sync_only &&
-                                     config_.csma_ranked;
+                                     ranked_active();
                     }
-                    if (!still_want || !tx_queue_.empty() || !is_tx_allowed()) {
+                    bool drop = pkt.manual
+                        ? !tx_queue_.empty()
+                        : (!still_want || !tx_queue_.empty() || !is_tx_allowed());
+                    if (drop) {
                         beacon_anchor_ms = steady_now_ms();
                         beacon_due_ms = beacon_due();
                         continue;
@@ -665,8 +662,7 @@ private:
                     csma_sync_only = config_.csma_sync_only;
                     csma_fast_floor = config_.csma_fast_floor;
                     csma_band = config_.csma_band;
-                    csma_ranked = config_.csma_ranked && config_.tx_lead_tone &&
-                                  config_.tx_delay_ms >= 250;
+                    csma_ranked = ranked_active();
                     carrier_sense_ms = config_.carrier_sense_ms;
                     carrier_threshold_db = config_.carrier_threshold_db;
                     slot_time_ms = config_.slot_time_ms;
@@ -733,14 +729,16 @@ private:
                         if (gcfg.rank >= gcfg.rank_n)
                             yield_attempt_++;
                         if (gcfg.rank < 0) {
-                            int known = known_others();
-                            if (known > 0) {
+                            if (forgotten) {
                                 boot_rank = (int)(id_mix(station_id_.load(),
                                                          boot_attempt) % 4);
                                 boot_attempt++;
+                            }
+                            int known = known_others();
+                            if (boot_rank >= 0 && known > 0) {
                                 gcfg.rank = std::max(4, known + 1) + boot_rank;
                                 gcfg.rank_n = gcfg.rank + 1;
-                                if (g_debug && forgotten)
+                                if (g_debug)
                                     ui_log("CSMA: silent too long, entering "
                                            "after known turns");
                             } else {
@@ -813,10 +811,17 @@ private:
                         float level_db = audio_->instant_level_db(carrier_sense_ms);
                         bool allowed = is_tx_allowed();
                         if (csma_ranked && csma_sync_only) {
-                            cur_rank = ranked_slot(&cur_rank_n);
-                            if (cur_rank < 0 && boot_rank >= 0) {
-                                cur_rank = boot_rank;
-                                cur_rank_n = 4;
+                            if (boot_rank >= 0) {
+                                int known = known_others();
+                                if (known > 0) {
+                                    cur_rank = std::max(4, known + 1) + boot_rank;
+                                    cur_rank_n = cur_rank + 1;
+                                } else {
+                                    cur_rank = -1;
+                                    cur_rank_n = 0;
+                                }
+                            } else {
+                                cur_rank = ranked_slot(&cur_rank_n);
                             }
                             gate.set_rank(cur_rank, cur_rank_n);
                         }
@@ -944,7 +949,7 @@ private:
                     {
                         std::lock_guard<std::mutex> lock(config_mutex_);
                         want = config_.csma_enabled && config_.csma_sync_only &&
-                               config_.csma_ranked;
+                               ranked_active();
                     }
                     bool participating =
                         bnow - last_burst_end < PARTICIPATION_MS ||
@@ -1009,6 +1014,12 @@ private:
         if (q < 300) q = 300;
         if (q > 3500) q = 3500;
         return q;
+    }
+
+    bool ranked_active() const {
+        return config_.csma_ranked && config_.tx_lead_tone &&
+               (config_.ptt_type == PTTType::VOX ||
+                config_.tx_delay_ms >= 250);
     }
 
     int tx_lead_ms() const {
@@ -1124,33 +1135,61 @@ private:
         if (config_.ptt_type == PTTType::VOX) {
             // VOX mode: generate tone to trigger radio's VOX
             int lead_samples = config_.vox_lead_ms * config_.sample_rate / 1000;
-            int tail_samples = config_.vox_tail_ms * config_.sample_rate / 1000;
-            
-            // Generate lead tone
-            auto lead_tone = generate_tone(config_.vox_tone_freq, lead_samples, 0.8f);
-            
-            // Generate tail tone  
+            int tail_ms = beacon ? 0 : config_.vox_tail_ms;
+            int tail_samples = tail_ms * config_.sample_rate / 1000;
+
+            bool sig_lead = first &&
+                            (beacon || (config_.csma_enabled &&
+                                        config_.tx_lead_tone));
+            int sig_lead_ms = ToneDCD::MIN_LEAD_MS +
+                              std::max(0, config_.vox_lead_ms - 150);
+            int gap_frames = 0;
+            std::vector<float> lead_tone;
+            if (sig_lead) {
+                if (!beacon) {
+                    gap_frames = TONE_LEAD_GAP_MS * config_.sample_rate / 1000;
+                }
+                lead_tone = ToneDCD::signature_lead(
+                    modem_config_.center_freq,
+                    sig_lead_ms * config_.sample_rate / 1000,
+                    ToneDCD::LEAD_AMPLITUDE, config_.sample_rate,
+                    station_id_);
+            } else {
+                lead_tone = generate_tone(config_.vox_tone_freq, lead_samples, 0.8f);
+            }
+
+            // Generate tail tone
             auto tail_tone = generate_tone(config_.vox_tone_freq, tail_samples, 0.8f);
-            
-            total_tx_duration += (config_.vox_lead_ms + config_.vox_tail_ms) / 1000.0f;
-            
-            ui_log("TX: VOX mode, " + std::to_string(config_.vox_tone_freq) + "Hz tone, " +
-                   std::to_string(config_.vox_lead_ms) + "ms lead, " +
-                   std::to_string(config_.vox_tail_ms) + "ms tail");
-            
+
+            total_tx_duration += (sig_lead ? sig_lead_ms
+                                           : config_.vox_lead_ms) / 1000.0f +
+                                 (gap_frames + tail_samples) /
+                                     (float)config_.sample_rate;
+
+            if (sig_lead)
+                ui_log("TX: VOX mode, signature lead " +
+                       std::to_string(sig_lead_ms) + "ms, " +
+                       std::to_string(tail_ms) + "ms tail");
+            else
+                ui_log("TX: VOX mode, " + std::to_string(config_.vox_tone_freq) + "Hz tone, " +
+                       std::to_string(config_.vox_lead_ms) + "ms lead, " +
+                       std::to_string(tail_ms) + "ms tail");
+
 #ifdef WITH_UI
             if (g_ui_state) g_ui_state->ptt_on = true;
 #endif
-            
+
             // Transmit: lead tone -> OFDM data -> tail tone
             const int chunk_size = 1024;
-            
+
             // Lead tone
             for (size_t i = 0; i < lead_tone.size(); i += chunk_size) {
                 int n = std::min(chunk_size, (int)(lead_tone.size() - i));
                 audio_->write(lead_tone.data() + i, n);
             }
-            
+            if (gap_frames > 0)
+                audio_->write_silence(gap_frames);
+
             // OFDM data
             for (size_t i = 0; i < samples.size(); i += chunk_size) {
                 int n = std::min(chunk_size, (int)(samples.size() - i));
@@ -2086,6 +2125,7 @@ public:
             config_.csma_sync_only = new_config.csma_sync_only;
             config_.csma_fast_floor = new_config.csma_fast_floor;
             config_.csma_ranked = new_config.csma_ranked;
+            config_.beacon_interval_s = new_config.beacon_interval_s;
             config_.csma_band = new_config.csma_band;
             config_.postamble = new_config.postamble;
             config_.carrier_threshold_db = new_config.carrier_threshold_db;
@@ -2252,6 +2292,14 @@ public:
 
     int channel_population() { return known_others(); }
 
+    bool queue_beacon() {
+        TxPacket b;
+        b.beacon = true;
+        b.manual = true;
+        tx_queue_.push(std::move(b));
+        return true;
+    }
+
     int channel_occupancy() const { return occupancy_pct_.load(); }
 
     bool is_receiving() const {
@@ -2408,7 +2456,10 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
         else if (!strcmp(key, "tx_lead_tone") && take(key)) config.tx_lead_tone = atoi(value) != 0;
         else if (!strcmp(key, "p_persistence") && take(key)) config.p_persistence = atoi(value);
         else if (!strcmp(key, "fragmentation_enabled") && take(key)) config.fragmentation_enabled = atoi(value) != 0;
-        else if (!strcmp(key, "tx_blanking_enabled") && take(key)) config.tx_blanking_enabled = atoi(value) != 0;
+        else if (!strcmp(key, "tx_blanking_enabled") && take(key)) {
+            config.tx_blanking_enabled = atoi(value) != 0;
+            g_tx_blanking_configured = true;
+        }
         else if (!strcmp(key, "audio_input") && take(key)) config.audio_input_device = value;
         else if (!strcmp(key, "audio_output") && take(key)) config.audio_output_device = value;
         else if (!strcmp(key, "audio_device")) {
@@ -2813,6 +2864,13 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (!g_use_ui && config.csma_enabled && !config.tx_blanking_enabled &&
+        !g_tx_blanking_configured && !cli_set.count("tx_blanking_enabled")) {
+        config.tx_blanking_enabled = true;
+        std::cerr << "TX blanking enable "
+                  << std::endl;
+    }
+
 #ifdef WITH_UI
     TNCUIState ui_state;
     if (g_use_ui) {
@@ -2892,6 +2950,17 @@ int main(int argc, char** argv) {
                     config.fragmentation_enabled = ui_state.fragmentation_enabled;
                 if (!cli_set.count("tx_blanking_enabled"))
                     config.tx_blanking_enabled = ui_state.tx_blanking_enabled;
+                if (!ui_state.tx_blanking_auto && config.csma_enabled &&
+                    !cli_set.count("tx_blanking_enabled")) {
+                    if (!config.tx_blanking_enabled) {
+                        config.tx_blanking_enabled = true;
+                        ui_state.tx_blanking_enabled = true;
+                        std::cerr << "TX blanking enabled "
+                                  << std::endl;
+                    }
+                    ui_state.tx_blanking_auto = 1;
+                    ui_state.save_settings();
+                }
                 if (!cli_set.count("ofdm_rx_enabled"))
                     config.ofdm_rx_enabled = ui_state.ofdm_rx_enabled;
                 if (!cli_set.count("robust_rx_enabled"))
@@ -3290,6 +3359,7 @@ int main(int argc, char** argv) {
                 cJSON_AddBoolToObject(j, "csma_sync_only", cfg.csma_sync_only);
                 cJSON_AddBoolToObject(j, "csma_fast_floor", cfg.csma_fast_floor);
                 cJSON_AddBoolToObject(j, "csma_ranked", cfg.csma_ranked);
+                cJSON_AddNumberToObject(j, "beacon_interval_s", cfg.beacon_interval_s);
                 cJSON_AddNumberToObject(j, "csma_band", cfg.csma_band);
                 cJSON_AddNumberToObject(j, "carrier_threshold_db", cfg.carrier_threshold_db);
                 cJSON_AddNumberToObject(j, "p_persistence", cfg.p_persistence);
@@ -3350,6 +3420,9 @@ int main(int argc, char** argv) {
                     new_config.csma_fast_floor = cJSON_IsTrue(item);
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "csma_ranked")) && cJSON_IsBool(item))
                     new_config.csma_ranked = cJSON_IsTrue(item);
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "beacon_interval_s")) && cJSON_IsNumber(item)
+                    && item->valueint >= 45 && item->valueint <= 90)
+                    new_config.beacon_interval_s = item->valueint;
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "csma_band")) && cJSON_IsNumber(item))
                     new_config.csma_band = item->valueint != 0 ? 1 : 0;
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "carrier_threshold_db")) && cJSON_IsNumber(item))
@@ -3395,6 +3468,7 @@ int main(int argc, char** argv) {
                     g_ui_state->postamble = new_config.postamble;
                     g_ui_state->csma_enabled = new_config.csma_enabled;
                     g_ui_state->csma_sync_only = new_config.csma_sync_only;
+                    g_ui_state->beacon_interval_s = new_config.beacon_interval_s;
                     g_ui_state->carrier_threshold_db = new_config.carrier_threshold_db;
                     g_ui_state->p_persistence = new_config.p_persistence;
                     g_ui_state->slot_time_ms = new_config.slot_time_ms;
@@ -3423,6 +3497,10 @@ int main(int argc, char** argv) {
                 }
 #endif
                 return rejected.empty();
+            };
+
+            ctrl_iface.send_beacon = [&tnc]() -> bool {
+                return tnc.queue_beacon();
             };
 
             ctrl_iface.rigctl_command = [&tnc](const std::string& cmd) -> std::string {

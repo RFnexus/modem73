@@ -67,6 +67,7 @@ public:
         std::function<bool(cJSON* params)> set_config;
         std::function<std::string(const std::string&)> rigctl_command;
         std::function<bool(const std::vector<uint8_t>&, int oper_mode)> tx_data;
+        std::function<bool()> send_beacon;
     };
 
     ControlPort(int port, const std::string& bind_address, TNCInterface iface)
@@ -304,6 +305,8 @@ private:
             handle_rigctl(client_fd, request);
         } else if (strcmp(cmd_str, "tx") == 0) {
             handle_tx(client_fd, request);
+        } else if (strcmp(cmd_str, "send_beacon") == 0) {
+            handle_send_beacon(client_fd);
         } else {
             send_error(client_fd, "unknown command");
         }
@@ -374,6 +377,17 @@ private:
         cJSON* response = cJSON_CreateObject();
         cJSON_AddBoolToObject(response, "ok", 1);
         cJSON_AddStringToObject(response, "response", result.c_str());
+        send_json(client_fd, response);
+        cJSON_Delete(response);
+    }
+
+    void handle_send_beacon(int client_fd) {
+        if (!iface_.send_beacon) {
+            send_error(client_fd, "send_beacon not available");
+            return;
+        }
+        cJSON* response = cJSON_CreateObject();
+        cJSON_AddBoolToObject(response, "ok", iface_.send_beacon() ? 1 : 0);
         send_json(client_fd, response);
         cJSON_Delete(response);
     }

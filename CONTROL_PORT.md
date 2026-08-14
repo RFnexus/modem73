@@ -13,6 +13,7 @@ Wire format: 4-byte big-endian length prefix + JSON payload.
 | `set_config` | Update configuration (partial updates OK) |
 | `rigctl` | Passthrough command to rigctld |
 | `tx` | Transmit data via KISS |
+| `send_beacon` | Queue a presence tone transmission |
 
 ---
 
@@ -39,6 +40,9 @@ Wire format: 4-byte big-endian length prefix + JSON payload.
 | `client_count` | int | Connected KISS clients |
 | `rigctl_connected` | bool | rigctld connection status |
 | `audio_connected` | bool | Audio device health |
+| `population` | int | Stations heard on frequency counted from signature tone IDs decoded within the 300s list expiry |
+| `occupancy_pct` | int | Channel occupancy 0-100 when CSMA is enabled |
+
 
 Stats switch between the OFDM, MFSK and RDM decoders based on active `modem_type`.
 
@@ -57,12 +61,21 @@ Stats switch between the OFDM, MFSK and RDM decoders based on active `modem_type
 | `robust_mode` | int | `0` = RDM-1200 (1150 bps), `1` = RDM-600 (585 bps), `2` = RDM-300 (296 bps), `3` = RDMN-300 (296 bps), `4` = RDMN-150 (149 bps), `5` = RDM-1200S (732 bps), `6` = RDM-600S (378 bps), `7` = RDM-300S (194 bps), `8` = RDMN-300S (197 bps), `9` = RDMN-150S (99 bps), `10` = RDM-800 (780 bps), `11` = RDM-800S (510 bps). Modes 0-4 and 10 carry 512-byte frames (510 B MTU), 5-9 and 11 carry 172-byte frames (170 B MTU). RDMN modes use 600 Hz bandwidth, all others 2400 Hz. RX auto-detects the mode. |
 | `mfsk_mode` | int | `0` = MFSK-8, `1` = MFSK-16, `2` = MFSK-32, `3` = MFSK-32R |
 | `modulation` | string | OFDM: `"BPSK"`..`"QAM4096"`. MFSK: `"MFSK-8"`..`"MFSK-32R"`. ROBUST: `"RDM-1200"`..`"RDM-800S"` |
-| `code_rate` | string | `"1/2"`, `"2/3"`, `"3/4"`, `"5/6"`, `"1/4"`, `"1/2x2"`, `"1/4x2"` (OFDM only; the `x2` rates send the codeword twice for time diversity on fading paths; every code bit airs twice, half the frame duration apart. Valid with long frames up to QAM16; not valid with QAM64+ long or QAM256+ normal frames) |
+| `code_rate` | string | `"1/2"`, `"2/3"`, `"3/4"`, `"5/6"`, `"1/4"` |
 | `postamble` | bool | OFDM only. Append a trailing sync anchor (~0.4 s of extra airtime) to each transmitted frame. An aware receiver uses it to rescue frames whose preamble/meta was fade-clipped; legacy receivers reject it cleanly (invalid-callsign marker) with no interop impact. |
 | `short_frame` | bool | Short frame mode (OFDM only) |
 | `payload_size` | int | Current PHY payload capacity in bytes |
 | `csma_enabled` | bool | CSMA carrier sense enabled |
 | `csma_sync_only` | bool | Busy detection uses carrier sync (DCD) only, ignoring the audio level threshold |
+| `csma_ranked` | bool | RANKED turn order on top of sync detection. Only active while `csma_sync_only` and `tx_lead_tone` are also true |
+| `beacon_interval_s` | int | RANKED presence tone interval when idle, 45-90 s. Values outside the range are ignored. Leave at 45 unless every station on frequency has the 300 s list expiry |
+| `csma_fast_floor` | bool | Size the sync contention window for 550 ms detection. Turn off only if a station on frequency predates 2.3 |
+| `csma_band` | int | `0` = HF, `1` = VHF/UHF preset timings |
+| `csma_quiet_ms` | int | Idle time required before contending (ms, `0` = auto from frame airtime) |
+| `csma_cw` | int | Contention window in slots (THRESHOLD mode) |
+| `csma_responder_dither` | int | Reply offset dither (ms) to spread simultaneous responders |
+| `csma_burst` | int | Frames sent per channel acquisition (1-4) |
+| `tx_lead_tone` | bool | Signature lead with the 16-bit station ID ahead of each transmission |
 | `carrier_threshold_db` | float | CSMA threshold (dB) |
 | `p_persistence` | int | P-persistence value (0-255) |
 | `slot_time_ms` | int | CSMA slot time (ms) |
@@ -110,6 +123,16 @@ Passes the command string to rigctld and returns the response.
 | `oper_mode` | int | OFDM mode override (-1 = use current config) |
 
 **Response:** `{"ok": true, "size": 123}`
+
+---
+
+## `send_beacon`
+
+**Request:** `{"cmd": "send_beacon"}`
+
+Queues one presence tone 
+
+**Response:** `{"ok": true}`
 
 ---
 
