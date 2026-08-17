@@ -43,6 +43,19 @@ enum class PTTType {
 #endif
 };
 
+const std::vector<std::string> PTT_TYPE_OPTIONS = {
+    "NONE", "RIGCTL", "VOX", "COM"
+#ifdef WITH_CM108
+    , "CM108"
+#endif
+};
+
+const std::vector<std::string> PTT_LINE_OPTIONS = {
+    "DTR", "RTS", "BOTH"
+};
+
+
+
 struct TNCConfig {
     // Network settings
     std::string bind_address = "0.0.0.0";
@@ -491,8 +504,10 @@ public:
         return fragments;
     }
     
+    // an unfragmented frame carries no header so a full MTU packet will fit in one
+    
     bool needs_fragmentation(size_t data_size, size_t max_payload) const {
-        return data_size > (max_payload - Frag::HEADER_SIZE);
+        return data_size > max_payload;
     }
     
 private:

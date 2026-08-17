@@ -244,7 +244,11 @@ public:
                                      "' (A-Z 0-9 / only, 1-9 characters)");
         }
         if (modem_config_.oper_mode < 0) {
-            throw std::runtime_error("Invalid modulation or code rate");
+            throw std::runtime_error("Unsupported OFDM combination: " + config.modulation +
+                                     " " + config.code_rate + " " +
+                                     ModemConfig::frame_size_name(config.frame_size) +
+                                     " (micro needs QPSK 1/2; the x2 rates and long frames"
+                                     " do not reach the higher QAM orders)");
         }
 
         if (config.modem_type == 1) {
@@ -334,14 +338,21 @@ public:
         
         std::cerr << "KISS TNC listening on " << config_.bind_address << ":" << config_.port << std::endl;
         std::cerr << "Callsign: " << config_.callsign << std::endl;
-        std::cerr << "Modulation: " << config_.modulation << " " << config_.code_rate
-                  << " " << ModemConfig::frame_size_name(config_.frame_size) << std::endl;
+        if (config_.modem_type == 1) {
+            std::cerr << "Mode: MFSK " << MFSK_MODE_NAMES[config_.mfsk_mode] << std::endl;
+        } else if (config_.modem_type == 2) {
+            std::cerr << "Mode: ROBUST " << ROBUST_MODE_NAMES[config_.robust_mode] << std::endl;
+        } else {
+            std::cerr << "Mode: OFDM " << config_.modulation << " " << config_.code_rate
+                      << " " << ModemConfig::frame_size_name(config_.frame_size) << std::endl;
+        }
         std::cerr << "Payload: " << payload_size_ << " bytes (including 2-byte length prefix)" << std::endl;
-        
+
         if (config_.csma_enabled) {
             std::cerr << "CSMA: enabled ("
-                      << (config_.csma_sync_only ? "sync-only, " : "")
-                      << "threshold=" << config_.carrier_threshold_db
+                      << "mode=" << (!config_.csma_sync_only ? "threshold"
+                          : config_.csma_ranked ? "ranked" : "sync")
+                      << ", threshold=" << config_.carrier_threshold_db
                       << " dB, slot=" << config_.slot_time_ms
                       << " ms, cw=" << config_.csma_cw
                       << ", quiet=" << (config_.csma_quiet_ms > 0
@@ -2382,16 +2393,19 @@ public:
     }
 };
 
+static const char* const MOD_OPTS[] = {
+    "BPSK", "QPSK", "8PSK", "QAM16", "QAM64", "QAM256", "QAM1024", "QAM4096"
+};
+static const int N_MOD = sizeof(MOD_OPTS) / sizeof(*MOD_OPTS);
+static const char* const RATE_OPTS[] = {"1/2", "2/3", "3/4", "5/6", "1/4", "1/2x2", "1/4x2"};
+static const int N_RATE = sizeof(RATE_OPTS) / sizeof(*RATE_OPTS);
+static const char* const MODEM_TYPE_OPTS[] = {"ofdm", "mfsk", "robust"};
+static const char* const CSMA_MODE_OPTS[] = {"threshold", "sync", "ranked"};
+static const char* const CSMA_BAND_OPTS[] = {"hf", "vhf"};
+
 // Load key=value settings from path into config when --config is passed
 static bool apply_settings_file(const std::string& path, TNCConfig& config,
                                 const std::set<std::string>& cli_set) {
-    static const char* MOD_OPTS[] = {
-        "BPSK", "QPSK", "8PSK", "QAM16", "QAM64", "QAM256", "QAM1024", "QAM4096"
-    };
-    static const int N_MOD = sizeof(MOD_OPTS) / sizeof(*MOD_OPTS);
-    static const char* RATE_OPTS[] = {"1/2", "2/3", "3/4", "5/6", "1/4", "1/2x2", "1/4x2"};
-    static const int N_RATE = sizeof(RATE_OPTS) / sizeof(*RATE_OPTS);
-
     FILE* f = fopen(path.c_str(), "r");
     if (!f) return false;
 
@@ -2460,6 +2474,10 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
             config.tx_blanking_enabled = atoi(value) != 0;
             g_tx_blanking_configured = true;
         }
+        else if (!strcmp(key, "tx_drive") && take(key)) {
+            float v = (float)atof(value);
+            if (std::isfinite(v) && v >= 0.05f && v <= 1.0f) config.tx_drive = v;
+        }
         else if (!strcmp(key, "audio_input") && take(key)) config.audio_input_device = value;
         else if (!strcmp(key, "audio_output") && take(key)) config.audio_output_device = value;
         else if (!strcmp(key, "audio_device")) {
@@ -2510,80 +2528,153 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
     return true;
 }
 
+static bool arg_ieq(const std::string& a, const char* b) {
+    size_t i = 0;
+    for (; i < a.size() && b[i]; ++i)
+        if (toupper((unsigned char)a[i]) != toupper((unsigned char)b[i]))
+            return false;
+    return i == a.size() && b[i] == '\0';
+}
+
+template<typename T, size_t N>
+static int arg_index(const std::string& value, T (&names)[N]) {
+    for (size_t i = 0; i < N; ++i)
+        if (arg_ieq(value, names[i])) return (int)i;
+    return -1;
+}
+
+template<typename T, size_t N>
+static void print_arg_options(const char* flag, const std::string& value,
+                              T (&names)[N]) {
+    std::cerr << "Invalid " << flag << " '" << value << "', expected one of:";
+    for (size_t i = 0; i < N; ++i)
+        std::cerr << ' ' << names[i];
+    std::cerr << std::endl;
+}
+
+static int clamp_arg(const char* flag, const char* value, int lo, int hi) {
+    int v = std::atoi(value);
+    int c = std::min(hi, std::max(lo, v));
+    if (c != v)
+        std::cerr << "Warning: " << flag << ' ' << v << " out of range "
+                  << lo << ".." << hi << ", using " << c << std::endl;
+    return c;
+}
+
+static float clamp_arg_f(const char* flag, const char* value, float lo, float hi) {
+    float v = (float)std::atof(value);
+    if (!std::isfinite(v)) v = lo;
+    float c = std::min(hi, std::max(lo, v));
+    if (c != v)
+        std::cerr << "Warning: " << flag << ' ' << v << " out of range "
+                  << lo << ".." << hi << ", using " << c << std::endl;
+    return c;
+}
+
 void print_help(const char* prog) {
     std::cerr << "MODEM73\n\n"
-              << "Usage: " << prog << " [options]\n\n"
-              << "Options:\n"
+              << "Usage: " << prog << " [options]\n"
+              << "\nGeneral:\n"
+#ifdef WITH_UI
+              << "  -h, --headless          Run without the TUI\n"
+#endif
+              << "  -v, --verbose           Verbose output\n"
+              << "      --debug             Log heard station IDs and population tracking\n"
+              << "      --config [FILE]     Load options from FILE\n"
+              << "                          (defaults to ~/.config/modem73/settings)\n"
+              << "      --list-audio        List available audio devices and exit\n"
+#ifdef WITH_CM108
+              << "      --list-cm108        List CM108-compatible devices and exit\n"
+#endif
+              << "      --help              Show this help\n"
+              << "\nNetwork:\n"
               << "  -p, --port PORT         KISS TCP port (default: 8001)\n"
-              << "  --bind ADDR             KISS bind address (default: 0.0.0.0)\n"
-              << "  --control-port PORT     Control port (default: 8073, 0 to disable)\n"
-              << "  --control-bind ADDR     Control port bind address (default: 127.0.0.1)\n"
-              << "  -d, --device DEV        Audio device for both I/O\n"
-              << "  --input-device DEV      Audio input  device\n"
-              << "  --output-device DEV     Audio output device\n"
-              << "  --list-audio            List available audio devices and exit\n"
+              << "      --bind ADDR         KISS bind address (default: 0.0.0.0)\n"
+              << "      --control-port PORT Control port (default: 8073, 0 to disable)\n"
+              << "      --control-bind ADDR Control port bind address (default: 127.0.0.1)\n"
+              << "\nAudio:\n"
+              << "  -d, --device DEV        Audio device for both capture and playback\n"
+              << "      --input-device DEV  Audio capture device\n"
+              << "      --output-device DEV Audio playback device\n"
+              << "      --tx-level PCT      TX audio output level, 5-100 (default: 100)\n"
+              << "\nModem:\n"
               << "  -c, --callsign CALL     Callsign (default: N0CALL)\n"
-              << "  -m, --modulation MOD    BPSK/QPSK/8PSK/QAM16/QAM64/QAM256 (default: QPSK)\n"
-              << "  -r, --rate RATE         Code rate: 1/2, 2/3, 3/4, 5/6, 1/4 (default: 1/2)\n"
-              << "  --short                 Use short frames\n"
-              << "  --normal                Use normal frames (default)\n"
-              << "  --long                  Use long frames\n"
-              << "  --micro                 QB micro burst (QPSK 1/2 only, 32 B in ~0.59 s)\n"
-              << "  --no-rxfilter           Disable RX bandpass in front of the OFDM decoder\n"
-              << "\nPTT options:\n"
-              << "  --ptt TYPE              PTT type: none, rigctl, vox, com"
+              << "      --modem TYPE        ofdm, mfsk or robust (default: ofdm)\n"
+              << "  -m, --modulation MOD    OFDM modulation, one of:\n"
+              << "                          BPSK QPSK 8PSK QAM16 QAM64 QAM256 QAM1024 QAM4096\n"
+              << "                          (default: QPSK)\n"
+              << "  -r, --rate RATE         OFDM code rate, one of:\n"
+              << "                          1/2 2/3 3/4 5/6 1/4 (default: 1/2)\n"
+              << "                          \n"
+              << "      --short             OFDM short frames\n"
+              << "      --normal            OFDM normal frames (default)\n"
+              << "      --long              OFDM long frames\n"
+              << "      --micro             OFDM QB micro burst (WIP)\n"
+              << "      --postamble         Send a postamble after each OFDM frame\n"
+              << "      --no-postamble      Do not send a postamble (default)\n"
+              << "      --mfsk-mode MODE    MFSK-8, MFSK-16, MFSK-32 or MFSK-32R\n"
+              << "                          (implies --modem mfsk)\n"
+              << "      --robust-mode MODE  RDM-1200 RDM-800 RDM-600 RDM-300 RDMN-300 RDMN-150\n"
+              << "                          suffix S selects short frames (e.g. RDM-600S),\n"
+              << "                          RDM-QB is the 32 B micro burst\n"
+              << "                          (implies --modem robust)\n"
+              << "      --no-rxfilter       Disable RX bandpass in front of the OFDM decoder\n"
+              << "\nRX decoders:\n"
+              << "      --no-mfsk-rx        Disable the 3 always-on MFSK RX decoders to save CPU\n"
+              << "                          (ignored while an MFSK mode is selected for TX)\n"
+              << "      --no-ofdm-rx        Disable the OFDM RX decoder to save CPU\n"
+              << "                          (ignored while an OFDM mode is selected for TX)\n"
+              << "      --no-robust-rx      Disable the 2 ROBUST (RDM) RX decoders to save CPU\n"
+              << "                          (ignored while a ROBUST mode is selected for TX)\n"
+              << "\nPTT:\n"
+              << "      --ptt TYPE          PTT type: none, rigctl, vox, com"
 #ifdef WITH_CM108
               << ", cm108"
 #endif
               << " (default: rigctl)\n"
-              << "  --rigctl HOST:PORT      Rigctl address (default: localhost:4532)\n"
-              << "  --com-port PORT         Serial port for COM PTT (default: /dev/ttyUSB0)\n"
-              << "  --com-line LINE         COM PTT line: dtr, rts, both, -dtr, -rts, -both\n"
+              << "      --rigctl HOST:PORT  Rigctld address (default: localhost:4532,\n"
+              << "                          implies --ptt rigctl)\n"
+              << "      --com-port PORT     Serial port for COM PTT (default: /dev/ttyUSB0)\n"
+              << "      --com-line LINE     COM PTT line: dtr, rts, both, -dtr, -rts, -both\n"
               << "                          (prefix '-' inverts polarity; default: rts)\n"
-              << "  --vox-freq HZ           VOX tone frequency (default: 1200)\n"
-              << "  --vox-lead MS           VOX lead time in ms (default: 150)\n"
-              << "  --vox-tail MS           VOX tail time in ms (default: 100)\n"
+              << "      --vox-freq HZ       VOX tone frequency (default: 1200)\n"
+              << "      --vox-lead MS       VOX lead time in ms (default: 550)\n"
+              << "      --vox-tail MS       VOX tail time in ms (default: 500)\n"
 #ifdef WITH_CM108
-              << "  --cm108-gpio N          CM108 GPIO pin for PTT (default: 3)\n"
-              << "  --cm108-device SPEC     CM108 device to use: serial or USB path\n"
+              << "      --cm108-gpio N      CM108 GPIO pin for PTT (default: 3)\n"
+              << "      --cm108-device SPEC CM108 device to use: serial or USB path\n"
               << "                          (default: first compatible device)\n"
-              << "  --list-cm108            List CM108-compatible devices and exit\n"
 #endif
-              << "  --ptt-delay MS          PTT delay before TX (default: 50)\n"
-              << "  --ptt-tail MS           PTT tail after TX (default: 50)\n"
-              << "\nRX decoder options:\n"
-              << "  --no-mfsk-rx            Disable the 3 always-on MFSK RX decoders to save CPU\n"
-              << "                          (ignored while an MFSK mode is selected for TX)\n"
-              << "  --no-ofdm-rx            Disable the OFDM RX decoder to save CPU\n"
-              << "                          (ignored while an OFDM mode is selected for TX)\n"
-              << "  --no-robust-rx          Disable the 2 ROBUST (RDM) RX decoders to save CPU\n"
-              << "                          (ignored while a ROBUST mode is selected for TX)\n"
-              << "\nCSMA options:\n"
-              << "  --no-csma               Disable CSMA carrier sense\n"
-              << "  --csma-threshold DB     Carrier sense threshold (default: -30)\n"
-              << "  --csma-slot MS          Slot time in ms (default: 500)\n"
-              << "  --csma-quiet MS         Idle time before contending (default: 0 = auto from frame airtime)\n"
-              << "  --csma-cw N             Contention window in slots (default: 8)\n"
-              << "  --csma-dither MS        Responder delay spread from callsign hash (default: 250, 0 = off)\n"
-              << "  --csma-burst N          Packets sent per channel acquisition, 1-4 (default: 2)\n"
-              << "  --lead-tone             Send tone during TXDelay so others detect keyup (default)\n"
-              << "  --no-lead-tone          Send silence during TXDelay instead\n"
-              << "  --csma-persist N        P-persistence 0-255 (deprecated, unused)\n"
+              << "      --ptt-delay MS      PTT delay before TX (default: 50)\n"
+              << "      --ptt-tail MS       PTT tail after TX (default: 50)\n"
+              << "      --tx-delay MS       TXDelay ahead of the frame, 250-2500 (default: 500)\n"
+              << "\nCSMA:\n"
+              << "      --no-csma           Disable CSMA, transmit as soon as a packet is queued\n"
+              << "      --csma-mode MODE    threshold, sync or ranked (default: threshold)\n"
+              << "                          threshold: busy = any audio over --csma-threshold\n"
+              << "                          sync:      busy = a real modem signal only\n"
+              << "                          ranked:    sync plus stations take timed turns\n"
+              << "      --csma-band BAND    Timing profile: hf or vhf (default: hf)\n"
+              << "      --csma-preset NAME  bench, relaxed, moderate or busy; sets quiet, window,\n"
+              << "                          slot, burst, dither and lead tone for the chosen band\n"
+              << "      --csma-threshold DB Carrier sense threshold, threshold mode (default: -30)\n"
+              << "      --csma-slot MS      Slot time in ms (default: 500)\n"
+              << "      --csma-quiet MS     Idle time before contending (default: 0 = auto)\n"
+              << "      --csma-cw N         Contention window in slots (default: 8)\n"
+              << "      --csma-dither MS    Responder delay spread from callsign hash\n"
+              << "                          (default: 250, 0 = off)\n"
+              << "      --csma-burst N      Packets sent per channel acquisition, 1-4 (default: 2)\n"
+              << "      --lead-tone         Send tone during TXDelay so others detect keyup (default)\n"
+              << "      --no-lead-tone      Send silence during TXDelay instead\n"
+              << "      --fast-floor        Drop the noise floor estimate quickly, sync mode (default)\n"
+              << "      --no-fast-floor     Keep the slower noise floor estimate\n"
+              << "      --beacon-interval S Presence tone interval in ranked mode, 45-90 (default: 45)\n"
               << "\nFragmentation:\n"
-              << "  --frag                  Enable packet fragmentation/reassembly\n"
-              << "  --no-frag               Disable fragmentation (default)\n"
-              << "\nTX Blanking:\n"
-              << "  --tx-blank              Suppress decoder during TX\n"
-              << "  --no-tx-blank           Disable TX blanking (default)\n"
-              << "\n"
-#ifdef WITH_UI
-              << "  -h, --headless          Run without TUI\n"
-#endif
-              << "  -v, --verbose           Verbose output\n"
-              << "      --debug             Log heard station IDs and population tracking\n"
-              << "  --config [FILE]         Load options from FILE\n"
-              << "                          (defaults to ~/.config/modem73/settings)\n"
-              << "  --help                  Show this help\n"
+              << "      --frag              Enable packet fragmentation/reassembly\n"
+              << "      --no-frag           Disable fragmentation (default)\n"
+              << "\nTX blanking:\n"
+              << "      --tx-blank          Suppress the decoder during TX\n"
+              << "      --no-tx-blank       Disable TX blanking (default)\n"
               << "\nSettings are saved to ~/.config/modem73/settings\n";
 }
 
@@ -2605,7 +2696,7 @@ int main(int argc, char** argv) {
             print_help(argv[0]);
             return 0;
         } else if (arg == "--list-audio") {
-            std::cout << "Input  0devices:\n";
+            std::cout << "Input devices:\n";
             auto input_devices = MiniAudio::list_capture_devices();
             for (const auto& dev : input_devices) {
                 std::cout << "  " << dev.second << "\n";
@@ -2674,20 +2765,69 @@ int main(int argc, char** argv) {
         } else if (arg == "--output-device" && i + 1 < argc) {
             config.audio_output_device = argv[++i];
             cli_set.insert("audio_output");
+        } else if (arg == "--tx-level" && i + 1 < argc) {
+            config.tx_drive = clamp_arg("--tx-level", argv[++i], 5, 100) / 100.0f;
+            cli_set.insert("tx_drive");
         } else if ((arg == "-c" || arg == "--callsign") && i + 1 < argc) {
             config.callsign = argv[++i];
             for (auto& ch : config.callsign)
                 ch = toupper((unsigned char)ch);
             cli_set.insert("callsign");
+        } else if (arg == "--modem" && i + 1 < argc) {
+            std::string value = argv[++i];
+            int idx = arg_index(value, MODEM_TYPE_OPTS);
+            if (idx < 0) {
+                print_arg_options("--modem", value, MODEM_TYPE_OPTS);
+                return 1;
+            }
+            config.modem_type = idx;
+            cli_set.insert("modem_type");
+        } else if (arg == "--mfsk-mode" && i + 1 < argc) {
+            std::string value = argv[++i];
+            int idx = arg_index(value, MFSK_MODE_NAMES);
+            if (idx < 0) {
+                print_arg_options("--mfsk-mode", value, MFSK_MODE_NAMES);
+                return 1;
+            }
+            config.mfsk_mode = idx;
+            config.modem_type = 1;
+            cli_set.insert("mfsk_mode");
+            cli_set.insert("modem_type");
+        } else if (arg == "--robust-mode" && i + 1 < argc) {
+            std::string value = argv[++i];
+            int idx = arg_index(value, ROBUST_MODE_NAMES);
+            if (idx < 0) {
+                print_arg_options("--robust-mode", value, ROBUST_MODE_NAMES);
+                return 1;
+            }
+            config.robust_mode = idx;
+            config.modem_type = 2;
+            cli_set.insert("robust_mode");
+            cli_set.insert("modem_type");
         } else if ((arg == "-m" || arg == "--modulation") && i + 1 < argc) {
-            config.modulation = argv[++i];
+            std::string value = argv[++i];
+            int idx = arg_index(value, MOD_OPTS);
+            if (idx < 0) {
+                print_arg_options("--modulation", value, MOD_OPTS);
+                return 1;
+            }
+            config.modulation = MOD_OPTS[idx];
             cli_set.insert("modulation");
         } else if ((arg == "-r" || arg == "--rate") && i + 1 < argc) {
-            config.code_rate = argv[++i];
+            std::string value = argv[++i];
+            int idx = arg_index(value, RATE_OPTS);
+            if (idx < 0) {
+                print_arg_options("--rate", value, RATE_OPTS);
+                return 1;
+            }
+            config.code_rate = RATE_OPTS[idx];
             cli_set.insert("code_rate");
-        } else if ((arg == "-f" || arg == "--freq") && i + 1 < argc) {
-            ++i;
-            std::cerr << "Warning: center frequency is fixed at 1500 Hz" << std::endl;
+        } else if (arg == "--postamble") {
+            config.postamble = true;
+            cli_set.insert("postamble");
+        } else if (arg == "--no-postamble") {
+            config.postamble = false;
+            cli_set.insert("postamble");
         } else if (arg == "--short") {
             config.frame_size = 0;
             cli_set.insert("frame_size");
@@ -2787,12 +2927,14 @@ int main(int argc, char** argv) {
             cli_set.insert("cm108_device");
 #endif
         } else if (arg == "--ptt-delay" && i + 1 < argc) {
-            config.ptt_delay_ms = std::atoi(argv[++i]);
+            config.ptt_delay_ms = clamp_arg("--ptt-delay", argv[++i], 0, 2000);
+            cli_set.insert("ptt_delay_ms");
         } else if (arg == "--ptt-tail" && i + 1 < argc) {
-            config.ptt_tail_ms = std::atoi(argv[++i]);
-        } else if (arg == "--no-rigctl") {
-            config.ptt_type = PTTType::NONE;
-            cli_set.insert("ptt_type");
+            config.ptt_tail_ms = clamp_arg("--ptt-tail", argv[++i], 0, 2000);
+            cli_set.insert("ptt_tail_ms");
+        } else if (arg == "--tx-delay" && i + 1 < argc) {
+            config.tx_delay_ms = clamp_arg("--tx-delay", argv[++i], 250, 2500);
+            cli_set.insert("tx_delay_ms");
         } else if (arg == "--no-mfsk-rx") {
             config.mfsk_rx_enabled = false;
             cli_set.insert("mfsk_rx_enabled");
@@ -2805,23 +2947,69 @@ int main(int argc, char** argv) {
         } else if (arg == "--no-csma") {
             config.csma_enabled = false;
             cli_set.insert("csma_enabled");
+        } else if (arg == "--csma-mode" && i + 1 < argc) {
+            std::string value = argv[++i];
+            int idx = arg_index(value, CSMA_MODE_OPTS);
+            if (idx < 0) {
+                print_arg_options("--csma-mode", value, CSMA_MODE_OPTS);
+                return 1;
+            }
+            config.csma_sync_only = idx >= 1;
+            config.csma_ranked = idx == 2;
+            cli_set.insert("csma_sync_only");
+            cli_set.insert("csma_ranked");
+        } else if (arg == "--csma-band" && i + 1 < argc) {
+            std::string value = argv[++i];
+            int idx = arg_index(value, CSMA_BAND_OPTS);
+            if (idx < 0) {
+                print_arg_options("--csma-band", value, CSMA_BAND_OPTS);
+                return 1;
+            }
+            config.csma_band = idx;
+            cli_set.insert("csma_band");
+        } else if (arg == "--csma-preset" && i + 1 < argc) {
+            std::string value = argv[++i];
+            int idx = -1;
+            for (int p = 0; p < CSMA_PRESET_COUNT; ++p)
+                if (arg_ieq(value, CSMA_PRESETS[0][p].name)) { idx = p; break; }
+            if (idx < 0) {
+                std::cerr << "Invalid --csma-preset '" << value << "', expected one of:";
+                for (int p = 0; p < CSMA_PRESET_COUNT; ++p)
+                    std::cerr << ' ' << CSMA_PRESETS[0][p].name;
+                std::cerr << std::endl;
+                return 1;
+            }
+            // presets are per band, so --csma-band must come first to take effect
+            const CsmaPreset& preset = CSMA_PRESETS[config.csma_band & 1][idx];
+            config.csma_quiet_ms = preset.quiet_ms;
+            config.csma_cw = preset.cw;
+            config.slot_time_ms = preset.slot_ms;
+            config.csma_burst = preset.burst;
+            config.csma_responder_dither = preset.dither;
+            config.tx_lead_tone = preset.lead_tone;
+            cli_set.insert("csma_quiet_ms");
+            cli_set.insert("csma_cw");
+            cli_set.insert("slot_time_ms");
+            cli_set.insert("csma_burst");
+            cli_set.insert("csma_responder_dither");
+            cli_set.insert("tx_lead_tone");
         } else if (arg == "--csma-threshold" && i + 1 < argc) {
-            config.carrier_threshold_db = std::atof(argv[++i]);
+            config.carrier_threshold_db = clamp_arg_f("--csma-threshold", argv[++i], -80.0f, 0.0f);
             cli_set.insert("carrier_threshold_db");
         } else if (arg == "--csma-slot" && i + 1 < argc) {
-            config.slot_time_ms = std::atoi(argv[++i]);
+            config.slot_time_ms = clamp_arg("--csma-slot", argv[++i], 50, 5000);
             cli_set.insert("slot_time_ms");
         } else if (arg == "--csma-quiet" && i + 1 < argc) {
-            config.csma_quiet_ms = std::atoi(argv[++i]);
+            config.csma_quiet_ms = clamp_arg("--csma-quiet", argv[++i], 0, 10000);
             cli_set.insert("csma_quiet_ms");
         } else if (arg == "--csma-cw" && i + 1 < argc) {
-            config.csma_cw = std::atoi(argv[++i]);
+            config.csma_cw = clamp_arg("--csma-cw", argv[++i], 2, 32);
             cli_set.insert("csma_cw");
         } else if (arg == "--csma-dither" && i + 1 < argc) {
-            config.csma_responder_dither = std::atoi(argv[++i]);
+            config.csma_responder_dither = clamp_arg("--csma-dither", argv[++i], 0, 3000);
             cli_set.insert("csma_responder_dither");
         } else if (arg == "--csma-burst" && i + 1 < argc) {
-            config.csma_burst = std::atoi(argv[++i]);
+            config.csma_burst = clamp_arg("--csma-burst", argv[++i], 1, 4);
             cli_set.insert("csma_burst");
         } else if (arg == "--lead-tone") {
             config.tx_lead_tone = true;
@@ -2829,9 +3017,15 @@ int main(int argc, char** argv) {
         } else if (arg == "--no-lead-tone") {
             config.tx_lead_tone = false;
             cli_set.insert("tx_lead_tone");
-        } else if (arg == "--csma-persist" && i + 1 < argc) {
-            config.p_persistence = std::atoi(argv[++i]);
-            cli_set.insert("p_persistence");
+        } else if (arg == "--fast-floor") {
+            config.csma_fast_floor = true;
+            cli_set.insert("csma_fast_floor");
+        } else if (arg == "--no-fast-floor") {
+            config.csma_fast_floor = false;
+            cli_set.insert("csma_fast_floor");
+        } else if (arg == "--beacon-interval" && i + 1 < argc) {
+            config.beacon_interval_s = clamp_arg("--beacon-interval", argv[++i], 45, 90);
+            cli_set.insert("beacon_interval_s");
         } else if (arg == "--frag") {
             config.fragmentation_enabled = true;
             cli_set.insert("fragmentation_enabled");
@@ -2844,6 +3038,19 @@ int main(int argc, char** argv) {
         } else if (arg == "--no-tx-blank") {
             config.tx_blanking_enabled = false;
             cli_set.insert("tx_blanking_enabled");
+        // deprecated, kept so existing scripts still start; hidden from --help
+        } else if ((arg == "-f" || arg == "--freq") && i + 1 < argc) {
+            ++i;
+            std::cerr << "Warning: " << arg
+                      << " is deprecated, center frequency is fixed at 1500 Hz" << std::endl;
+        } else if (arg == "--csma-persist" && i + 1 < argc) {
+            ++i;
+            std::cerr << "Warning: --csma-persist is deprecated and ignored,"
+                         " use --csma-cw and --csma-slot" << std::endl;
+        } else if (arg == "--no-rigctl") {
+            config.ptt_type = PTTType::NONE;
+            cli_set.insert("ptt_type");
+            std::cerr << "Warning: --no-rigctl is deprecated, use --ptt none" << std::endl;
         } else {
             std::cerr << "Unknown option: " << arg << std::endl;
             print_help(argv[0]);
@@ -2911,10 +3118,14 @@ int main(int argc, char** argv) {
                 // Apply loaded settings to config
                 if (!cli_set.count("callsign"))
                     config.callsign = ui_state.callsign;
-                config.modem_type = ui_state.modem_type_index;
-                config.mfsk_mode = ui_state.mfsk_mode_index;
-                config.robust_mode = ui_state.robust_mode_index;
-                config.tx_drive = ui_state.tx_drive;
+                if (!cli_set.count("modem_type"))
+                    config.modem_type = ui_state.modem_type_index;
+                if (!cli_set.count("mfsk_mode"))
+                    config.mfsk_mode = ui_state.mfsk_mode_index;
+                if (!cli_set.count("robust_mode"))
+                    config.robust_mode = ui_state.robust_mode_index;
+                if (!cli_set.count("tx_drive"))
+                    config.tx_drive = ui_state.tx_drive;
                 if (!cli_set.count("center_freq"))
                     config.center_freq = ui_state.center_freq;
                 if (!cli_set.count("modulation"))
@@ -2923,13 +3134,18 @@ int main(int argc, char** argv) {
                     config.code_rate = CODE_RATE_OPTIONS[ui_state.code_rate_index];
                 if (!cli_set.count("frame_size"))
                     config.frame_size = ui_state.frame_size;
-                config.postamble = ui_state.postamble;
+                if (!cli_set.count("postamble"))
+                    config.postamble = ui_state.postamble;
                 if (!cli_set.count("csma_enabled"))
                     config.csma_enabled = ui_state.csma_enabled;
-                config.csma_sync_only = ui_state.csma_sync_only;
-                config.csma_fast_floor = ui_state.csma_fast_floor;
-                config.csma_ranked = ui_state.csma_ranked;
-                config.csma_band = ui_state.csma_band;
+                if (!cli_set.count("csma_sync_only"))
+                    config.csma_sync_only = ui_state.csma_sync_only;
+                if (!cli_set.count("csma_fast_floor"))
+                    config.csma_fast_floor = ui_state.csma_fast_floor;
+                if (!cli_set.count("csma_ranked"))
+                    config.csma_ranked = ui_state.csma_ranked;
+                if (!cli_set.count("csma_band"))
+                    config.csma_band = ui_state.csma_band;
                 if (!cli_set.count("carrier_threshold_db"))
                     config.carrier_threshold_db = ui_state.carrier_threshold_db;
                 if (!cli_set.count("slot_time_ms"))
@@ -3063,7 +3279,6 @@ int main(int argc, char** argv) {
                 ui_state.csma_sync_only = config.csma_sync_only;
                 ui_state.csma_fast_floor = config.csma_fast_floor;
                 ui_state.csma_ranked = config.csma_ranked;
-        ui_state.csma_band = config.csma_band;
                 ui_state.csma_band = config.csma_band;
                 ui_state.carrier_threshold_db = config.carrier_threshold_db;
                 ui_state.slot_time_ms = config.slot_time_ms;
@@ -3130,12 +3345,16 @@ int main(int argc, char** argv) {
         
         ui_state.callsign = config.callsign;
         ui_state.center_freq = config.center_freq;
+        ui_state.modem_type_index = config.modem_type;
+        ui_state.mfsk_mode_index = config.mfsk_mode;
+        ui_state.robust_mode_index = config.robust_mode;
         ui_state.frame_size = config.frame_size;
         ui_state.postamble = config.postamble;
         ui_state.csma_enabled = config.csma_enabled;
         ui_state.csma_sync_only = config.csma_sync_only;
         ui_state.csma_fast_floor = config.csma_fast_floor;
         ui_state.csma_ranked = config.csma_ranked;
+        ui_state.csma_band = config.csma_band;
         ui_state.carrier_threshold_db = config.carrier_threshold_db;
         ui_state.slot_time_ms = config.slot_time_ms;
         ui_state.csma_quiet_ms = config.csma_quiet_ms;
@@ -3144,6 +3363,7 @@ int main(int argc, char** argv) {
         ui_state.csma_burst = config.csma_burst;
         ui_state.tx_lead_tone = config.tx_lead_tone;
         ui_state.p_persistence = config.p_persistence;
+        ui_state.tx_drive = config.tx_drive;
         ui_state.audio_input_device = config.audio_input_device;
         ui_state.audio_output_device = config.audio_output_device;
         ui_state.com_port = config.com_port;
@@ -3369,6 +3589,7 @@ int main(int argc, char** argv) {
                 cJSON_AddNumberToObject(j, "csma_responder_dither", cfg.csma_responder_dither);
                 cJSON_AddNumberToObject(j, "csma_burst", cfg.csma_burst);
                 cJSON_AddBoolToObject(j, "tx_lead_tone", cfg.tx_lead_tone);
+                cJSON_AddNumberToObject(j, "tx_drive", cfg.tx_drive);
                 cJSON_AddBoolToObject(j, "tx_blanking_enabled", cfg.tx_blanking_enabled);
                 cJSON_AddBoolToObject(j, "fragmentation_enabled", cfg.fragmentation_enabled);
                 cJSON_AddBoolToObject(j, "mfsk_rx_enabled", cfg.mfsk_rx_enabled);
@@ -3441,6 +3662,9 @@ int main(int argc, char** argv) {
                     new_config.csma_burst = item->valueint;
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "tx_lead_tone")) && cJSON_IsBool(item))
                     new_config.tx_lead_tone = cJSON_IsTrue(item);
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "tx_drive")) && cJSON_IsNumber(item)
+                    && item->valuedouble >= 0.05 && item->valuedouble <= 1.0)
+                    new_config.tx_drive = (float)item->valuedouble;
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "tx_blanking_enabled")) && cJSON_IsBool(item))
                     new_config.tx_blanking_enabled = cJSON_IsTrue(item);
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "fragmentation_enabled")) && cJSON_IsBool(item))
@@ -3471,6 +3695,7 @@ int main(int argc, char** argv) {
                     g_ui_state->beacon_interval_s = new_config.beacon_interval_s;
                     g_ui_state->carrier_threshold_db = new_config.carrier_threshold_db;
                     g_ui_state->p_persistence = new_config.p_persistence;
+                    g_ui_state->tx_drive = applied.tx_drive;
                     g_ui_state->slot_time_ms = new_config.slot_time_ms;
                     g_ui_state->tx_blanking_enabled = new_config.tx_blanking_enabled;
                     g_ui_state->fragmentation_enabled = new_config.fragmentation_enabled;

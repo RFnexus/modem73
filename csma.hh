@@ -4,6 +4,32 @@
 #include <cstdint>
 #include <random>
 
+struct CsmaPreset {
+    const char* name;
+    int quiet_ms;
+    int cw;
+    int slot_ms;
+    int burst;
+    int dither;
+    bool lead_tone;
+};
+static const CsmaPreset CSMA_PRESETS[2][4] = {
+    {
+        {"BENCH",    0,  3, 500, 3, 0,    true},
+        {"RELAXED",  0,  8, 500, 3, 300,  true},
+        {"MODERATE", 0, 12, 500, 2, 800,  true},
+        {"BUSY",     0, 16, 500, 2, 1500, true},
+    },
+    {
+        {"BENCH",    0,  2, 200, 4, 0,   true},
+        {"RELAXED",  0,  4, 200, 4, 200, true},
+        {"MODERATE", 0,  6, 200, 3, 300, true},
+        {"BUSY",     0, 10, 200, 2, 500, true},
+    },
+};
+static const char* CSMA_BAND_NAMES[2] = {"HF", "VHF/UHF"};
+static constexpr int CSMA_PRESET_COUNT = 4;
+
 struct CsmaConfig {
     float threshold_db = -30.0f;
     bool sync_only = false;

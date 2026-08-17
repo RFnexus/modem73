@@ -31,6 +31,7 @@
 #include <glob.h>
 
 #include "kiss_tnc.hh"
+#include "csma.hh"
 #include "phy/mfsk_modem.hh"
 #include "phy/robust_modem.hh"
 #include "perf_log.hh"
@@ -65,32 +66,6 @@ inline int robust_mtu_index(int mode) {
     return mode == 12 ? 2 : RobustParams::is_short((RobustMode)mode) ? 1 : 0;
 }
 
-struct CsmaPreset {
-    const char* name;
-    int quiet_ms;
-    int cw;
-    int slot_ms;
-    int burst;
-    int dither;
-    bool lead_tone;
-};
-static const CsmaPreset CSMA_PRESETS[2][4] = {
-    {
-        {"BENCH",    0,  3, 500, 3, 0,    true},
-        {"RELAXED",  0,  8, 500, 3, 300,  true},
-        {"MODERATE", 0, 12, 500, 2, 800,  true},
-        {"BUSY",     0, 16, 500, 2, 1500, true},
-    },
-    {
-        {"BENCH",    0,  2, 200, 4, 0,   true},
-        {"RELAXED",  0,  4, 200, 4, 200, true},
-        {"MODERATE", 0,  6, 200, 3, 300, true},
-        {"BUSY",     0, 10, 200, 2, 500, true},
-    },
-};
-static const char* CSMA_BAND_NAMES[2] = {"HF", "VHF/UHF"};
-static constexpr int CSMA_PRESET_COUNT = 4;
-
 struct AltMode {
     const char* label;
     int modem_type;
@@ -124,17 +99,6 @@ const std::vector<std::string> MODULATION_OPTIONS = {
 
 const std::vector<std::string> CODE_RATE_OPTIONS = {
     "1/2", "2/3", "3/4", "5/6", "1/4", "1/2x2", "1/4x2"
-};
-
-const std::vector<std::string> PTT_TYPE_OPTIONS = {
-    "NONE", "RIGCTL", "VOX", "COM"
-#ifdef WITH_CM108
-    , "CM108"
-#endif
-};
-
-const std::vector<std::string> PTT_LINE_OPTIONS = {
-    "DTR", "RTS", "BOTH"
 };
 
 const std::vector<std::string> RIG_MODE_OPTIONS = {
@@ -1454,6 +1418,7 @@ private:
         FIELD_RX_MFSK,
         FIELD_AUDIO_INPUT,
         FIELD_AUDIO_OUTPUT,
+        FIELD_TX_LEVEL,
         FIELD_PTT_TYPE,
         FIELD_VOX_FREQ,
         FIELD_VOX_LEAD,
@@ -2259,6 +2224,8 @@ private:
         if (state_.modem_type_index != 1 && field == FIELD_MFSK_MODE) return true;
         if (state_.modem_type_index != 2 &&
             (field == FIELD_ROBUST_MODE || field == FIELD_ROBUST_MTU)) return true;
+        // RIGCTL has its own TX Drive on the RIG tab, so don't offer it twice
+        if (state_.ptt_type_index == 1 && field == FIELD_TX_LEVEL) return true;
         if (state_.ptt_type_index != 2) {  // not VOX
             if (field == FIELD_VOX_FREQ || field == FIELD_VOX_LEAD || field == FIELD_VOX_TAIL) {
                 return true;
@@ -2399,6 +2366,10 @@ private:
         row++;
         if (field == FIELD_AUDIO_OUTPUT) return row;
         row++;
+        if (state_.ptt_type_index != 1) {
+            if (field == FIELD_TX_LEVEL) return row;
+            row++;
+        }
         if (field == FIELD_PTT_TYPE) return row;
         row++;
         if (state_.ptt_type_index == 2) {
@@ -2601,6 +2572,11 @@ private:
                 state_.vox_tail_ms += delta * 50;
                 state_.vox_tail_ms = std::max(50, std::min(2000, state_.vox_tail_ms));
                 break;
+            case FIELD_TX_LEVEL: {
+                int pct = (int)lround(state_.tx_drive.load() * 100) + delta * 5;
+                state_.tx_drive = std::max(5, std::min(100, pct)) / 100.0f;
+                break;
+            }
             case FIELD_COM_PORT:
                 break;
             case FIELD_COM_LINE:
@@ -4496,7 +4472,22 @@ private:
             draw_field(dy, c1, c2, "Output", FIELD_AUDIO_OUTPUT, dev_display, true);
         }
         row++;
-        
+
+        if (state_.ptt_type_index != 1) {
+            dy = visible_y(row);
+            if (dy >= 0) {
+                char lvl_buf[24];
+                snprintf(lvl_buf, sizeof(lvl_buf), "%d%%",
+                         (int)lround(state_.tx_drive.load() * 100));
+                draw_selector_field(dy, c1, c2, "TX Level", FIELD_TX_LEVEL, lvl_buf);
+                attron(A_DIM);
+                mvaddnstr(dy, c2 + 10, "soundcard output drive, applies live",
+                          std::max(0, divider - (c2 + 10) - 1));
+                attroff(A_DIM);
+            }
+            row++;
+        }
+
         dy = visible_y(row);
         if (dy >= 0) draw_field(dy, c1, c2, "PTT", FIELD_PTT_TYPE,
                            PTT_TYPE_OPTIONS[state_.ptt_type_index], true);
