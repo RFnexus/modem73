@@ -2366,10 +2366,8 @@ private:
         row++;
         if (field == FIELD_AUDIO_OUTPUT) return row;
         row++;
-        if (state_.ptt_type_index != 1) {
-            if (field == FIELD_TX_LEVEL) return row;
-            row++;
-        }
+        if (field == FIELD_TX_LEVEL) return row;
+        row++;
         if (field == FIELD_PTT_TYPE) return row;
         row++;
         if (state_.ptt_type_index == 2) {
@@ -4473,20 +4471,26 @@ private:
         }
         row++;
 
-        if (state_.ptt_type_index != 1) {
-            dy = visible_y(row);
-            if (dy >= 0) {
+        dy = visible_y(row);
+        if (dy >= 0) {
+            if (state_.ptt_type_index != 1) {
                 char lvl_buf[24];
                 snprintf(lvl_buf, sizeof(lvl_buf), "%d%%",
                          (int)lround(state_.tx_drive.load() * 100));
                 draw_selector_field(dy, c1, c2, "TX Level", FIELD_TX_LEVEL, lvl_buf);
                 attron(A_DIM);
-                mvaddnstr(dy, c2 + 10, "soundcard output drive, applies live",
+                mvaddnstr(dy, c2 + 10, "Soundcard output level, applies live",
+                          std::max(0, divider - (c2 + 10) - 1));
+                attroff(A_DIM);
+            } else {
+                attron(A_DIM);
+                mvaddstr(dy, c1, "TX Level");
+                mvaddnstr(dy, c2 + 10, "TX audio level and controls under RIG tab",
                           std::max(0, divider - (c2 + 10) - 1));
                 attroff(A_DIM);
             }
-            row++;
         }
+        row++;
 
         dy = visible_y(row);
         if (dy >= 0) draw_field(dy, c1, c2, "PTT", FIELD_PTT_TYPE,
