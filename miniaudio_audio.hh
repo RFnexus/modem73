@@ -306,20 +306,6 @@ public:
         return 20.0f * std::log10(rms);
     }
 
-    float measure_level(int duration_ms = 100) {
-        if (!capture_open_.load(std::memory_order_acquire)) return 0.0f;
-        uint64_t start_samples = capture_samples_.load();
-        double start_energy = capture_energy_.load();
-        std::this_thread::sleep_for(std::chrono::milliseconds(std::max(duration_ms, 10)));
-        uint64_t end_samples = capture_samples_.load();
-        double end_energy = capture_energy_.load();
-        if (end_samples == start_samples) return 0.0f;
-        float rms = std::sqrt(std::max(0.0, end_energy - start_energy) /
-                              (double)(end_samples - start_samples));
-        if (rms < 1e-10f) return -100.0f;
-        return 20.0f * std::log10(rms);
-    }
-
     int sample_rate() const { return sample_rate_; }
 
 private:
