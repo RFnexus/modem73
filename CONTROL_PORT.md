@@ -79,7 +79,7 @@ Stats switch between the OFDM, MFSK and RDM decoders based on active `modem_type
 | `carrier_threshold_db` | float | CSMA threshold (dB) |
 | `slot_time_ms` | int | CSMA slot time (ms) |
 | `tx_drive` | float | TX audio output level, 0.05-1.0. Applies immediately, no restart. Values outside the range are ignored |
-| `tx_blanking_enabled` | bool | Suppress decoder during TX |
+| `tx_blanking_enabled` | bool | Suppress decoder during TX. Cannot be disabled when CSMA is enabled |
 | `fragmentation_enabled` | bool | Enable packet fragmentation/reassembly |
 
 ---

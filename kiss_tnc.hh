@@ -139,7 +139,7 @@ struct TNCConfig {
     bool fragmentation_enabled = false;
     
     // TX blanking
-    bool tx_blanking_enabled = false;
+    bool tx_blanking_enabled = true;
     
     // Control port
     int control_port = 8073;

@@ -152,7 +152,7 @@ And every station needs to hear every other one. Ranked does not solve the hidde
 
 **Fragmentation** handles incoming packets that exceed your frame size by chunking them automatically.
 
-**TX blanking** stops you from hearing your own packets.
+**TX blanking** stops you from hearing your own packets. It is on by default and always on while CSMA is enabled
 
 Turn Fragmentation ON when another external application like Winlink is sending out PACLEN frames that exceed the modems frame size or your incoming frame size is unknown. It is ideal to have fragmentation OFF, but enable it where neccessary. 
 

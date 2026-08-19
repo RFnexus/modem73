@@ -66,7 +66,7 @@ public:
                 int slots = std::min(16, std::max(6, 3 * (cfg_.contenders + 1)));
                 window = std::max(slots * (det + 150), 4 * slot);
             } else {
-                window = std::max(window * 2, 16 * det);
+                window = std::max(16 * (det + 150), 4 * slot);
             }
             if (cfg_.idle_credit_ms >= cfg_.cold_channel_ms)
                 window = std::max(window / 4, 4 * slot);
@@ -125,9 +125,11 @@ public:
             } else {
                 episodes_ = std::min(episodes_ + 1, 1);
                 int slot = std::max(1, cfg_.slot_ms);
+                int det = std::max(1, cfg_.dcd_detect_ms);
                 int w = cfg_.contenders >= 0
                     ? window_
-                    : (int)std::min<long long>((long long)window_ << episodes_, 60000);
+                    : (int)std::min<long long>((long long)window_ << episodes_,
+                                               32LL * (det + 150));
                 int slots = std::max(2, w / slot);
                 contention_ms_ = cfg_.extra_delay_ms + slot *
                     std::uniform_int_distribution<int>(0, slots - 1)(gen_) +

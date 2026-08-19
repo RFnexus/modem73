@@ -53,7 +53,6 @@ std::string g_fatal_error;
 TNCConfig g_config;
 bool g_verbose = false;
 bool g_debug = false;
-static bool g_tx_blanking_configured = false;
 #ifdef WITH_UI
 bool g_use_ui = true;  
 #else
@@ -619,7 +618,7 @@ private:
         if (station_id_ == 0)
             station_id_ = (uint16_t)((gen() % 0xFFFE) + 1);
         int csma_stage = 0;
-        int csma_clean = 0;
+        int64_t csma_stage_ms = 0;
         int boot_attempt = 0;
         int64_t last_burst_end = steady_now_ms() - PARTICIPATION_MS - 1;
         auto beacon_interval_ms = [&]() {
@@ -714,6 +713,11 @@ private:
                     gcfg.contenders = csma_sync_only
                                         ? n_contenders(csma_band == 0) : -1;
                     int raw_pop = gcfg.contenders;
+                    while (csma_stage > 0 &&
+                           steady_now_ms() - csma_stage_ms >= CSMA_STAGE_DECAY_MS) {
+                        csma_stage--;
+                        csma_stage_ms += CSMA_STAGE_DECAY_MS;
+                    }
                     if (occupancy_pct_.load() > 55 || csma_stage >= 1)
                         gcfg.contenders = -1;
                     if (steady_now_ms() - last_burst_end < 3000 &&
@@ -906,13 +910,11 @@ private:
                         continue;
                     }
                     if (csma_sync_only) {
-                        if (busy_episodes >= 2) {
-                            csma_stage = std::min(csma_stage + 2, 2);
-                            csma_clean = 0;
-                        } else if (busy_episodes <= 1 && ++csma_clean >= 3) {
-                            csma_clean = 0;
-                            csma_stage = std::max(csma_stage - 1, 0);
-                        }
+                        if (busy_episodes >= 2)
+                            csma_stage = 2;
+                        else if (csma_stage > 0)
+                            csma_stage--;
+                        csma_stage_ms = steady_now_ms();
                     }
                     if (!g_running)
                         break;
@@ -1944,6 +1946,9 @@ private:
     static constexpr int64_t HEARD_EXPIRY_MS = 300000;
     static constexpr int64_t UNATTRIB_DISTRUST_MS = 90000;
     static constexpr int RANKED_QUIET_MS = 1000;
+
+    // stage a decay after 60 seconds for our contention window
+    static constexpr int64_t CSMA_STAGE_DECAY_MS = 60000;
     static constexpr int YIELD_BUCKETS = 4;
     static constexpr int64_t PARTICIPATION_MS = 1200000;
     int yield_attempt_ = 0;
@@ -2147,7 +2152,7 @@ public:
             config_.csma_responder_dither = new_config.csma_responder_dither;
             config_.csma_burst = new_config.csma_burst;
             config_.tx_lead_tone = new_config.tx_lead_tone;
-            config_.tx_blanking_enabled = new_config.tx_blanking_enabled;
+            config_.tx_blanking_enabled = new_config.tx_blanking_enabled || new_config.csma_enabled;
             config_.mfsk_rx_enabled = new_config.mfsk_rx_enabled;
             config_.ofdm_rx_enabled = new_config.ofdm_rx_enabled;
             config_.robust_rx_enabled = new_config.robust_rx_enabled;
@@ -2470,10 +2475,7 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
         else if (!strcmp(key, "tx_lead_tone") && take(key)) config.tx_lead_tone = atoi(value) != 0;
         else if (!strcmp(key, "p_persistence") && take(key)) config.p_persistence = atoi(value);
         else if (!strcmp(key, "fragmentation_enabled") && take(key)) config.fragmentation_enabled = atoi(value) != 0;
-        else if (!strcmp(key, "tx_blanking_enabled") && take(key)) {
-            config.tx_blanking_enabled = atoi(value) != 0;
-            g_tx_blanking_configured = true;
-        }
+        else if (!strcmp(key, "tx_blanking_enabled") && take(key)) config.tx_blanking_enabled = atoi(value) != 0;
         else if (!strcmp(key, "tx_drive") && take(key)) {
             float v = (float)atof(value);
             if (std::isfinite(v) && v >= 0.05f && v <= 1.0f) config.tx_drive = v;
@@ -2673,8 +2675,8 @@ void print_help(const char* prog) {
               << "      --frag              Enable packet fragmentation/reassembly\n"
               << "      --no-frag           Disable fragmentation (default)\n"
               << "\nTX blanking:\n"
-              << "      --tx-blank          Suppress the decoder during TX\n"
-              << "      --no-tx-blank       Disable TX blanking (default)\n"
+              << "      --tx-blank          Suppress the decoder during TX (default always on with CSMA)\n"
+              << "      --no-tx-blank       Disable TX blanking (only takes effect with --no-csma)\n"
               << "\nSettings are saved to ~/.config/modem73/settings\n";
 }
 
@@ -3071,13 +3073,6 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (!g_use_ui && config.csma_enabled && !config.tx_blanking_enabled &&
-        !g_tx_blanking_configured && !cli_set.count("tx_blanking_enabled")) {
-        config.tx_blanking_enabled = true;
-        std::cerr << "TX blanking enable "
-                  << std::endl;
-    }
-
 #ifdef WITH_UI
     TNCUIState ui_state;
     if (g_use_ui) {
@@ -3166,17 +3161,6 @@ int main(int argc, char** argv) {
                     config.fragmentation_enabled = ui_state.fragmentation_enabled;
                 if (!cli_set.count("tx_blanking_enabled"))
                     config.tx_blanking_enabled = ui_state.tx_blanking_enabled;
-                if (!ui_state.tx_blanking_auto && config.csma_enabled &&
-                    !cli_set.count("tx_blanking_enabled")) {
-                    if (!config.tx_blanking_enabled) {
-                        config.tx_blanking_enabled = true;
-                        ui_state.tx_blanking_enabled = true;
-                        std::cerr << "TX blanking enabled "
-                                  << std::endl;
-                    }
-                    ui_state.tx_blanking_auto = 1;
-                    ui_state.save_settings();
-                }
                 if (!cli_set.count("ofdm_rx_enabled"))
                     config.ofdm_rx_enabled = ui_state.ofdm_rx_enabled;
                 if (!cli_set.count("robust_rx_enabled"))
@@ -3510,6 +3494,8 @@ int main(int argc, char** argv) {
     }
 
     config.center_freq = 1500;
+    if (config.csma_enabled)
+        config.tx_blanking_enabled = true;
 
     try {
         KISSTNC tnc(config);
@@ -3697,7 +3683,7 @@ int main(int argc, char** argv) {
                     g_ui_state->p_persistence = new_config.p_persistence;
                     g_ui_state->tx_drive = applied.tx_drive;
                     g_ui_state->slot_time_ms = new_config.slot_time_ms;
-                    g_ui_state->tx_blanking_enabled = new_config.tx_blanking_enabled;
+                    g_ui_state->tx_blanking_enabled = new_config.tx_blanking_enabled || new_config.csma_enabled;
                     g_ui_state->fragmentation_enabled = new_config.fragmentation_enabled;
                     g_ui_state->ofdm_rx_enabled = new_config.ofdm_rx_enabled;
                     g_ui_state->robust_rx_enabled = new_config.robust_rx_enabled;

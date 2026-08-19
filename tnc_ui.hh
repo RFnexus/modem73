@@ -256,8 +256,7 @@ struct TNCUIState {
     float airtime_seconds = 0.0f;
     int random_data_size = 0;
     bool fragmentation_enabled = false;
-    bool tx_blanking_enabled = false;
-    int tx_blanking_auto = 0;
+    bool tx_blanking_enabled = true;
     int tx_delay_ms = 500;
     
     // stats
@@ -755,7 +754,6 @@ struct TNCUIState {
         fprintf(f, "csma_band=%d\n", csma_band);
         fprintf(f, "fragmentation_enabled=%d\n", fragmentation_enabled ? 1 : 0);
         fprintf(f, "tx_blanking_enabled=%d\n", tx_blanking_enabled ? 1 : 0);
-        fprintf(f, "tx_blanking_auto=%d\n", tx_blanking_auto);
         fprintf(f, "ofdm_rx_enabled=%d\n", ofdm_rx_enabled ? 1 : 0);
         fprintf(f, "robust_rx_enabled=%d\n", robust_rx_enabled ? 1 : 0);
         fprintf(f, "mfsk_rx_enabled=%d\n", mfsk_rx_enabled ? 1 : 0);
@@ -869,7 +867,6 @@ struct TNCUIState {
                 else if (strcmp(key, "csma_band") == 0) csma_band = atoi(value) != 0 ? 1 : 0;
                 else if (strcmp(key, "fragmentation_enabled") == 0) fragmentation_enabled = atoi(value) != 0;
                 else if (strcmp(key, "tx_blanking_enabled") == 0) tx_blanking_enabled = atoi(value) != 0;
-                else if (strcmp(key, "tx_blanking_auto") == 0) tx_blanking_auto = atoi(value) != 0 ? 1 : 0;
                 else if (strcmp(key, "ofdm_rx_enabled") == 0) ofdm_rx_enabled = atoi(value) != 0;
                 else if (strcmp(key, "robust_rx_enabled") == 0) robust_rx_enabled = atoi(value) != 0;
                 else if (strcmp(key, "mfsk_rx_enabled") == 0) mfsk_rx_enabled = atoi(value) != 0;
@@ -2215,6 +2212,9 @@ private:
 
     bool should_skip_field(int field) {
         if (field == FIELD_FREQ) return true;
+        
+        // TX blanking is forced on while CSMA is enabled
+        if (state_.csma_enabled && field == FIELD_TX_BLANKING) return true;
         // Hide OFDM-only fields when in MFSK mode
         if (state_.modem_type_index != 0) {
             if (field == FIELD_MODULATION || field == FIELD_CODERATE ||
@@ -2351,9 +2351,11 @@ private:
         row += 2;
         if (field == FIELD_FRAGMENTATION) return row;
         row += 2;
-        row++;
-        if (field == FIELD_TX_BLANKING) return row;
-        row += 2;
+        if (!state_.csma_enabled) {
+            row++;
+            if (field == FIELD_TX_BLANKING) return row;
+            row += 2;
+        }
         row++;
         if (field == FIELD_RX_OFDM) return row;
         row++;
@@ -2478,6 +2480,7 @@ private:
                 break;
             case FIELD_CSMA:
                 state_.csma_enabled = !state_.csma_enabled;
+                if (state_.csma_enabled) state_.tx_blanking_enabled = true;
                 break;
             case FIELD_THRESHOLD:
                 state_.carrier_threshold_db += delta * 2;
@@ -4393,18 +4396,19 @@ private:
         if (dy >= 0) draw_toggle_field(dy, c1, c2, "Enabled", FIELD_FRAGMENTATION, state_.fragmentation_enabled);
         row += 2;
         
-        // TX Blanking section
-        dy = visible_y(row);
-        if (dy >= 0) {
-            attron(A_DIM);
-            mvaddstr(dy, c1, "TX BLANKING");
-            attroff(A_DIM);
+        if (!state_.csma_enabled) {
+            dy = visible_y(row);
+            if (dy >= 0) {
+                attron(A_DIM);
+                mvaddstr(dy, c1, "TX BLANKING");
+                attroff(A_DIM);
+            }
+            row++;
+
+            dy = visible_y(row);
+            if (dy >= 0) draw_toggle_field(dy, c1, c2, "Enabled", FIELD_TX_BLANKING, state_.tx_blanking_enabled);
+            row += 2;
         }
-        row++;
-        
-        dy = visible_y(row);
-        if (dy >= 0) draw_toggle_field(dy, c1, c2, "Enabled", FIELD_TX_BLANKING, state_.tx_blanking_enabled);
-        row += 2;
 
         dy = visible_y(row);
         if (dy >= 0) {
