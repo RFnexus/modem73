@@ -433,7 +433,10 @@ private:
         }
 
         capture_open_.store(true, std::memory_order_release);
-        log_msg(std::string("Capture: ") + capture_device_.capture.name);
+        log_msg(std::string("Capture: ") + capture_device_.capture.name +
+                " (device " + std::to_string(capture_device_.capture.internalSampleRate) + " Hz, " +
+                std::to_string(capture_device_.capture.internalChannels) + " ch, period " +
+                std::to_string(capture_device_.capture.internalPeriodSizeInFrames) + ")");
         return true;
     }
 
