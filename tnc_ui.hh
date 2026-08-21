@@ -2,6 +2,9 @@
 
 #include <locale.h>
 #include <ncurses.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <arpa/inet.h>
 #include <glob.h>
 #include "tnc_ui_state.hh"
 
@@ -88,6 +91,8 @@ public:
             draw();
             if (rx_off_dialog_field_ >= 0)
                 draw_rx_off_dialog();
+            if (lan_dialog_)
+                draw_lan_dialog();
             refresh();
             std::this_thread::sleep_for(std::chrono::milliseconds(33));
         }
@@ -153,6 +158,7 @@ private:
         FIELD_TX_DELAY,
         FIELD_NET_PORT,
         FIELD_CONTROL_PORT,
+        FIELD_LAN_MODE,
         FIELD_PRESET,
         FIELD_COUNT
     };
@@ -181,6 +187,18 @@ private:
     }
 
     void handle_input(int ch) {
+        if (lan_dialog_) {
+            if (ch == 'y' || ch == 'Y' || ch == '\n' || ch == KEY_ENTER) {
+                state_.bind_address = "0.0.0.0";
+                state_.control_bind_address = "0.0.0.0";
+                state_.save_settings();
+                state_.add_log("LAN mode enabled (restart to apply)");
+                lan_dialog_ = false;
+            } else if (ch == 'n' || ch == 'N' || ch == 27) {
+                lan_dialog_ = false;
+            }
+            return;
+        }
         if (rx_off_dialog_field_ >= 0) {
             if (ch == 'y' || ch == 'Y' || ch == '\n' || ch == KEY_ENTER) {
                 bool* flag = rx_dialog_flag();
@@ -391,6 +409,8 @@ private:
 
                         edit_text_field(FIELD_NET_PORT);
 
+                    } else if (current_field_ == FIELD_LAN_MODE) {
+                        adjust_field(1);
                     } else if (current_field_ == FIELD_CONTROL_PORT) {
 
                         edit_text_field(FIELD_CONTROL_PORT);
@@ -1126,8 +1146,9 @@ private:
         if (field == FIELD_NET_PORT) return row;
         row++;
         if (field == FIELD_CONTROL_PORT) return row;
-        row += 2;
         row++;
+        if (field == FIELD_LAN_MODE) return row;
+        row += 2;
         if (field == FIELD_PRESET) return row;
         return row;
     }
@@ -1201,6 +1222,18 @@ private:
             case FIELD_POSTAMBLE:
                 state_.postamble = !state_.postamble;
                 break;
+            case FIELD_LAN_MODE: {
+                bool lan = state_.bind_address == "0.0.0.0" &&
+                           state_.control_bind_address == "0.0.0.0";
+                if (lan) {
+                    state_.bind_address = "127.0.0.1";
+                    state_.control_bind_address = "127.0.0.1";
+                    state_.add_log("LAN mode disabled (restart to apply)");
+                } else {
+                    lan_dialog_ = true;
+                }
+                break;
+            }
             case FIELD_CSMA:
                 state_.csma_enabled = !state_.csma_enabled;
                 if (state_.csma_enabled) state_.tx_blanking_enabled = true;
@@ -3184,6 +3217,11 @@ private:
                 dev_display = dev_display.substr(0, 11) + "~";
             }
             draw_field(dy, c1, c2, "Input", FIELD_AUDIO_INPUT, dev_display, true);
+            if (!state_.audio_connected.load() && current_field_ != FIELD_AUDIO_INPUT) {
+                attron(COLOR_PAIR(2) | A_BOLD);
+                mvaddstr(dy, c1, "Input");
+                attroff(COLOR_PAIR(2) | A_BOLD);
+            }
         }
         row++;
         
@@ -3195,6 +3233,11 @@ private:
                 dev_display = dev_display.substr(0, 11) + "~";
             }
             draw_field(dy, c1, c2, "Output", FIELD_AUDIO_OUTPUT, dev_display, true);
+            if (!state_.audio_connected.load() && current_field_ != FIELD_AUDIO_OUTPUT) {
+                attron(COLOR_PAIR(2) | A_BOLD);
+                mvaddstr(dy, c1, "Output");
+                attroff(COLOR_PAIR(2) | A_BOLD);
+            }
         }
         row++;
 
@@ -3220,8 +3263,22 @@ private:
         row++;
 
         dy = visible_y(row);
-        if (dy >= 0) draw_field(dy, c1, c2, "PTT", FIELD_PTT_TYPE,
-                           PTT_TYPE_OPTIONS[state_.ptt_type_index], true);
+        if (dy >= 0) {
+            draw_field(dy, c1, c2, "PTT", FIELD_PTT_TYPE,
+                       PTT_TYPE_OPTIONS[state_.ptt_type_index], true);
+            bool ptt_err = state_.ptt_failed.load() ||
+                           (state_.ptt_type_index == 1 && !state_.rigctl_connected.load());
+            if (ptt_err) {
+                if (current_field_ != FIELD_PTT_TYPE) {
+                    attron(COLOR_PAIR(2) | A_BOLD);
+                    mvaddstr(dy, c1, "PTT");
+                    attroff(COLOR_PAIR(2) | A_BOLD);
+                }
+                attron(COLOR_PAIR(2) | A_BOLD);
+                mvaddstr(dy, c2 + 18, "!key failed");
+                attroff(COLOR_PAIR(2) | A_BOLD);
+            }
+        }
         row++;
         
         if (state_.ptt_type_index == 2) {  // VOX
@@ -3336,6 +3393,14 @@ private:
             snprintf(cport_buf, sizeof(cport_buf), "%d", state_.control_port);
             draw_field(dy, c1, c2, "Control Port", FIELD_CONTROL_PORT, cport_buf, true);
         }
+        row++;
+
+        dy = visible_y(row);
+        if (dy >= 0) {
+            bool lan = state_.bind_address == "0.0.0.0" &&
+                       state_.control_bind_address == "0.0.0.0";
+            draw_field(dy, c1, c2, "LAN Mode", FIELD_LAN_MODE, lan ? "ON" : "OFF", true);
+        }
         row += 2;
         
         //  Preset section
@@ -3407,6 +3472,15 @@ private:
         printw("  TX ");
         if (tx_time < 60) printw("%.0fs", tx_time);
         else printw("%.1fm", tx_time / 60.0f);
+        if (state_.csma_enabled) {
+            int net = net_bps_estimate(true, state_.csma_quiet_ms, state_.csma_cw,
+                                       state_.slot_time_ms, state_.csma_burst,
+                                       state_.tx_lead_tone, state_.tx_delay_ms,
+                                       state_.airtime_seconds, state_.mtu_bytes);
+            attron(A_DIM);
+            printw("  net ~%d b/s", net);
+            attroff(A_DIM);
+        }
         y++;
 
 
@@ -5605,6 +5679,7 @@ private:
     int64_t last_level_ms_ = 0;
     int current_field_ = 0;
     int rx_off_dialog_field_ = -1;
+    bool lan_dialog_ = false;
 
     bool* rx_dialog_flag() {
         switch (rx_off_dialog_field_) {
@@ -5637,6 +5712,52 @@ private:
             case FIELD_RX_ROBUST: return 2;
         }
         return -1;
+    }
+
+    static std::string local_ip() {
+        std::string ip = "unknown";
+        struct ifaddrs* ifs = nullptr;
+        if (getifaddrs(&ifs) != 0) return ip;
+        for (struct ifaddrs* a = ifs; a; a = a->ifa_next) {
+            if (!a->ifa_addr || a->ifa_addr->sa_family != AF_INET) continue;
+            if (a->ifa_flags & IFF_LOOPBACK) continue;
+            char buf[INET_ADDRSTRLEN];
+            auto* sin = reinterpret_cast<struct sockaddr_in*>(a->ifa_addr);
+            if (inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf))) {
+                ip = buf;
+                break;
+            }
+        }
+        freeifaddrs(ifs);
+        return ip;
+    }
+
+    void draw_lan_dialog() {
+        int rows, cols;
+        getmaxyx(stdscr, rows, cols);
+        int w = 56, h = 10;
+        int y = (rows - h) / 2, x = (cols - w) / 2;
+        if (y < 0 || x < 0) return;
+        for (int i = 0; i < h; i++) {
+            move(y + i, x);
+            for (int j = 0; j < w; j++) addch(' ');
+        }
+        draw_box(y, x, h, w);
+        attron(COLOR_PAIR(3) | A_BOLD);
+        mvaddstr(y + 1, x + 2, "(!) ENABLE LAN MODE?");
+        attroff(COLOR_PAIR(3) | A_BOLD);
+        mvaddstr(y + 3, x + 2, "KISS and control ports will listen on 0.0.0.0,");
+        mvaddstr(y + 4, x + 2, "reachable by any device on your network:");
+        attron(COLOR_PAIR(4) | A_BOLD);
+        char line[64];
+        std::string ip = local_ip();
+        snprintf(line, sizeof(line), "KISS %s:%d   control %s:%d",
+                 ip.c_str(), state_.port, ip.c_str(), state_.control_port);
+        mvaddnstr(y + 6, x + 2, line, w - 4);
+        attroff(COLOR_PAIR(4) | A_BOLD);
+        attron(A_BOLD);
+        mvaddstr(y + h - 2, x + 2, "[Y] Enable        [N] Cancel");
+        attroff(A_BOLD);
     }
 
     void draw_rx_off_dialog() {

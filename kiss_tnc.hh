@@ -458,6 +458,20 @@ namespace Frag {
     constexpr size_t MAX_PENDING_PACKETS = 64;
 }
 
+inline int net_bps_estimate(bool csma_enabled, int quiet_ms, int cw, int slot_ms,
+                            int burst, bool lead_tone, int tx_delay_ms,
+                            float airtime_s, int payload_bytes) {
+    if (airtime_s <= 0.0f || payload_bytes <= 0) return 0;
+    float per_frame = airtime_s + tx_delay_ms / 1000.0f + 0.1f;
+    if (!csma_enabled)
+        return (int)(payload_bytes * 8 / per_frame);
+    int b = std::max(1, std::min(4, burst));
+    float access = (quiet_ms + cw * slot_ms * 0.5f) / 1000.0f;
+    float lead = lead_tone ? 0.45f : 0.0f;
+    float cycle = access + lead + b * per_frame;
+    return (int)(b * payload_bytes * 8 / cycle);
+}
+
 class Fragmenter {
 public:
     Fragmenter() : next_packet_id_((uint16_t)std::random_device{}()) {}

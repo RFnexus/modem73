@@ -11,6 +11,7 @@
 
 #include <vector>
 #include <cstring>
+#include <memory>
 #include <cmath>
 #include <functional>
 #include <algorithm>
@@ -400,7 +401,7 @@ public:
         for (int k = 0; k < nc_; ++k)
             rot_[k] = DSP::polar<value>(1, (value)M_PI * k * k / nc_);
         nrows_top_ = RobustParams::nrows(modes_[nmodes_ - 1]);
-        keep_ = (size_t)(nrows_top_ + 10) * RobustParams::SYM + 2 * D;
+        keep_ = (size_t)(2 * nrows_top_ + 10) * RobustParams::SYM + 2 * D;
         {
             // pilot patterns for mid-frame acquisition: same MLS stream the
             // encoder feeds into every 4th row
@@ -457,6 +458,8 @@ public:
         entry_pr_ = 0;
         entry_checked_ = true;
         trail_anchor_ = -1;
+        prev_peak_pos_ = -1;
+        last_decode_start_ = -1;
     }
 
     void process(const float* samples, size_t count, FrameCallback callback) {
@@ -510,6 +513,7 @@ public:
                     peak_metric_ = m;
                     peak_pos_ = n;
                     peak_deadline_ = n + 2 * D;
+                    prev_peak_pos_ = -1;
                 }
                 break;
             }
@@ -524,12 +528,18 @@ public:
                 }
                 value m = norm(P_) / (Ra_ * Rb_ + value(1e-9));
                 if (m > peak_metric_) {
+                    if (n - peak_pos_ > RobustParams::NFFT)
+                        prev_peak_pos_ = peak_pos_;
                     peak_metric_ = m;
                     peak_pos_ = n;
                 }
                 if (n >= peak_deadline_) {
                     int kind = lock();
                     if (kind == 1) {
+                        if (prev_peak_pos_ >= 0 &&
+                            try_trail_rescue_at(prev_peak_pos_, callback))
+                            ++stats_rescues;
+                        prev_peak_pos_ = -1;
                         state_ = State::COLLECT;
                         locked_q_ = lock_q_;
                         cand_deadline_ = -1;
@@ -550,7 +560,7 @@ public:
                 if (confirmed_ && pilot_alive_total_ >= 0 &&
                     total_in_ - pilot_alive_total_ > COLLECT_STALE &&
                     rows_done_ >= RobustParams::nrows(modes_[0])) {
-                    std::cerr << "RDM" << (narrow_ ? "n" : "")
+                    if (debug_log) std::cerr << "RDM" << (narrow_ ? "n" : "")
                               << ": carrier dropped, finalizing at "
                               << rows_done_ << " rows" << std::endl;
                     finalize_collect(callback);
@@ -591,7 +601,7 @@ public:
                                  total_in_ - pilot_alive_total_ >= PREEMPT_STALE;
                     int lk = lock();
                     if (lk == 1 && (lock_q_ > locked_q_ + value(0.08) || stale)) {
-                        std::cerr << "RDM" << (narrow_ ? "n" : "")
+                        if (debug_log) std::cerr << "RDM" << (narrow_ ? "n" : "")
                                   << ": collect preempted (q=" << lock_q_
                                   << " over " << locked_q_
                                   << (stale ? ", stale" : "") << ")" << std::endl;
@@ -601,7 +611,7 @@ public:
                             value n_om = omega_;
                             anchor_u_ = s_ta;
                             omega_ = trail_omega_;
-                            rescued = rescue_backward(callback, s_rd, false);
+                            rescued = rescue_backward(callback, false);
                             frame_pos_ = n_fp;
                             anchor_u_ = n_au;
                             omega_ = n_om;
@@ -616,13 +626,15 @@ public:
                                     for (int k = 0; k < nc_; ++k)
                                         rows_[i][k] = cmplx(0, 0);
                                 if (try_decode(rm, callback)) {
-                                    std::cerr << "RDM" << (narrow_ ? "n" : "")
+                                    if (debug_log) std::cerr << "RDM" << (narrow_ ? "n" : "")
                                               << ": tail rescue "
                                               << ROBUST_MODE_NAMES[(int)rm]
                                               << " at " << s_rd << " rows"
                                               << std::endl;
                                     if (pilot_alive_total_ >= 0)
                                         last_decode_total_ = pilot_alive_total_;
+                                    last_decode_start_ = total_in_
+                                        - (int64_t)buf_.size() + frame_pos_;
                                     rescued = true;
                                 }
                             }
@@ -664,7 +676,7 @@ public:
                         entry_checked_ = true;
                         if (!pilot_window_live(entry_pr_, 3,
                                                nc_ <= 8 ? 0.45f : 0.28f)) {
-                            std::cerr << "RDM" << (narrow_ ? "n" : "")
+                            if (debug_log) std::cerr << "RDM" << (narrow_ ? "n" : "")
                                       << ": pilot entry rejected"
                                       << std::endl;
                             state_ = State::SEARCH;
@@ -693,7 +705,7 @@ public:
                         ((rows_done_ == 1 && !pilot_sanity(1, nc_ <= 8 ? 0.30f : 0.18f)) ||
                         (rows_done_ == 2 * RobustParams::NS + 1 &&
                          !pilot_sanity(3, nc_ <= 8 ? 0.45f : 0.28f)))) {
-                        std::cerr << "RDM" << (narrow_ ? "n" : "")
+                        if (debug_log) std::cerr << "RDM" << (narrow_ ? "n" : "")
                                   << ": collect abort at row " << rows_done_
                                   << std::endl;
                         state_ = State::SEARCH;
@@ -713,12 +725,18 @@ public:
                             finish_frame(modes_[mi]);
                             done = true;
                         } else if (last) {
-                            ++stats_crc_errors;
-                            std::cerr << "RDM" << (narrow_ ? "n" : "")
-                                      << ": ladder exhausted at "
-                                      << rows_done_ << " rows" << std::endl;
-                            finalize_collect(callback);
-                            done = true;
+                            RobustMode rm;
+                            if (retry_ladder(callback, rm)) {
+                                finish_frame(rm);
+                                done = true;
+                            } else {
+                                ++stats_crc_errors;
+                                if (debug_log) std::cerr << "RDM" << (narrow_ ? "n" : "")
+                                          << ": ladder exhausted at "
+                                          << rows_done_ << " rows" << std::endl;
+                                finalize_collect(callback);
+                                done = true;
+                            }
                         }
                         break;
                     }
@@ -735,6 +753,8 @@ public:
             refresh_sums((int64_t)buf_.size() - 1);
         }
     }
+
+    bool debug_log = true;
 
     float get_last_snr() const { return last_snr_; }
     float get_last_ber() const { return last_ber_; }
@@ -754,6 +774,8 @@ public:
     int stats_false_locks = 0;
     int stats_crc_errors = 0;
     int stats_rescues = 0;
+    int stats_backward_rescues = 0;
+    int stats_ladder_rescues = 0;
     int stats_retry_success = 0;
     int stats_pilot_syncs = 0;
 
@@ -763,6 +785,8 @@ public:
         stats_false_locks = 0;
         stats_crc_errors = 0;
         stats_rescues = 0;
+        stats_backward_rescues = 0;
+        stats_ladder_rescues = 0;
         stats_retry_success = 0;
         last_snr_ = 0;
         last_ber_ = -1;
@@ -819,6 +843,8 @@ private:
     std::vector<cmplx> buf_;
     int64_t total_in_ = 0;
     int64_t last_decode_total_ = 0;
+    int64_t last_decode_start_ = -1;
+    int64_t prev_peak_pos_ = -1;
 
     int base_ = 4;
     int base_use_ = 4;
@@ -1026,7 +1052,7 @@ private:
         state_ = State::COLLECT;
         ++stats_pilot_syncs;
         ++stats_sync_count;
-        std::cerr << "RDM" << (narrow_ ? "n" : "") << ": Sync (PILOT j="
+        if (debug_log) std::cerr << "RDM" << (narrow_ ? "n" : "") << ": Sync (PILOT j="
                   << j + 1 << " q=" << q << " boff=" << boff
                   << " tau=" << tau << " cfo="
                   << omega_ * RobustParams::SAMPLE_RATE
@@ -1165,7 +1191,7 @@ private:
                 return 0;
         }
         anchor_u_ = p2u;
-        std::cerr << "RDM" << (narrow_ ? "n" : "") << ": Sync ("
+        if (debug_log) std::cerr << "RDM" << (narrow_ ? "n" : "") << ": Sync ("
                   << (best_kind == 1 ? "lead" : "TRAIL") << " q=" << best_q
                   << " boff=" << best_off << " tau=" << best_tau
                   << " cfo=" << omega_ * RobustParams::SAMPLE_RATE
@@ -1276,7 +1302,7 @@ private:
             int64_t s_fp = frame_pos_;
             anchor_u_ = trail_anchor_;
             omega_ = trail_omega_;
-            saved = rescue_backward(callback, rows_done_);
+            saved = rescue_backward(callback);
             if (saved) {
                 ++stats_rescues;
                 trail_saved = true;
@@ -1294,12 +1320,14 @@ private:
                 for (int k = 0; k < nc_; ++k)
                     rows_[i][k] = cmplx(0, 0);
             if (try_decode(m, callback)) {
-                std::cerr << "RDM" << (narrow_ ? "n" : "")
+                if (debug_log) std::cerr << "RDM" << (narrow_ ? "n" : "")
                           << ": tail rescue " << ROBUST_MODE_NAMES[(int)m]
                           << " at " << rows_done_ << " rows" << std::endl;
                 ++stats_rescues;
                 if (pilot_alive_total_ >= 0)
                     last_decode_total_ = pilot_alive_total_;
+                last_decode_start_ = total_in_
+                    - (int64_t)buf_.size() + frame_pos_;
                 saved = true;
             }
         }
@@ -1325,13 +1353,121 @@ private:
 
 
 
-    bool rescue_backward(FrameCallback callback, int max_rows = 0,
-                         bool consume = true) {
+    bool retry_ladder(FrameCallback& callback, RobustMode& out_mode) {
+        using namespace robust_detail;
+        const value dws = 2 * (value)M_PI * RobustParams::SPACING
+                        / RobustParams::SAMPLE_RATE / 8;
+        struct Adj { int dt; value dw; };
+        static const Adj adjs[] = {
+            {-RobustParams::SYM / 16, 0}, {RobustParams::SYM / 16, 0},
+            {-RobustParams::SYM / 8, 0}, {RobustParams::SYM / 8, 0},
+            {0, 0}, {0, 0}
+        };
+        Adj adjl[6];
+        std::memcpy(adjl, adjs, sizeof(adjl));
+        adjl[4].dw = -dws;
+        adjl[5].dw = dws;
+        int64_t s_fp = frame_pos_;
+        value s_om = omega_;
         for (int mi = 0; mi < nmodes_; ++mi) {
             RobustMode m = modes_[mi];
             int n = RobustParams::nrows(m);
-            if (max_rows > 0 && n > max_rows)
+            if (n != rows_done_)
                 continue;
+            for (const auto& a : adjl) {
+                frame_pos_ = s_fp + a.dt;
+                omega_ = s_om + a.dw;
+                bool fits = true;
+                for (int i = 0; i < n && fits; ++i) {
+                    int64_t st = row_start(i);
+                    if (st < 0 ||
+                        st + RobustParams::NFFT > (int64_t)buf_.size())
+                        fits = false;
+                }
+                if (!fits)
+                    continue;
+                for (int i = 0; i < n; ++i)
+                    take_row(i, row_start(i));
+                if (try_decode(m, callback)) {
+                    if (debug_log) std::cerr << "RDM" << (narrow_ ? "n" : "")
+                              << ": retry ladder " << ROBUST_MODE_NAMES[(int)m]
+                              << " dt=" << a.dt << " dw=" << a.dw
+                              << std::endl;
+                    ++stats_retry_success;
+                    ++stats_ladder_rescues;
+                    out_mode = m;
+                    return true;
+                }
+            }
+        }
+        frame_pos_ = s_fp;
+        omega_ = s_om;
+        for (int i = 0; i < rows_done_; ++i) {
+            int64_t st = row_start(i);
+            if (st >= 0 && st + RobustParams::NFFT <= (int64_t)buf_.size())
+                take_row(i, st);
+        }
+        return false;
+    }
+
+    bool try_trail_rescue_at(int64_t ppos, FrameCallback& callback) {
+        using namespace robust_detail;
+        if (!seq_init_)
+            return false;
+        int64_t p2u = ppos - RobustParams::NFFT + 1;
+        if (p2u - D - RobustParams::CP < 0 ||
+            p2u + RobustParams::NFFT > (int64_t)buf_.size())
+            return false;
+        int64_t s_fp = frame_pos_, s_au = anchor_u_;
+        value s_om = omega_;
+        int s_bu = base_use_;
+        frame_pos_ = p2u;
+        omega_ = arg(cp_corr(p2u, 96, 128)) / (value)RobustParams::NFFT;
+        base_use_ = base_;
+        cmplx bins[RobustParams::NC_MAX + 4], bins1[RobustParams::NC_MAX + 4];
+        window_fft(p2u, bins);
+        window_fft(p2u - D, bins1);
+        int best_off = 0;
+        value best_q = 0, best_tau = 0;
+        for (int boff = -2; boff <= 2; ++boff) {
+            if (base_ + boff < 2 ||
+                base_ + boff + nc_ + 2 > RobustParams::NFFT / 2)
+                continue;
+            value tau = 0;
+            value q = probe2(bins, bins1, boff, post_, &tau);
+            if (q > best_q) {
+                best_q = q; best_off = boff; best_tau = tau;
+            }
+        }
+        value qgate = nc_ <= 8 ? value(0.62) : value(0.4);
+        bool ok = false;
+        if (best_q >= qgate) {
+            const value bin_step = 2 * (value)M_PI * RobustParams::SPACING
+                                 / RobustParams::SAMPLE_RATE;
+            int shift = (int)std::lround(best_tau) - 96;
+            p2u += shift;
+            if (p2u - D - RobustParams::CP >= 0 &&
+                p2u + RobustParams::NFFT + 192 <= (int64_t)buf_.size()) {
+                omega_ = arg(cp_corr(p2u, 112, 192)) / (value)RobustParams::NFFT
+                       + best_off * bin_step;
+                int64_t a_abs = total_in_ - (int64_t)buf_.size() + p2u;
+                if (std::llabs(a_abs - spent_anchor_) >= RobustParams::SYM / 2) {
+                    anchor_u_ = p2u;
+                    ok = rescue_backward(callback, false);
+                }
+            }
+        }
+        frame_pos_ = s_fp;
+        anchor_u_ = s_au;
+        omega_ = s_om;
+        base_use_ = s_bu;
+        return ok;
+    }
+
+    bool rescue_backward(FrameCallback callback, bool consume = true) {
+        for (int mi = 0; mi < nmodes_; ++mi) {
+            RobustMode m = modes_[mi];
+            int n = RobustParams::nrows(m);
             int64_t row0 = anchor_u_ - D - (int64_t)n * RobustParams::SYM;
             // late join: head rows never captured decode as erasures, inside
             // the margin the rate-1/4 mother code leaves (RDM-800 already
@@ -1343,7 +1479,9 @@ private:
                 continue;
             int64_t head_abs = total_in_ - (int64_t)buf_.size()
                              + std::max<int64_t>(row0, 0);
-            if (head_abs < last_decode_total_)
+            int64_t tail_abs = total_in_ - (int64_t)buf_.size()
+                             + anchor_u_ + RobustParams::NFFT;
+            if (head_abs < last_decode_total_ && tail_abs > last_decode_start_)
                 continue;
             frame_pos_ = row0;
             if (mi == 0)
@@ -1358,10 +1496,12 @@ private:
                 }
             }
             if (try_decode(m, callback)) {
-                std::cerr << "RDM" << (narrow_ ? "n" : "")
+                ++stats_backward_rescues;
+                if (debug_log) std::cerr << "RDM" << (narrow_ ? "n" : "")
                           << ": backward rescue " << ROBUST_MODE_NAMES[(int)m]
                           << (missing ? " (late join)" : "")
                           << std::endl;
+                last_decode_start_ = head_abs;
                 last_decode_total_ = total_in_ - (int64_t)buf_.size()
                                    + anchor_u_ + RobustParams::NFFT;
                 if (consume) {
@@ -1654,13 +1794,15 @@ private:
                   ? 10 * std::log10(std::max(snr_acc / snr_rows, value(0.1)))
                   : 0;
         last_mode_ = mode;
-        last_decode_total_ = total_in_;
+        last_decode_start_ = total_in_ - (int64_t)buf_.size() + frame_pos_;
+        last_decode_total_ = total_in_ - (int64_t)buf_.size()
+                           + row_start(RobustParams::nrows(mode));
 
         CODE::Xorshift32 scrambler;
         for (int i = 0; i < RobustParams::data_bytes(mode); ++i)
             out[i] ^= scrambler();
 
-        std::cerr << "RDM" << (narrow_ ? "n" : "") << ": Decoded "
+        if (debug_log) std::cerr << "RDM" << (narrow_ ? "n" : "") << ": Decoded "
                   << ROBUST_MODE_NAMES[(int)mode] << " SNR=" << last_snr_
                   << " dB BER=" << 100 * last_ber_ << "%" << std::endl;
         callback(out, RobustParams::data_bytes(mode));

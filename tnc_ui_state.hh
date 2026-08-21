@@ -198,6 +198,7 @@ struct TNCUIState {
     std::string rigctl_host = "localhost";
     int rigctl_port = 4532;
     std::atomic<bool> rigctl_connected{false};
+    std::atomic<bool> ptt_failed{false};
     std::atomic<bool> audio_connected{true};  // Track audio device health
 
     std::function<std::string(const std::string&)> on_rigctl_command;

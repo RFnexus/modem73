@@ -675,11 +675,20 @@ int main(int argc, char** argv) {
     signal(SIGTERM, signal_handler);
     signal(SIGPIPE, SIG_IGN);
 
-    if (!g_use_ui && cli_config && !config.config_file.empty()) {
-        if (apply_settings_file(config.config_file, config, cli_set)) {
-            std::cerr << "Loaded settings from " << config.config_file << std::endl;
+    if (!g_use_ui) {
+        std::string settings_path;
+        if (cli_config && !config.config_file.empty()) {
+            settings_path = config.config_file;
         } else {
-            std::cerr << "Could not read config file: " << config.config_file << std::endl;
+            const char* home = getenv("HOME");
+            if (home) settings_path = std::string(home) + "/.config/modem73/settings";
+        }
+        if (!settings_path.empty()) {
+            if (apply_settings_file(settings_path, config, cli_set)) {
+                std::cerr << "Loaded settings from " << settings_path << std::endl;
+            } else if (cli_config) {
+                std::cerr << "Could not read config file: " << settings_path << std::endl;
+            }
         }
     }
 
@@ -1115,9 +1124,17 @@ int main(int argc, char** argv) {
         if (config.control_port > 0) {
             ControlPort::TNCInterface ctrl_iface;
 
-            ctrl_iface.get_status = [&tnc]() -> cJSON* {
+            ctrl_iface.get_status = [&tnc, &ui_state]() -> cJSON* {
                 cJSON* j = cJSON_CreateObject();
                 auto stats = tnc.get_decoder_stats();
+                {
+                    TNCConfig c = tnc.get_config();
+                    cJSON_AddNumberToObject(j, "net_bps_estimate",
+                        net_bps_estimate(c.csma_enabled, c.csma_quiet_ms, c.csma_cw,
+                                         c.slot_time_ms, c.csma_burst, c.tx_lead_tone,
+                                         c.tx_delay_ms, ui_state.airtime_seconds,
+                                         ui_state.mtu_bytes));
+                }
 
                 // Channel state
                 const char* state = "idle";

@@ -73,7 +73,9 @@ inline void ui_log(const std::string& msg) {
         g_ui_state->add_log(msg);
     }
 #endif
-    if (g_verbose || !g_use_ui) {
+    if (!g_use_ui) {
+        std::cout << msg << std::endl;
+    } else if (g_verbose) {
         std::cerr << msg << std::endl;
     }
 }
@@ -207,6 +209,8 @@ public:
         robust_encoder_ = std::make_unique<RobustEncoder>();
         robust_decoder_ = std::make_unique<RobustDecoder>(config.center_freq);
         robust_decoder_n_ = std::make_unique<RobustDecoder>(config.center_freq, true);
+        robust_decoder_->debug_log = g_debug;
+        robust_decoder_n_->debug_log = g_debug;
         tone_dcd_ = std::make_unique<ToneDCD>(config.center_freq, config.sample_rate);
 
         std::cerr << "  All encoders/decoders created" << std::endl;
@@ -1343,7 +1347,8 @@ private:
         auto deliver_to_clients = [this](const std::vector<uint8_t>& payload, float snr, float ber_pct, bool was_reassembled,
                                          const std::string& mode = "", std::string callsign = "") {
             last_rx_done_ms_.store(steady_now_ms());
-            ui_log("RX: " + std::to_string(payload.size()) + " bytes, SNR=" +
+            ui_log("RX: " + std::to_string(payload.size()) + " bytes" +
+                   (mode.empty() ? "" : " " + mode) + ", SNR=" +
                    std::to_string((int)snr) + "dB" + (was_reassembled ? " (reassembled)" : ""));
             if (g_verbose) {
                 std::cerr << packet_visualize(payload.data(), payload.size(), false, false) << std::endl;
@@ -1764,6 +1769,21 @@ private:
                         robust_decoder_n_->reset_stats();
                         g_ui_state->last_rx_ber = -1.0f;
                     }
+                    {
+                        auto note = [this](int cur, int& last, const char* what) {
+                            if (cur > last && last >= 0)
+                                ui_log(std::string("RDM: ") + what + " recovered a frame");
+                            last = cur;
+                        };
+                        note(robust_decoder_->stats_backward_rescues, last_bw_, "backward rescue");
+                        note(robust_decoder_n_->stats_backward_rescues, last_bw_n_, "backward rescue");
+                        note(robust_decoder_->stats_ladder_rescues, last_ld_, "retry ladder");
+                        note(robust_decoder_n_->stats_ladder_rescues, last_ld_n_, "retry ladder");
+                        note(robust_decoder_->stats_rescues - robust_decoder_->stats_backward_rescues, last_rescues_, "tail rescue");
+                        note(robust_decoder_n_->stats_rescues - robust_decoder_n_->stats_backward_rescues, last_rescues_n_, "tail rescue");
+                        note(robust_decoder_->stats_retry_success - robust_decoder_->stats_ladder_rescues, last_retries_, "retry decode");
+                        note(robust_decoder_n_->stats_retry_success - robust_decoder_n_->stats_ladder_rescues, last_retries_n_, "retry decode");
+                    }
                     if (config_.modem_type == 2) {
                         auto& rd = RobustParams::is_narrow((RobustMode)config_.robust_mode)
                                  ? robust_decoder_n_ : robust_decoder_;
@@ -1841,6 +1861,7 @@ private:
 #ifdef WITH_UI
         if (g_ui_state) {
             g_ui_state->ptt_on = ptt_state_.load();
+            g_ui_state->ptt_failed = ptt_failed_.load();
         }
 #endif
         return ok;
@@ -1939,6 +1960,14 @@ private:
     std::atomic<bool> rx_running_{false};
     
     Fragmenter fragmenter_;
+    int last_rescues_ = 0;
+    int last_rescues_n_ = 0;
+    int last_retries_ = 0;
+    int last_retries_n_ = 0;
+    int last_bw_ = 0;
+    int last_bw_n_ = 0;
+    int last_ld_ = 0;
+    int last_ld_n_ = 0;
     Reassembler reassembler_;
     
     mutable std::mutex config_mutex_;
@@ -1966,7 +1995,7 @@ private:
     // stage a decay after 60 seconds for our contention window
     static constexpr int64_t CSMA_STAGE_DECAY_MS = 60000;
     static constexpr int YIELD_BUCKETS = 4;
-    static constexpr int64_t PARTICIPATION_MS = 1200000;
+    static constexpr int64_t PARTICIPATION_MS = 720000;
     int yield_attempt_ = 0;
     std::map<uint16_t, int64_t> heard_ids_;
     int64_t last_id_ms_ = -1000000;
@@ -2170,6 +2199,8 @@ public:
             config_.csma_burst = new_config.csma_burst;
             config_.tx_lead_tone = new_config.tx_lead_tone;
             config_.tx_blanking_enabled = new_config.tx_blanking_enabled || new_config.csma_enabled;
+            config_.fragmentation_enabled = new_config.fragmentation_enabled;
+            config_.tx_delay_ms = new_config.tx_delay_ms;
             config_.mfsk_rx_enabled = new_config.mfsk_rx_enabled;
             config_.ofdm_rx_enabled = new_config.ofdm_rx_enabled;
             config_.robust_rx_enabled = new_config.robust_rx_enabled;
