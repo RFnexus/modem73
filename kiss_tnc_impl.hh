@@ -36,6 +36,7 @@
 #include "tone_dcd.hh"
 #include "miniaudio_audio.hh"
 #include "rigctl_ptt.hh"
+#include "hamlib_ptt.hh"
 #include "serial_ptt.hh"
 #ifdef WITH_CM108
 #include "cm108_ptt.hh"
@@ -285,6 +286,20 @@ public:
             if (!rigctl_->connect()) {
                 std::cerr << "Could not connect to rigctl" << std::endl;
             }
+        } else if (config_.ptt_type == PTTType::HAMLIB) {
+#ifdef WITH_HAMLIB
+            hamlib_ptt_ = std::make_unique<HamlibPTT>();
+            std::string err;
+            if (!hamlib_ptt_->open(config_.hamlib_model, config_.hamlib_device, config_.hamlib_baud, err)) {
+                ui_log("(!) Hamlib: " + err);
+                ui_log("(!) PTT will not key the radio - check rig model and device");
+            } else {
+                ui_log("Hamlib: rig model " + std::to_string(config_.hamlib_model) + " opened on " + config_.hamlib_device);
+            }
+#else
+            dummy_ptt_ = std::make_unique<DummyPTT>();
+            dummy_ptt_->connect();
+#endif
         } else if (external_ptt && (config_.ptt_type == PTTType::COM
 #ifdef WITH_CM108
                                     || config_.ptt_type == PTTType::CM108
@@ -394,6 +409,10 @@ public:
                 break;
             case PTTType::VOX:
                 std::cerr << "PTT: VOX " << config_.vox_tone_freq << "Hz" << std::endl;
+                break;
+            case PTTType::HAMLIB:
+                std::cerr << "PTT: hamlib model " << config_.hamlib_model
+                          << " on " << config_.hamlib_device << std::endl;
                 break;
             case PTTType::COM:
                 std::cerr << "PTT: COM " << config_.com_port 
@@ -1142,7 +1161,7 @@ private:
             if (!first && last && config_.ptt_type != PTTType::VOX) {
                 audio_->write_silence(config_.ptt_tail_ms * config_.sample_rate / 1000);
                 audio_->drain_playback();
-                if (config_.ptt_type == PTTType::RIGCTL || config_.ptt_type == PTTType::COM
+                if (config_.ptt_type == PTTType::RIGCTL || config_.ptt_type == PTTType::HAMLIB || config_.ptt_type == PTTType::COM
 #ifdef WITH_CM108
                     || config_.ptt_type == PTTType::CM108
 #endif
@@ -1255,7 +1274,7 @@ private:
             
             if (first) {
                 // PTT on (for RIGCTL or COM mode)
-                if (config_.ptt_type == PTTType::RIGCTL || config_.ptt_type == PTTType::COM
+                if (config_.ptt_type == PTTType::RIGCTL || config_.ptt_type == PTTType::HAMLIB || config_.ptt_type == PTTType::COM
 #ifdef WITH_CM108
                     || config_.ptt_type == PTTType::CM108
 #endif
@@ -1303,7 +1322,7 @@ private:
                 audio_->drain_playback();
 
                 // PTT off
-                if (config_.ptt_type == PTTType::RIGCTL || config_.ptt_type == PTTType::COM
+                if (config_.ptt_type == PTTType::RIGCTL || config_.ptt_type == PTTType::HAMLIB || config_.ptt_type == PTTType::COM
 #ifdef WITH_CM108
                     || config_.ptt_type == PTTType::CM108
 #endif
@@ -1841,6 +1860,10 @@ private:
                                               ) && !serial_ptt_;
         if (want_external) {
             ok = external_ptt(on);
+#ifdef WITH_HAMLIB
+        } else if (hamlib_ptt_) {
+            ok = hamlib_ptt_->set_ptt(on);
+#endif
         } else if (external_ptt && !rigctl_ && !serial_ptt_ && !dummy_ptt_) {
             ok = external_ptt(on);
         } else if (rigctl_) {
@@ -1960,6 +1983,9 @@ private:
 
     std::unique_ptr<MiniAudio> audio_;
     std::unique_ptr<RigctlPTT> rigctl_;
+#ifdef WITH_HAMLIB
+    std::unique_ptr<HamlibPTT> hamlib_ptt_;
+#endif
     std::unique_ptr<SerialPTT> serial_ptt_;
 #ifdef WITH_CM108
     std::unique_ptr<CM108PTT> cm108_ptt_;
@@ -2399,11 +2425,25 @@ public:
 
     std::string rigctl_command(const std::string& cmd) {
         if (rigctl_) return rigctl_->send_command(cmd);
+#ifdef WITH_HAMLIB
+        if (hamlib_ptt_) return hamlib_ptt_->command(cmd);
+#endif
         return "ERR: rigctl not enabled";
     }
 
     bool is_rigctl_connected() const {
         if (rigctl_) return rigctl_->is_connected();
+#ifdef WITH_HAMLIB
+        if (hamlib_ptt_) return hamlib_ptt_->is_connected();
+#endif
+        return false;
+    }
+
+    bool hamlib_get_freq(double& hz) {
+#ifdef WITH_HAMLIB
+        if (hamlib_ptt_) return hamlib_ptt_->get_freq(hz);
+#endif
+        (void)hz;
         return false;
     }
     

@@ -38,16 +38,12 @@ enum class PTTType {
     RIGCTL = 1,
     VOX = 2,
     COM = 3,
-#ifdef WITH_CM108
-    CM108 = 4
-#endif
+    CM108 = 4,
+    HAMLIB = 5
 };
 
 const std::vector<std::string> PTT_TYPE_OPTIONS = {
-    "NONE", "RIGCTL", "VOX", "COM"
-#ifdef WITH_CM108
-    , "CM108"
-#endif
+    "NONE", "RIGCTL", "VOX", "COM", "CM108", "HAMLIB"
 };
 
 const std::vector<std::string> PTT_LINE_OPTIONS = {
@@ -84,6 +80,9 @@ struct TNCConfig {
     PTTType ptt_type = PTTType::RIGCTL;  
     
     // Rigctl settings 
+    int hamlib_model = 0;
+    std::string hamlib_device;
+    int hamlib_baud = 0;
     std::string rigctl_host = "localhost";
     int rigctl_port = 4532;
     

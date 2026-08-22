@@ -48,6 +48,9 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
             if (v >= 0 && v < ROBUST_MODE_COUNT) config.robust_mode = v;
         }
         else if (!strcmp(key, "perf_log") && take(key)) config.perf_log = atoi(value) != 0;
+        else if (!strcmp(key, "hamlib_model") && take(key)) config.hamlib_model = atoi(value);
+        else if (!strcmp(key, "hamlib_device") && take(key)) config.hamlib_device = value;
+        else if (!strcmp(key, "hamlib_baud") && take(key)) config.hamlib_baud = atoi(value);
         else if (!strcmp(key, "modulation") && take(key)) {
             int idx = atoi(value);
             if (idx >= 0 && idx < N_MOD) config.modulation = MOD_OPTS[idx];
@@ -247,6 +250,9 @@ void print_help(const char* prog) {
               << "      --rigctl HOST:PORT  Rigctld address (default: localhost:4532,\n"
               << "                          implies --ptt rigctl)\n"
               << "      --com-port PORT     Serial port for COM PTT (default: /dev/ttyUSB0)\n"
+              << "      --hamlib-model N    Hamlib rig model number for HAMLIB PTT\n"
+              << "      --hamlib-device DEV Serial port or host:port for HAMLIB PTT\n"
+              << "      --hamlib-baud BAUD  Serial speed for HAMLIB PTT (0 = rig default)\n"
               << "      --com-line LINE     COM PTT line: dtr, rts, both, -dtr, -rts, -both\n"
               << "                          (prefix '-' inverts polarity; default: rts)\n"
               << "      --vox-freq HZ       VOX tone frequency (default: 1200)\n"
@@ -466,6 +472,15 @@ int main(int argc, char** argv) {
             } else {
                 config.rigctl_host = hostport;
             }
+        } else if (arg == "--hamlib-model" && i + 1 < argc) {
+            config.hamlib_model = atoi(argv[++i]);
+            cli_set.insert("hamlib_model");
+        } else if (arg == "--hamlib-device" && i + 1 < argc) {
+            config.hamlib_device = argv[++i];
+            cli_set.insert("hamlib_device");
+        } else if (arg == "--hamlib-baud" && i + 1 < argc) {
+            config.hamlib_baud = atoi(argv[++i]);
+            cli_set.insert("hamlib_baud");
         } else if (arg == "--com-port" && i + 1 < argc) {
             config.com_port = argv[++i];
             cli_set.insert("com_port");
@@ -831,6 +846,12 @@ int main(int argc, char** argv) {
                 // COM PTT settings
                 if (!cli_set.count("com_port"))
                     config.com_port = ui_state.com_port;
+                if (!cli_set.count("hamlib_model"))
+                    config.hamlib_model = ui_state.hamlib_model;
+                if (!cli_set.count("hamlib_device"))
+                    config.hamlib_device = ui_state.hamlib_device;
+                if (!cli_set.count("hamlib_baud"))
+                    config.hamlib_baud = ui_state.hamlib_baud;
                 if (!cli_set.count("com_ptt_line"))
                     config.com_ptt_line = ui_state.com_ptt_line;
                 if (!cli_set.count("com_invert_dtr"))
@@ -1402,6 +1423,9 @@ int main(int argc, char** argv) {
                 new_config.beacon_interval_s = state.beacon_interval_s;
                 // COM PTT settings
                 new_config.com_port = state.com_port;
+                new_config.hamlib_model = state.hamlib_model;
+                new_config.hamlib_device = state.hamlib_device;
+                new_config.hamlib_baud = state.hamlib_baud;
                 new_config.com_ptt_line = state.com_ptt_line;
                 new_config.com_invert_dtr = state.com_invert_dtr;
                 new_config.com_invert_rts = state.com_invert_rts;

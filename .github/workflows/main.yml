@@ -201,10 +201,10 @@ jobs:
           if [ -n "${{ matrix.cross_triple }}" ]; then
             apt-get install -y --no-install-recommends $BASE build-essential \
               crossbuild-essential-${{ matrix.arch }} \
-              libncurses-dev:${{ matrix.arch }} libtinfo-dev:${{ matrix.arch }} libhidapi-dev:${{ matrix.arch }}
+              libncurses-dev:${{ matrix.arch }} libtinfo-dev:${{ matrix.arch }} libhidapi-dev:${{ matrix.arch }} libhamlib-dev:${{ matrix.arch }}
           else
             apt-get install -y --no-install-recommends $BASE build-essential g++ \
-              libncurses-dev libhidapi-dev
+              libncurses-dev libhidapi-dev libhamlib-dev
           fi
           gem install --no-document fpm
           command -v fpm || { echo "::error::fpm not on PATH after gem install"; exit 1; }
@@ -233,6 +233,14 @@ jobs:
         run: |
           readelf -d modem73 | grep -q hidapi || {
             echo "::error::binary is not linked against hidapi - CM108 PTT was silently disabled"
+            exit 1
+          }
+
+      - name: Verify Hamlib support is compiled in
+        working-directory: m73
+        run: |
+          readelf -d modem73 | grep -q hamlib || {
+            echo "::error::binary is not linked against hamlib !!! Hamlib PTT was silently disabled"
             exit 1
           }
 
@@ -266,6 +274,7 @@ jobs:
             -d 'libstdc++6' \
             -d 'libncurses6 | libncurses6t64' \
             -d 'libtinfo6 | libtinfo6t64' \
+            -d 'libhamlib4 | libhamlib4t64' \
             $HIDAPI_DEP \
             --deb-no-default-config-files \
             -C ../staging \
@@ -399,12 +408,12 @@ jobs:
         run: |
           if [ "${{ matrix.family }}" = "fedora" ]; then
             dnf -y install gcc gcc-c++ make pkgconf-pkg-config ncurses-devel \
-              rpm-build redhat-rpm-config ruby ruby-devel hidapi-devel
+              rpm-build redhat-rpm-config ruby ruby-devel hidapi-devel hamlib-devel
           else
             zypper -n --gpg-auto-import-keys refresh || true
             zypper -n install \
               gcc gcc-c++ make pkgconf-pkg-config ncurses-devel \
-              rpm-build ruby ruby-devel libhidapi-devel
+              rpm-build ruby ruby-devel libhidapi-devel hamlib-devel
           fi
           gem install --no-document --no-user-install --no-format-executable --bindir /usr/bin fpm
           if ! command -v fpm >/dev/null; then
@@ -436,6 +445,14 @@ jobs:
             exit 1
           }
 
+      - name: Verify Hamlib support is compiled in
+        working-directory: m73
+        run: |
+          readelf -d modem73 | grep -q hamlib || {
+            echo "::error::binary is not linked against hamlib - Hamlib PTT was silently disabled"
+            exit 1
+          }
+
       - name: Stage install tree
         working-directory: m73
         run: |
@@ -460,6 +477,7 @@ jobs:
             -d glibc \
             -d '${{ matrix.dep_cxx }}' \
             -d '${{ matrix.dep_ncurses }}' \
+            -d hamlib \
             $HIDAPI_DEP \
             -C ../staging \
             -p "../modem73_${{ needs.prep.outputs.version }}_${{ matrix.id }}_${{ matrix.arch }}.rpm" \
@@ -518,7 +536,7 @@ jobs:
       - name: Install build dependencies
         run: |
           pacman -S --needed --noconfirm \
-            gcc make pkgconf ncurses hidapi ruby rubygems ruby-erb zstd fakeroot libarchive
+            gcc make pkgconf ncurses hidapi hamlib ruby rubygems ruby-erb zstd fakeroot libarchive
           gem install --no-document --no-user-install --no-format-executable --bindir /usr/bin fpm
           if ! command -v fpm >/dev/null; then
             FOUND="$(ls /usr/bin/fpm* "$(gem environment gemdir)"/bin/fpm* 2>/dev/null | head -1)"
@@ -549,6 +567,14 @@ jobs:
             exit 1
           }
 
+      - name: Verify Hamlib support is compiled in
+        working-directory: m73
+        run: |
+          readelf -d modem73 | grep -q hamlib || {
+            echo "::error::binary is not linked against hamlib - Hamlib PTT was silently disabled"
+            exit 1
+          }
+
       - name: Stage install tree
         working-directory: m73
         run: |
@@ -572,6 +598,7 @@ jobs:
             -d glibc \
             -d gcc-libs \
             -d ncurses \
+            -d hamlib \
             $HIDAPI_DEP \
             -C ../staging \
             -p "../modem73_${{ needs.prep.outputs.version }}_${{ matrix.id }}_${{ matrix.arch }}.pkg.tar.zst" \

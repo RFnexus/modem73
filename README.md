@@ -87,6 +87,13 @@ sudo apt install git build-essential libncurses-dev g++
 #### Optional Addons
 
 
+##### Hamlib PTT
+modem73 can talk to your radio through Hamlib directly instead of going through rigctld. Install libhamlib-dev or your distro equivelant before building and the Makefile picks it up. Then set PTT to HAMLIB under [ CONFIG ], pick your rig model, and point it at the serial port or a network rig as host:port. rigctld still works the same as before if you'd rather keep that.
+
+```bash
+sudo apt install libhamlib-dev
+```
+
 ##### CM108 USB PTT Support
 CM108-based USB audio interfaces have GPIO pins that can be used for PTT control. To enable CM108 support, install libhidapi-dev before building. The Makefile will auto-detect it and enable the feature.
 ```

@@ -239,6 +239,9 @@ struct TNCUIState {
     
     // COM/Serial PTT settings (PTT type 3)
     std::string com_port = "/dev/ttyUSB0";
+    int hamlib_model = 0;
+    std::string hamlib_device;
+    int hamlib_baud = 0;
     int com_ptt_line = 1;       // 0=DTR, 1=RTS, 2=BOTH
     bool com_invert_dtr = false;
     bool com_invert_rts = false;
@@ -765,6 +768,9 @@ struct TNCUIState {
         fprintf(f, "tx_delay_ms=%d\n", tx_delay_ms);
         fprintf(f, "# COM PTT\n");
         fprintf(f, "com_port=%s\n", com_port.c_str());
+        fprintf(f, "hamlib_model=%d\n", hamlib_model);
+        fprintf(f, "hamlib_device=%s\n", hamlib_device.c_str());
+        fprintf(f, "hamlib_baud=%d\n", hamlib_baud);
         fprintf(f, "com_ptt_line=%d\n", com_ptt_line);
         fprintf(f, "com_invert_dtr=%d\n", com_invert_dtr ? 1 : 0);
         fprintf(f, "com_invert_rts=%d\n", com_invert_rts ? 1 : 0);
@@ -895,6 +901,9 @@ struct TNCUIState {
                     if (v >= 50 && v <= 2000) vox_tail_ms = v;
                 }
                 else if (strcmp(key, "com_port") == 0) com_port = value;
+                else if (strcmp(key, "hamlib_model") == 0) hamlib_model = atoi(value);
+                else if (strcmp(key, "hamlib_device") == 0) hamlib_device = value;
+                else if (strcmp(key, "hamlib_baud") == 0) hamlib_baud = atoi(value);
                 else if (strcmp(key, "com_ptt_line") == 0) {
                     int v = atoi(value);
                     if (v >= 0 && v < (int)PTT_LINE_OPTIONS.size()) com_ptt_line = v;

@@ -18,7 +18,7 @@ INCLUDES = -I$(AICODIX_DSP) -I$(AICODIX_CODE) -I$(MODEM_SRC)
 TARGET = modem73
 
 SRCS = kiss_tnc.cc
-HDRS = kiss_tnc.hh kiss_tnc_impl.hh csma.hh tone_dcd.hh miniaudio_audio.hh rigctl_ptt.hh modem.hh phy/mfsk_modem.hh phy/robust_modem.hh phy/common.hh tnc_ui.hh tnc_ui_state.hh control_port.hh
+HDRS = kiss_tnc.hh kiss_tnc_impl.hh csma.hh tone_dcd.hh miniaudio_audio.hh rigctl_ptt.hh hamlib_ptt.hh modem.hh phy/mfsk_modem.hh phy/robust_modem.hh phy/common.hh tnc_ui.hh tnc_ui_state.hh control_port.hh
 OBJS = deps/miniaudio.o deps/cJSON.o
 
 # defualt to build with UI, headless operations through --headless
@@ -38,6 +38,21 @@ else
     CM108_FLAGS =
 endif
 
+# Optional direct Hamlib PTT requires libhamlib-dev
+HAMLIB_CFLAGS := $(shell pkg-config --cflags hamlib 2>/dev/null)
+HAMLIB_LIBS := $(shell pkg-config --libs hamlib 2>/dev/null)
+
+ifneq ($(HAMLIB_LIBS),)
+    $(info Hamlib PTT support: enabled (found hamlib))
+    HAMLIB_FLAGS = -DWITH_HAMLIB
+    CXXFLAGS += $(HAMLIB_CFLAGS)
+    LDFLAGS += $(HAMLIB_LIBS)
+    SRCS += hamlib_ptt.cc
+else
+    $(info Hamlib PTT support: disabled (install libhamlib-dev to enable))
+    HAMLIB_FLAGS =
+endif
+
 .PHONY: all clean install debug help
 
 all: $(TARGET)
@@ -49,7 +64,7 @@ deps/cJSON.o: deps/cJSON.c deps/cJSON.h
 	$(CC) -c -O2 -o $@ deps/cJSON.c
 
 $(TARGET): $(SRCS) $(HDRS) $(OBJS)
-	$(CXX) $(CXXFLAGS) $(UI_FLAGS) $(CM108_FLAGS) $(INCLUDES) -o $@ $(SRCS) $(OBJS) $(LDFLAGS)
+	$(CXX) $(CXXFLAGS) $(UI_FLAGS) $(CM108_FLAGS) $(HAMLIB_FLAGS) $(INCLUDES) -o $@ $(SRCS) $(OBJS) $(LDFLAGS)
 ifneq ($(HIDAPI_LIBS),)
 	@echo ""
 	@echo "CM108 PTT support enabled. To allow non-root access, install udev rules:"
@@ -117,6 +132,7 @@ help:
 	@echo ""
 	@echo "Optional features:"
 	@echo "  CM108 PTT    - Requires libhidapi-dev (auto-detected)"
+	@echo "  Hamlib PTT   - Requires libhamlib-dev (auto-detected)"
 	@echo ""
 	@echo "Example:"
 	@echo "  make"

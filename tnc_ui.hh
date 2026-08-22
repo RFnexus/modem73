@@ -151,6 +151,9 @@ private:
         FIELD_COM_PORT,
         FIELD_COM_LINE,
         FIELD_COM_INVERT,
+        FIELD_HAMLIB_MODEL,
+        FIELD_HAMLIB_DEVICE,
+        FIELD_HAMLIB_BAUD,
 #ifdef WITH_CM108
         FIELD_CM108_GPIO,
         FIELD_CM108_DEVICE,
@@ -409,6 +412,12 @@ private:
 
                         edit_text_field(FIELD_NET_PORT);
 
+                    } else if (current_field_ == FIELD_HAMLIB_MODEL) {
+                        show_hamlib_model_dialog();
+                    } else if (current_field_ == FIELD_HAMLIB_DEVICE) {
+                        edit_text_field(FIELD_HAMLIB_DEVICE);
+                    } else if (current_field_ == FIELD_HAMLIB_BAUD) {
+                        adjust_field(1);
                     } else if (current_field_ == FIELD_LAN_MODE) {
                         adjust_field(1);
                     } else if (current_field_ == FIELD_CONTROL_PORT) {
@@ -715,6 +724,8 @@ private:
 
         if (field == FIELD_CALLSIGN) {
             max_len = 9;
+        } else if (field == FIELD_HAMLIB_DEVICE) {
+            max_len = 40;
         } else if (field == FIELD_COM_PORT) {
             max_len = 20;
 #ifdef WITH_CM108
@@ -750,6 +761,8 @@ private:
                 }
                 state_.callsign = buf;
                 apply_settings();
+            } else if (field == FIELD_HAMLIB_DEVICE) {
+                state_.hamlib_device = buf;
             } else if (field == FIELD_COM_PORT) {
                 state_.com_port = buf;
                 state_.add_log("(!) COM port changed, restart required");
@@ -979,6 +992,10 @@ private:
                 return true;
             }
         }
+        if (state_.ptt_type_index != 5) {
+            if (field == FIELD_HAMLIB_MODEL || field == FIELD_HAMLIB_DEVICE || field == FIELD_HAMLIB_BAUD)
+                return true;
+        }
 #ifdef WITH_CM108
         if (state_.ptt_type_index != 4) {  // not CM108
             if (field == FIELD_CM108_GPIO || field == FIELD_CM108_DEVICE) {
@@ -1131,6 +1148,14 @@ private:
             if (field == FIELD_COM_INVERT) return row;
             row++;
         }
+        if (state_.ptt_type_index == 5) {
+            if (field == FIELD_HAMLIB_MODEL) return row;
+            row++;
+            if (field == FIELD_HAMLIB_DEVICE) return row;
+            row++;
+            if (field == FIELD_HAMLIB_BAUD) return row;
+            row++;
+        }
 #ifdef WITH_CM108
         if (state_.ptt_type_index == 4) {
             if (field == FIELD_CM108_GPIO) return row;
@@ -1222,6 +1247,14 @@ private:
             case FIELD_POSTAMBLE:
                 state_.postamble = !state_.postamble;
                 break;
+            case FIELD_HAMLIB_BAUD: {
+                static const int bauds[] = {0, 4800, 9600, 19200, 38400, 57600, 115200};
+                int n = (int)(sizeof(bauds) / sizeof(bauds[0]));
+                int cur = 0;
+                for (int i = 0; i < n; i++) if (bauds[i] == state_.hamlib_baud) cur = i;
+                state_.hamlib_baud = bauds[(cur + delta + n) % n];
+                break;
+            }
             case FIELD_LAN_MODE: {
                 bool lan = state_.bind_address == "0.0.0.0" &&
                            state_.control_bind_address == "0.0.0.0";
@@ -1389,6 +1422,107 @@ private:
         state_.save_settings();
     }
     
+    struct HamlibModel { int id; std::string label; };
+
+    const std::vector<HamlibModel>& hamlib_models() {
+        static std::vector<HamlibModel> models;
+        static bool loaded = false;
+        if (!loaded) {
+            loaded = true;
+#ifdef WITH_HAMLIB
+            std::string raw = hamlib_list_models();
+            size_t pos = 0;
+            while (pos < raw.size()) {
+                size_t e = raw.find('\n', pos);
+                if (e == std::string::npos) e = raw.size();
+                std::string line = raw.substr(pos, e - pos);
+                pos = e + 1;
+                size_t a = line.find('|'), b = line.rfind('|');
+                if (a == std::string::npos || b == a) continue;
+                models.push_back({atoi(line.substr(0, a).c_str()),
+                                  line.substr(a + 1, b - a - 1) + " " + line.substr(b + 1)});
+            }
+            std::sort(models.begin(), models.end(),
+                      [](const HamlibModel& x, const HamlibModel& y) { return x.label < y.label; });
+#endif
+        }
+        return models;
+    }
+
+    std::string hamlib_model_label(int id) {
+        for (const auto& m : hamlib_models())
+            if (m.id == id) return m.label;
+        return "model " + std::to_string(id);
+    }
+
+    void show_hamlib_model_dialog() {
+        const auto& models = hamlib_models();
+        if (models.empty()) {
+            state_.add_log("Hamlib: no rig list (built without Hamlib?)");
+            return;
+        }
+        int rows, cols;
+        getmaxyx(stdscr, rows, cols);
+        int dialog_w = std::min(cols - 4, 50);
+        int dialog_h = std::min(rows - 4, 20);
+        int dialog_x = (cols - dialog_w) / 2;
+        int dialog_y = (rows - dialog_h) / 2;
+        int visible = dialog_h - 4;
+        std::string filter;
+        int selection = 0, scroll = 0;
+        nodelay(stdscr, FALSE);
+        while (true) {
+            std::vector<int> shown;
+            for (int i = 0; i < (int)models.size(); i++) {
+                if (filter.empty()) { shown.push_back(i); continue; }
+                std::string l = models[i].label, f = filter;
+                for (auto& c : l) c = (char)tolower((unsigned char)c);
+                for (auto& c : f) c = (char)tolower((unsigned char)c);
+                if (l.find(f) != std::string::npos) shown.push_back(i);
+            }
+            if (selection >= (int)shown.size()) selection = std::max(0, (int)shown.size() - 1);
+            if (selection < scroll) scroll = selection;
+            if (selection >= scroll + visible) scroll = selection - visible + 1;
+            for (int y = dialog_y; y < dialog_y + dialog_h; y++) {
+                move(y, dialog_x);
+                for (int x = 0; x < dialog_w; x++) addch(' ');
+            }
+            attron(COLOR_PAIR(4) | A_BOLD);
+            draw_box(dialog_y, dialog_x, dialog_h, dialog_w);
+            mvaddstr(dialog_y, dialog_x + 2, " Hamlib Rig ");
+            attroff(COLOR_PAIR(4) | A_BOLD);
+            mvaddnstr(dialog_y + 1, dialog_x + 2, ("Filter: " + filter).c_str(), dialog_w - 4);
+            for (int i = 0; i < visible && scroll + i < (int)shown.size(); i++) {
+                const auto& m = models[shown[scroll + i]];
+                int y = dialog_y + 2 + i;
+                bool sel = scroll + i == selection;
+                if (sel) attron(COLOR_PAIR(4) | A_BOLD);
+                std::string line = (sel ? "> " : "  ") + std::to_string(m.id) + " " + m.label;
+                mvaddnstr(y, dialog_x + 1, line.c_str(), dialog_w - 2);
+                if (sel) attroff(COLOR_PAIR(4) | A_BOLD);
+            }
+            attron(A_DIM);
+            mvaddstr(dialog_y + dialog_h - 1, dialog_x + 2, " type to filter  Enter=OK  Esc=Cancel ");
+            attroff(A_DIM);
+            refresh();
+            int ch = getch();
+            if (ch == 27) break;
+            if ((ch == '\n' || ch == KEY_ENTER) && !shown.empty()) {
+                state_.hamlib_model = models[shown[selection]].id;
+                state_.add_log("Hamlib rig: " + models[shown[selection]].label + " (restart to apply)");
+                apply_settings();
+                break;
+            }
+            if (ch == KEY_UP && selection > 0) selection--;
+            else if (ch == KEY_DOWN && selection + 1 < (int)shown.size()) selection++;
+            else if (ch == KEY_NPAGE) selection = std::min((int)shown.size() - 1, selection + visible);
+            else if (ch == KEY_PPAGE) selection = std::max(0, selection - visible);
+            else if ((ch == KEY_BACKSPACE || ch == 127 || ch == 8) && !filter.empty()) filter.pop_back();
+            else if (ch >= 32 && ch < 127 && filter.size() < 30) { filter += (char)ch; selection = 0; }
+        }
+        nodelay(stdscr, TRUE);
+    }
+
     void show_ptt_type_dialog() {
         int rows, cols;
         getmaxyx(stdscr, rows, cols);
@@ -1398,14 +1532,19 @@ private:
             "RIGCTL - Hamlib rigctld (network)",
             "VOX    - Tone-keyed VOX",
             "COM    - Serial port DTR/RTS",
-#ifdef WITH_CM108
             "CM108  - USB HID GPIO",
-#endif
+            "HAMLIB - Hamlib direct (serial or network rig)",
         };
-        int count = (int)PTT_TYPE_OPTIONS.size();
-
-        int selection = state_.ptt_type_index;
-        if (selection < 0 || selection >= count) selection = 0;
+        std::vector<int> items = {0, 1, 2, 3};
+#ifdef WITH_CM108
+        items.push_back(4);
+#endif
+#ifdef WITH_HAMLIB
+        items.push_back(5);
+#endif
+        int count = (int)items.size();
+        int selection = 0;
+        for (int i = 0; i < count; i++) if (items[i] == state_.ptt_type_index) selection = i;
 
         int dialog_w = std::min(cols - 4, 42);
         int dialog_h = count + 3;
@@ -1437,8 +1576,9 @@ private:
                     mvaddstr(y, dialog_x + 1, "  ");
                 }
 
-                std::string desc = (i < (int)(sizeof(descriptions) / sizeof(descriptions[0]))) ?
-                    descriptions[i] : PTT_TYPE_OPTIONS[i];
+                int idx = items[i];
+                std::string desc = (idx < (int)(sizeof(descriptions) / sizeof(descriptions[0]))) ?
+                    descriptions[idx] : PTT_TYPE_OPTIONS[idx];
                 int max_len = dialog_w - 4;
                 if ((int)desc.length() > max_len) {
                     desc = desc.substr(0, max_len - 2) + "..";
@@ -1461,9 +1601,9 @@ private:
             if (ch == 27 || ch == 'q') {
                 break;
             } else if (ch == '\n' || ch == KEY_ENTER) {
-                if (selection != state_.ptt_type_index) {
-                    state_.ptt_type_index = selection;
-                    state_.add_log("PTT: " + PTT_TYPE_OPTIONS[selection]);
+                if (items[selection] != state_.ptt_type_index) {
+                    state_.ptt_type_index = items[selection];
+                    state_.add_log("PTT: " + PTT_TYPE_OPTIONS[items[selection]]);
                     apply_settings();
                 }
                 break;
@@ -3337,6 +3477,26 @@ private:
                 }
                 draw_selector_field(dy, c1, c2, "Invert", FIELD_COM_INVERT, invert_str);
             }
+            row++;
+        }
+        if (state_.ptt_type_index == 5) {
+            dy = visible_y(row);
+            if (dy >= 0) {
+                std::string m = state_.hamlib_model > 0 ? hamlib_model_label(state_.hamlib_model) : "select";
+                if (m.length() > 22) m = m.substr(0, 21) + "~";
+                draw_field(dy, c1, c2, "Rig", FIELD_HAMLIB_MODEL, m, true);
+            }
+            row++;
+            dy = visible_y(row);
+            if (dy >= 0) {
+                std::string d = state_.hamlib_device.empty() ? "none" : state_.hamlib_device;
+                if (d.length() > 22) d = d.substr(0, 21) + "~";
+                draw_field(dy, c1, c2, "Rig Device", FIELD_HAMLIB_DEVICE, d, true);
+            }
+            row++;
+            dy = visible_y(row);
+            if (dy >= 0) draw_selector_field(dy, c1, c2, "Rig Baud", FIELD_HAMLIB_BAUD,
+                                             state_.hamlib_baud > 0 ? std::to_string(state_.hamlib_baud) : std::string("default"));
             row++;
         }
 #ifdef WITH_CM108
