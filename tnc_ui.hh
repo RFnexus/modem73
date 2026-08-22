@@ -178,8 +178,15 @@ private:
         RIG_FIELD_COUNT
     };
 
+    bool rig_ui() const {
+#ifdef WITH_HAMLIB
+        if (state_.ptt_type_index == 5) return true;
+#endif
+        return state_.ptt_type_index == 1;
+    }
+
     int tab_count() const {
-        return state_.ptt_type_index == 1 ? 6 : 5;
+        return rig_ui() ? 6 : 5;
     }
 
     bool rig_should_skip(int field) const {
@@ -415,7 +422,7 @@ private:
                     } else if (current_field_ == FIELD_HAMLIB_MODEL) {
                         show_hamlib_model_dialog();
                     } else if (current_field_ == FIELD_HAMLIB_DEVICE) {
-                        edit_text_field(FIELD_HAMLIB_DEVICE);
+                        show_serial_port_dialog(FIELD_HAMLIB_DEVICE);
                     } else if (current_field_ == FIELD_HAMLIB_BAUD) {
                         adjust_field(1);
                     } else if (current_field_ == FIELD_LAN_MODE) {
@@ -725,7 +732,9 @@ private:
         if (field == FIELD_CALLSIGN) {
             max_len = 9;
         } else if (field == FIELD_HAMLIB_DEVICE) {
-            max_len = 40;
+            int rows, cols;
+            getmaxyx(stdscr, rows, cols);
+            max_len = std::max(20, std::min(40, cols / 2 - 2 - col - 1));
         } else if (field == FIELD_COM_PORT) {
             max_len = 20;
 #ifdef WITH_CM108
@@ -762,7 +771,11 @@ private:
                 state_.callsign = buf;
                 apply_settings();
             } else if (field == FIELD_HAMLIB_DEVICE) {
-                state_.hamlib_device = buf;
+                if (state_.hamlib_device != buf) {
+                    state_.hamlib_device = buf;
+                    state_.add_log("(!) Rig device changed, restart required");
+                    apply_settings();
+                }
             } else if (field == FIELD_COM_PORT) {
                 state_.com_port = buf;
                 state_.add_log("(!) COM port changed, restart required");
@@ -981,7 +994,7 @@ private:
         if (state_.modem_type_index != 2 &&
             (field == FIELD_ROBUST_MODE || field == FIELD_ROBUST_MTU)) return true;
         // RIGCTL has its own TX Drive on the RIG tab, so don't offer it twice
-        if (state_.ptt_type_index == 1 && field == FIELD_TX_LEVEL) return true;
+        if (rig_ui() && field == FIELD_TX_LEVEL) return true;
         if (state_.ptt_type_index != 2) {  // not VOX
             if (field == FIELD_VOX_FREQ || field == FIELD_VOX_LEAD || field == FIELD_VOX_TAIL) {
                 return true;
@@ -1618,6 +1631,12 @@ private:
     }
 
     void show_com_port_dialog() {
+        show_serial_port_dialog(FIELD_COM_PORT);
+    }
+
+    void show_serial_port_dialog(int field) {
+        bool hamlib = (field == FIELD_HAMLIB_DEVICE);
+        std::string& target = hamlib ? state_.hamlib_device : state_.com_port;
         std::vector<std::string> ports;
         std::vector<std::string> labels;
         const char* patterns[] = {"/dev/serial/by-id/*", "/dev/ttyUSB*", "/dev/ttyACM*"};
@@ -1632,7 +1651,7 @@ private:
             globfree(&g);
         }
         ports.push_back("");
-        labels.push_back("[ Type manually ]");
+        labels.push_back(hamlib ? "[ Type manually / host:port ]" : "[ Type manually ]");
 
         int rows, cols;
         getmaxyx(stdscr, rows, cols);
@@ -1644,7 +1663,7 @@ private:
 
         int selection = 0;
         for (size_t i = 0; i < ports.size(); i++) {
-            if (ports[i] == state_.com_port) { selection = i; break; }
+            if (ports[i] == target) { selection = i; break; }
         }
         int scroll_offset = 0;
         if (selection >= max_visible) scroll_offset = selection - max_visible + 1;
@@ -1659,7 +1678,7 @@ private:
             }
             attron(COLOR_PAIR(4) | A_BOLD);
             draw_box(dialog_y, dialog_x, dialog_h, dialog_w);
-            const char* title = " Serial Port ";
+            const char* title = hamlib ? " Rig Device " : " Serial Port ";
             mvaddstr(dialog_y, dialog_x + (dialog_w - strlen(title)) / 2, title);
             attroff(COLOR_PAIR(4) | A_BOLD);
 
@@ -1699,9 +1718,10 @@ private:
                 if (selection >= 0 && selection < (int)ports.size()) {
                     if (ports[selection].empty()) {
                         manual = true;
-                    } else {
-                        state_.com_port = ports[selection];
-                        state_.add_log("(!) COM port changed, restart required");
+                    } else if (ports[selection] != target) {
+                        target = ports[selection];
+                        state_.add_log(hamlib ? "(!) Rig device changed, restart required"
+                                              : "(!) COM port changed, restart required");
                         apply_settings();
                     }
                 }
@@ -1721,7 +1741,7 @@ private:
         }
 
         nodelay(stdscr, TRUE);
-        if (manual) edit_text_field(FIELD_COM_PORT);
+        if (manual) edit_text_field(field);
     }
 
     void show_device_select_dialog(bool is_input) {
@@ -3383,7 +3403,7 @@ private:
 
         dy = visible_y(row);
         if (dy >= 0) {
-            if (state_.ptt_type_index != 1) {
+            if (!rig_ui()) {
                 char lvl_buf[24];
                 snprintf(lvl_buf, sizeof(lvl_buf), "%d%%",
                          (int)lround(state_.tx_drive.load() * 100));
@@ -3407,7 +3427,7 @@ private:
             draw_field(dy, c1, c2, "PTT", FIELD_PTT_TYPE,
                        PTT_TYPE_OPTIONS[state_.ptt_type_index], true);
             bool ptt_err = state_.ptt_failed.load() ||
-                           (state_.ptt_type_index == 1 && !state_.rigctl_connected.load());
+                           (rig_ui() && !state_.rigctl_connected.load());
             if (ptt_err) {
                 if (current_field_ != FIELD_PTT_TYPE) {
                     attron(COLOR_PAIR(2) | A_BOLD);
@@ -3729,7 +3749,7 @@ private:
         
         mvaddstr(y, c3, "PTT: ");
         addstr(PTT_TYPE_OPTIONS[state_.ptt_type_index].c_str());
-        if (state_.ptt_type_index == 1) {  // RIGCTL
+        if (rig_ui()) {
             if (state_.rigctl_connected.load()) {
                 attron(COLOR_PAIR(1) | A_BOLD);
                 addstr(" OK");
@@ -5408,7 +5428,10 @@ private:
         mvaddstr(y, c1, "[ RIG CONTROL ]");
         attroff(COLOR_PAIR(4) | A_BOLD);
         attron(A_DIM);
-        printw("  rigctld %s:%d", state_.rigctl_host.c_str(), state_.rigctl_port);
+        if (state_.ptt_type_index == 1)
+            printw("  rigctld %s:%d", state_.rigctl_host.c_str(), state_.rigctl_port);
+        else
+            printw("  hamlib %s", hamlib_model_label(state_.hamlib_model).c_str());
         attroff(A_DIM);
         if (state_.rigctl_connected.load()) {
             attron(COLOR_PAIR(1) | A_BOLD);

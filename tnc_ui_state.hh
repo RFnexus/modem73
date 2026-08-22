@@ -882,7 +882,7 @@ struct TNCUIState {
                 }
                 else if (strcmp(key, "ptt_type") == 0) {
                     int v = atoi(value);
-                    if (v >= 0 && v < (int)PTT_TYPE_OPTIONS.size()) ptt_type_index = v;
+                    if (v >= 0 && v < (int)PTT_TYPE_OPTIONS.size()) ptt_type_index = ptt_type_available(v);
                 }
                 else if (strcmp(key, "vox_tone_freq") == 0) {
                     int v = atoi(value);
@@ -1023,7 +1023,7 @@ struct TNCUIState {
                 p.slot_time_ms = slot;
                 p.p_persistence = persist;
 
-                p.ptt_type_index = (n >= 10) ? clampi(ptt_type, 0, (int)PTT_TYPE_OPTIONS.size() - 1) : 1;
+                p.ptt_type_index = (n >= 10) ? ptt_type_available(clampi(ptt_type, 0, (int)PTT_TYPE_OPTIONS.size() - 1)) : 1;
                 p.vox_tone_freq = (n >= 11 && vox_freq >= 300 && vox_freq <= 3000) ? vox_freq : 1200;
                 p.vox_lead_ms = (n >= 12) ? clampi(vox_lead, 50, 2000) : 150;
                 p.vox_tail_ms = (n >= 13) ? clampi(vox_tail, 50, 2000) : 100;

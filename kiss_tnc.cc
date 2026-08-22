@@ -99,7 +99,7 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
             if (take("audio_input")) config.audio_input_device = value;
             if (take("audio_output")) config.audio_output_device = value;
         }
-        else if (!strcmp(key, "ptt_type") && take(key)) config.ptt_type = static_cast<PTTType>(atoi(value));
+        else if (!strcmp(key, "ptt_type") && take(key)) config.ptt_type = static_cast<PTTType>(ptt_type_available(atoi(value)));
         else if (!strcmp(key, "vox_tone_freq") && take(key)) {
             int v = atoi(value);
             if (v >= 300 && v <= 3000) config.vox_tone_freq = v;
@@ -935,6 +935,9 @@ int main(int argc, char** argv) {
                 ui_state.beacon_interval_s = config.beacon_interval_s;
                 // COM PTT settings
                 ui_state.com_port = config.com_port;
+                ui_state.hamlib_model = config.hamlib_model;
+                ui_state.hamlib_device = config.hamlib_device;
+                ui_state.hamlib_baud = config.hamlib_baud;
                 ui_state.com_ptt_line = config.com_ptt_line;
                 ui_state.com_invert_dtr = config.com_invert_dtr;
                 ui_state.com_invert_rts = config.com_invert_rts;
@@ -991,6 +994,9 @@ int main(int argc, char** argv) {
         ui_state.audio_input_device = config.audio_input_device;
         ui_state.audio_output_device = config.audio_output_device;
         ui_state.com_port = config.com_port;
+        ui_state.hamlib_model = config.hamlib_model;
+        ui_state.hamlib_device = config.hamlib_device;
+        ui_state.hamlib_baud = config.hamlib_baud;
         ui_state.com_ptt_line = config.com_ptt_line;
         ui_state.com_invert_dtr = config.com_invert_dtr;
         ui_state.com_invert_rts = config.com_invert_rts;

@@ -46,6 +46,13 @@ const std::vector<std::string> PTT_TYPE_OPTIONS = {
     "NONE", "RIGCTL", "VOX", "COM", "CM108", "HAMLIB"
 };
 
+inline int ptt_type_available(int v) {
+#ifndef WITH_HAMLIB
+    if (v == static_cast<int>(PTTType::HAMLIB)) return static_cast<int>(PTTType::NONE);
+#endif
+    return v;
+}
+
 const std::vector<std::string> PTT_LINE_OPTIONS = {
     "DTR", "RTS", "BOTH"
 };
