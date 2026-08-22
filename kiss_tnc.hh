@@ -50,6 +50,9 @@ inline int ptt_type_available(int v) {
 #ifndef WITH_HAMLIB
     if (v == static_cast<int>(PTTType::HAMLIB)) return static_cast<int>(PTTType::NONE);
 #endif
+#ifndef WITH_CM108
+    if (v == static_cast<int>(PTTType::CM108)) return static_cast<int>(PTTType::NONE);
+#endif
     return v;
 }
 

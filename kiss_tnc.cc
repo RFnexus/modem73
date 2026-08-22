@@ -246,13 +246,18 @@ void print_help(const char* prog) {
 #ifdef WITH_CM108
               << ", cm108"
 #endif
+#ifdef WITH_HAMLIB
+              << ", hamlib"
+#endif
               << " (default: rigctl)\n"
               << "      --rigctl HOST:PORT  Rigctld address (default: localhost:4532,\n"
               << "                          implies --ptt rigctl)\n"
               << "      --com-port PORT     Serial port for COM PTT (default: /dev/ttyUSB0)\n"
+#ifdef WITH_HAMLIB
               << "      --hamlib-model N    Hamlib rig model number for HAMLIB PTT\n"
               << "      --hamlib-device DEV Serial port or host:port for HAMLIB PTT\n"
               << "      --hamlib-baud BAUD  Serial speed for HAMLIB PTT (0 = rig default)\n"
+#endif
               << "      --com-line LINE     COM PTT line: dtr, rts, both, -dtr, -rts, -both\n"
               << "                          (prefix '-' inverts polarity; default: rts)\n"
               << "      --vox-freq HZ       VOX tone frequency (default: 1200)\n"
@@ -528,10 +533,16 @@ int main(int argc, char** argv) {
 #ifdef WITH_CM108
             else if (ptt_type == "cm108") config.ptt_type = PTTType::CM108;
 #endif
+#ifdef WITH_HAMLIB
+            else if (ptt_type == "hamlib") config.ptt_type = PTTType::HAMLIB;
+#endif
             else {
                 std::cerr << "Unknown PTT type: " << ptt_type << " (use none, rigctl, vox, com"
 #ifdef WITH_CM108
                           << ", cm108"
+#endif
+#ifdef WITH_HAMLIB
+                          << ", hamlib"
 #endif
                           << ")\n";
                 return 1;

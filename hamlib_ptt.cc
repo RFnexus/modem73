@@ -57,6 +57,21 @@ std::string hamlib_list_models() {
 
 }
 
+static std::string hamlib_err(int rc) {
+    switch (-rc) {
+        case RIG_ETIMEOUT: return "timeout, no reply from rig";
+        case RIG_EIO: return "IO error opening the device";
+        case RIG_EINVAL: return "invalid parameter";
+        case RIG_ECONF: return "invalid configuration";
+        case RIG_ENAVAIL: return "not available on this rig";
+        case RIG_EPROTO: return "protocol error";
+        case RIG_ENIMPL: return "not implemented for this rig";
+        case RIG_ERJCTED: return "command rejected by rig";
+        case RIG_EINTERNAL: return "hamlib internal error";
+        default: return "hamlib error " + std::to_string(rc);
+    }
+}
+
 static std::string rprt(int rc) {
 
     return "RPRT " + std::to_string(rc) + "\n";
@@ -213,7 +228,7 @@ bool HamlibPTT::open(int model, const std::string& device, int baud, std::string
 
     if (rc != RIG_OK) {
 
-        err = rigerror(rc);
+        err = hamlib_err(rc) + " (" + device + ")";
         rig_cleanup(rig);
         return false;
 
@@ -229,8 +244,8 @@ bool HamlibPTT::set_ptt(bool on) {
     if (!rig_) return false;
     int rc = rig_set_ptt(static_cast<RIG*>(rig_), RIG_VFO_CURR, on ? RIG_PTT_ON : RIG_PTT_OFF);
     if (rc != RIG_OK) {
-        fprintf(stderr, "hamlib: set_ptt %d failed: %s\n", on ? 1 : 0, rigerror(rc));
-        last_error_ = rigerror(rc);
+        last_error_ = hamlib_err(rc);
+        fprintf(stderr, "hamlib: set_ptt %d failed: %s\n", on ? 1 : 0, last_error_.c_str());
         return false;
     }
     return true;

@@ -732,9 +732,7 @@ private:
         if (field == FIELD_CALLSIGN) {
             max_len = 9;
         } else if (field == FIELD_HAMLIB_DEVICE) {
-            int rows, cols;
-            getmaxyx(stdscr, rows, cols);
-            max_len = std::max(20, std::min(40, cols / 2 - 2 - col - 1));
+            max_len = std::max(20, std::min(40, getmaxx(stdscr) / 2 - 2 - col - 1));
         } else if (field == FIELD_COM_PORT) {
             max_len = 20;
 #ifdef WITH_CM108

@@ -418,11 +418,13 @@ public:
                 std::cerr << "PTT: COM " << config_.com_port 
                           << " (" << PTT_LINE_OPTIONS[config_.com_ptt_line] << ")" << std::endl;
                 break;
-#ifdef WITH_CM108
             case PTTType::CM108:
+#ifdef WITH_CM108
                 std::cerr << "PTT: CM108 (GPIO" << config_.cm108_gpio << ")" << std::endl;
-                break;
+#else
+                std::cerr << "PTT: CM108 not available in this build" << std::endl;
 #endif
+                break;
         }
         
         // Start threads

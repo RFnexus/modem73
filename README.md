@@ -88,7 +88,7 @@ sudo apt install git build-essential libncurses-dev g++
 
 
 ##### Hamlib PTT
-modem73 can talk to your radio through Hamlib directly instead of going through rigctld. Install libhamlib-dev or your distro equivelant before building and the Makefile picks it up. Then set PTT to HAMLIB under [ CONFIG ], pick your rig model, and point it at the serial port or a network rig as host:port. rigctld still works the same as before if you'd rather keep that.
+modem73 can talk to your radio through Hamlib directly instead of going through rigctld. Install libhamlib-dev or your distro equivalent before building and the Makefile picks it up. Then set PTT to HAMLIB under [ CONFIG ], pick your rig model, and point it at the serial port or a network rig as host:port. rigctld still works the same as before if you'd rather keep that.
 
 ```bash
 sudo apt install libhamlib-dev

@@ -334,6 +334,7 @@ jobs:
             dep_ncurses: ncurses-libs
             dep_cxx: libstdc++
             dep_hidapi: hidapi
+            dep_hamlib: hamlib
           - id: fedora-43
             container: fedora:43
             family: fedora
@@ -345,6 +346,7 @@ jobs:
             dep_ncurses: ncurses-libs
             dep_cxx: libstdc++
             dep_hidapi: hidapi
+            dep_hamlib: hamlib
           - id: fedora-44
             container: fedora:44
             family: fedora
@@ -356,6 +358,7 @@ jobs:
             dep_ncurses: ncurses-libs
             dep_cxx: libstdc++
             dep_hidapi: hidapi
+            dep_hamlib: hamlib
           - id: fedora-44
             container: fedora:44
             family: fedora
@@ -367,6 +370,7 @@ jobs:
             dep_ncurses: ncurses-libs
             dep_cxx: libstdc++
             dep_hidapi: hidapi
+            dep_hamlib: hamlib
           - id: opensuse-leap-16.0
             container: opensuse/leap:16.0
             family: suse
@@ -378,6 +382,7 @@ jobs:
             dep_ncurses: libncurses6
             dep_cxx: libstdc++6
             dep_hidapi: libhidapi-hidraw0
+            dep_hamlib: libhamlib4
           - id: opensuse-leap-16.0
             container: opensuse/leap:16.0
             family: suse
@@ -389,6 +394,7 @@ jobs:
             dep_ncurses: libncurses6
             dep_cxx: libstdc++6
             dep_hidapi: libhidapi-hidraw0
+            dep_hamlib: libhamlib4
 
     steps:
       - name: Bootstrap container
@@ -477,7 +483,7 @@ jobs:
             -d glibc \
             -d '${{ matrix.dep_cxx }}' \
             -d '${{ matrix.dep_ncurses }}' \
-            -d hamlib \
+            -d '${{ matrix.dep_hamlib }}' \
             $HIDAPI_DEP \
             -C ../staging \
             -p "../modem73_${{ needs.prep.outputs.version }}_${{ matrix.id }}_${{ matrix.arch }}.rpm" \
