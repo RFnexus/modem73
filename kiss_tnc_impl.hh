@@ -1095,6 +1095,9 @@ private:
             size_t cap = payload_size_;
             if (config_.modem_type == 0 && oper_mode_override >= 0)
                 cap = encoder_->get_payload_size(oper_mode_override);
+            else if (config_.modem_type == 2 && oper_mode_override >= 0 &&
+                     oper_mode_override < ROBUST_MODE_COUNT)
+                cap = robust_encoder_->get_payload_size((RobustMode)oper_mode_override);
             if (cap < 2 || data.size() > cap - 2) {
                 ui_log("(!) TX: " + std::to_string(data.size()) + " byte frame exceeds " +
                        std::to_string(cap >= 2 ? cap - 2 : 0) + " byte capacity of current mode, dropped");
