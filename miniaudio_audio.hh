@@ -411,6 +411,10 @@ private:
         config.pUserData = this;
         config.periodSizeInFrames = 480;
         config.periods = 4;
+#ifdef __ANDROID__
+        config.aaudio.inputPreset = ma_aaudio_input_preset_unprocessed;
+        config.performanceProfile = ma_performance_profile_conservative;
+#endif
 
         if (capture_device_id_ != "default" && !capture_device_id_.empty()) {
             if (find_device_id(true, capture_device_id_, &stored_capture_id_)) {

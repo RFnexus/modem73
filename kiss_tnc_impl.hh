@@ -1090,6 +1090,17 @@ private:
 #endif
 
         // Add length prefix framing
+        bool data_oversize = false;
+        {
+            size_t cap = payload_size_;
+            if (config_.modem_type == 0 && oper_mode_override >= 0)
+                cap = encoder_->get_payload_size(oper_mode_override);
+            if (cap < 2 || data.size() > cap - 2) {
+                ui_log("(!) TX: " + std::to_string(data.size()) + " byte frame exceeds " +
+                       std::to_string(cap >= 2 ? cap - 2 : 0) + " byte capacity of current mode, dropped");
+                data_oversize = true;
+            }
+        }
         auto framed_data = frame_with_length(data);
 
         // Encode to audio
@@ -1122,8 +1133,9 @@ private:
             );
         }
         
+        if (data_oversize) samples.clear();
         if (samples.empty() && !beacon) {
-            ui_log("TX: Encoding failed");
+            if (!data_oversize) ui_log("TX: Encoding failed");
             if (!first && last && config_.ptt_type != PTTType::VOX) {
                 audio_->write_silence(config_.ptt_tail_ms * config_.sample_rate / 1000);
                 audio_->drain_playback();
@@ -1753,22 +1765,8 @@ private:
                     !blanking && !g_ui_state->ptt_on.load(std::memory_order_relaxed) &&
                     !g_ui_state->transmitting.load(std::memory_order_relaxed))
                     g_ui_state->push_scope_audio(buffer.data(), n);
-                if (g_ui_state && ++level_update_counter >= LEVEL_UPDATE_INTERVAL) {
+                if (++level_update_counter >= LEVEL_UPDATE_INTERVAL) {
                     level_update_counter = 0;
-
-                    // Copy decoder stats
-                    if (g_ui_state->stats_reset_requested.exchange(false)) {
-                        decoder_->stats_sync_count = 0;
-                        decoder_->stats_preamble_errors = 0;
-                        decoder_->stats_symbol_errors = 0;
-                        decoder_->stats_erased_symbols = 0;
-                        decoder_->stats_crc_errors = 0;
-                        decoder_->reset_ber();
-                        for (auto& d : mfsk_decoders_) d->reset_stats();
-                        robust_decoder_->reset_stats();
-                        robust_decoder_n_->reset_stats();
-                        g_ui_state->last_rx_ber = -1.0f;
-                    }
                     {
                         auto note = [this](int cur, int& last, const char* what) {
                             if (cur > last && last >= 0)
@@ -1783,6 +1781,22 @@ private:
                         note(robust_decoder_n_->stats_rescues - robust_decoder_n_->stats_backward_rescues, last_rescues_n_, "tail rescue");
                         note(robust_decoder_->stats_retry_success - robust_decoder_->stats_ladder_rescues, last_retries_, "retry decode");
                         note(robust_decoder_n_->stats_retry_success - robust_decoder_n_->stats_ladder_rescues, last_retries_n_, "retry decode");
+                    }
+                }
+                if (g_ui_state && level_update_counter == 0) {
+
+                    // Copy decoder stats
+                    if (g_ui_state->stats_reset_requested.exchange(false)) {
+                        decoder_->stats_sync_count = 0;
+                        decoder_->stats_preamble_errors = 0;
+                        decoder_->stats_symbol_errors = 0;
+                        decoder_->stats_erased_symbols = 0;
+                        decoder_->stats_crc_errors = 0;
+                        decoder_->reset_ber();
+                        for (auto& d : mfsk_decoders_) d->reset_stats();
+                        robust_decoder_->reset_stats();
+                        robust_decoder_n_->reset_stats();
+                        g_ui_state->last_rx_ber = -1.0f;
                     }
                     if (config_.modem_type == 2) {
                         auto& rd = RobustParams::is_narrow((RobustMode)config_.robust_mode)
@@ -2092,7 +2106,7 @@ public:
     float alc_auto_tune() {
         if (alc_tune_active_.exchange(true))
             return -1.0f;
-        bool busy = tx_blanking_active_.load();
+        bool busy = tx_blanking_active_.load() || tx_on_air_.load();
 #ifdef WITH_UI
         if (g_ui_state && g_ui_state->transmitting.load())
             busy = true;

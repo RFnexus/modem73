@@ -1465,6 +1465,7 @@ private:
     }
 
     bool rescue_backward(FrameCallback callback, bool consume = true) {
+        int64_t s_fp = frame_pos_;
         for (int mi = 0; mi < nmodes_; ++mi) {
             RobustMode m = modes_[mi];
             int n = RobustParams::nrows(m);
@@ -1515,6 +1516,12 @@ private:
                 }
                 return true;
             }
+        }
+        frame_pos_ = s_fp;
+        for (int i = 0; i < rows_done_; ++i) {
+            int64_t st = row_start(i);
+            if (st >= 0 && st + RobustParams::NFFT <= (int64_t)buf_.size())
+                take_row(i, st);
         }
         return false;
     }
