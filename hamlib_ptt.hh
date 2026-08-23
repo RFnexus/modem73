@@ -23,8 +23,10 @@ public:
 
 private:
     void close_locked();
+    void note_result(int rc);
     void* rig_ = nullptr;
     bool connected_ = false;
+    int fails_ = 0;
     std::mutex mutex_;
     std::string last_error_;
 };

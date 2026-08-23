@@ -176,8 +176,22 @@ std::string HamlibPTT::command(const std::string& cmdline) {
     } else {
         rc = -RIG_ENAVAIL;
     }
+    note_result(rc);
     if (rc != RIG_OK) return (ext ? out : std::string()) + rprt(rc);
     return out + rprt(0);
+}
+
+void HamlibPTT::note_result(int rc) {
+    if (rc == RIG_OK) {
+        fails_ = 0;
+        connected_ = rig_ != nullptr;
+        return;
+    }
+    if (rc != -RIG_ETIMEOUT && rc != -RIG_EIO) return;
+    if (++fails_ >= 3 && connected_) {
+        connected_ = false;
+        fprintf(stderr, "hamlib: rig not responding, marking disconnected\n");
+    }
 }
 
 
@@ -235,6 +249,7 @@ bool HamlibPTT::open(int model, const std::string& device, int baud, std::string
     }
     rig_ = rig;
     connected_ = true;
+    fails_ = 0;
     return true;
 }
 
@@ -243,6 +258,7 @@ bool HamlibPTT::set_ptt(bool on) {
     std::lock_guard<std::mutex> guard(mutex_);
     if (!rig_) return false;
     int rc = rig_set_ptt(static_cast<RIG*>(rig_), RIG_VFO_CURR, on ? RIG_PTT_ON : RIG_PTT_OFF);
+    note_result(rc);
     if (rc != RIG_OK) {
         last_error_ = hamlib_err(rc);
         fprintf(stderr, "hamlib: set_ptt %d failed: %s\n", on ? 1 : 0, last_error_.c_str());
@@ -257,7 +273,9 @@ bool HamlibPTT::get_freq(double& hz) {
     std::lock_guard<std::mutex> guard(mutex_);
     if (!rig_) return false;
     freq_t f = 0;
-    if (rig_get_freq(static_cast<RIG*>(rig_), RIG_VFO_CURR, &f) != RIG_OK) return false;
+    int rc = rig_get_freq(static_cast<RIG*>(rig_), RIG_VFO_CURR, &f);
+    note_result(rc);
+    if (rc != RIG_OK) return false;
     hz = (double)f;
     return true;
 
