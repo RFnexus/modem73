@@ -62,9 +62,13 @@ Hit "Start microphone" to begin decoding
 
 
 ### Windows?
-Experimental Windows fork: https://github.com/RFnexus/modem73-win | Releases: https://github.com/RFnexus/modem73-win/releases/
+Windows port: https://github.com/RFnexus/modem73-win | Releases: https://github.com/RFnexus/modem73-win/releases/
 
-It's recommended to use modem73 with [WSL](https://learn.microsoft.com/en-us/windows/wsl/install) instead 
+
+
+### Android
+https://github.com/RFnexus/modem73-android
+
 
 ## Building from source
 
