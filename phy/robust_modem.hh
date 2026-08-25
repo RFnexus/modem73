@@ -1151,6 +1151,24 @@ private:
         base_use_ = base_;
         window_fft(p2u, bins);
         window_fft(p2u - D, bins1);
+
+        if (nc_ > 8) {
+            value tot = 0, band = 0;
+            for (int k = 0; k < nc_ + 4; ++k)
+                tot += norm(bins[k]);
+            for (int s = 0; s + 8 <= nc_ + 4; ++s) {
+                value w = 0;
+                for (int k = 0; k < 8; ++k)
+                    w += norm(bins[s + k]);
+                if (w > band)
+                    band = w;
+            }
+            if (tot > value(1e-12) && band > value(0.75) * tot) {
+                if (debug_log)
+                    std::cerr << "RDM: narrow signal, not ours" << std::endl;
+                return 0;
+            }
+        }
         int best_off = 0, best_kind = 1;
         value best_q = 0, best_tau = 0;
         for (int boff = -2; boff <= 2; ++boff) {
