@@ -192,7 +192,7 @@ struct TNCUIState {
     std::string control_bind_address = "127.0.0.1";
 
     // PTT 
-    int ptt_type_index = 1;  // 0=NONE, 1=RIGCTL, 2=VOX
+    int ptt_type_index = 0;  // 0=NONE, 1=RIGCTL, 2=VOX
     
     // Rigctl settings (PTT type 1)
     std::string rigctl_host = "localhost";

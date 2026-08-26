@@ -87,7 +87,7 @@ struct TNCConfig {
     bool rx_filter_enabled = true;  // RX bandpass in front of the OFDM decoder
     
     // PTT settings
-    PTTType ptt_type = PTTType::RIGCTL;  
+    PTTType ptt_type = PTTType::NONE;  
     
     // Rigctl settings 
     int hamlib_model = 0;
