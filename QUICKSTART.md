@@ -294,7 +294,7 @@ Start with the lowest mode first. Then, go up. Don't pick something like QAM256 
 
 If you're on HF, start with the ROBUST modes. RDM-600 while the band is fading, RDM-1200 once it decodes cleanly with SNR over 5 dB. Only move to OFDM when the path is steady, and keep it at 8PSK or below. If nothing decodes at all, drop to MFSK.
 
-Remember that two stations can use different settings, and as long as they have the RX decoder on, can hear you. This enables setups for asymetric conditions
+Remember that two stations can use different settings, and as long as they have the RX decoder on, can hear you. This enables setups with asymmetric conditions
 
 You should always make sure your audio input and output are tuned properly. Use the TX level and check to see if your packets are distorted or overmodulated. If you use Hamlib or Rigctl PTT, there is an auto-ALC tune feature under RIG.
 
