@@ -272,7 +272,7 @@ The total percentage of raw bit errors before forward error correction. modem73 
 
 ### Frame size
 
-How many bytes go out in one transmission. OFDM frames run from 256 to 6144 bytes depending on modulation and code rate (MICRO, SHORT, NORMAL or LONG), ROBUST frames are 510, 170 or 30 bytes, and the info panel shows the exact number for the mode you have picked. A bigger frame wastes less time on sync and overhead but spends longer on air, and one deep fade can take the whole frame with it. Packets bigger than the frame are split up by fragmentation.
+How many bytes go out in one transmission. OFDM frames run from 256 to 6144 bytes depending on modulation and code rate (SHORT, NORMAL or LONG), ROBUST frames are 510, 170 or speciality modes like RDM-QB, and the info panel shows the exact number for the mode you have picked. A bigger frame wastes less time on sync and overhead but spends longer on air, and one deep fade can take the whole frame with it. Longer frames are less of an issue on line of sight Fm. Packets bigger than the frame are split up by fragmentation when enabled.
 
 ### Modulation
 
@@ -294,13 +294,17 @@ Start with the lowest mode first. Then, go up. Don't pick something like QAM256 
 
 If you're on HF, start with the ROBUST modes. RDM-600 while the band is fading, RDM-1200 once it decodes cleanly with SNR over 5 dB. Only move to OFDM when the path is steady, and keep it at 8PSK or below. If nothing decodes at all, drop to MFSK.
 
+Remember that two stations can use different settings, and as long as they have the RX decoder on, can hear you. This enables setups for asymetric conditions
+
+You should always make sure your audio input and output are tuned properly. Use the TX level and check to see if your packets are distorted or overmodulated. If you use Hamlib or Rigctl PTT, there is an auto-ALC tune feature under RIG.
+
 ### Every other setting
 
 #### MODEM SETTINGS
 
 **Code rate**
 
-How much of the frame is data and how much is error correction. 5/6 is almost all data and needs a clean channel. 1/4 spends three quarters of the frame on correction and decodes deep in the noise. The x2 rates send the whole codeword twice so the receiver can combine both copies; use them when the path fades in and out.
+How much of the frame is data and how much is error correction. 5/6 is almost all data and needs a clean channel. 1/4 spends three quarters of the frame on correction and decodes deep in the noise.
 
 **Postamble**
 
@@ -360,7 +364,7 @@ The random wait drawn after Quiet, so two stations that are ready at the same mo
 
 **Lead tone**
 
-A short tone at keyup so other stations hear you before the data starts. RANKED needs it.
+A short tone at keyup so other stations hear you before the data starts. Always on when RANKED is enabled.
 
 **Dither**
 
@@ -382,7 +386,7 @@ In RANKED, an idle station sends a presence tone every 45 to 90 s so the others 
 
 **Fragmentation**
 
-Splits packets bigger than one frame into pieces and reassembles them at the far end. Turn **Fragmentation ON** when another external application like Winlink is sending out PACLEN frames that exceed the modems frame size or your incoming frame size is unknown. It is ideal to have fragmentation OFF, but enable it where neccessary.
+Splits packets bigger than one frame into pieces and reassembles them at the far end. Turn it on whenever another program talks to modem73 over KISS. Recommended to turn on when you're receiving packets from applications that may exceed your frame size.
 
 **TX blanking**
 
@@ -430,3 +434,4 @@ A short code that packs up your modem settings. Share it so another station can 
 
 Saved sets of settings. In the config tab, s saves the current one and x deletes it.
 
+Source: https://modem73.app/quickstart.html
