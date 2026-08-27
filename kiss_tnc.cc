@@ -249,7 +249,7 @@ void print_help(const char* prog) {
 #ifdef WITH_HAMLIB
               << ", hamlib"
 #endif
-              << " (default: rigctl)\n"
+              << " (default: none)\n"
               << "      --rigctl HOST:PORT  Rigctld address (default: localhost:4532,\n"
               << "                          implies --ptt rigctl)\n"
               << "      --com-port PORT     Serial port for COM PTT (default: /dev/ttyUSB0)\n"
@@ -1156,13 +1156,20 @@ int main(int argc, char** argv) {
 
     try {
         KISSTNC tnc(config);
+#ifdef WITH_UI
+        const float& modem_airtime_s = ui_state.airtime_seconds;
+        const int& modem_mtu_bytes = ui_state.mtu_bytes;
+#else
+        const float modem_airtime_s = 0.0f;
+        const int modem_mtu_bytes = 0;
+#endif
 
         // Set up control port
         std::unique_ptr<ControlPort> ctrl;
         if (config.control_port > 0) {
             ControlPort::TNCInterface ctrl_iface;
 
-            ctrl_iface.get_status = [&tnc, &ui_state]() -> cJSON* {
+            ctrl_iface.get_status = [&tnc, &modem_airtime_s, &modem_mtu_bytes]() -> cJSON* {
                 cJSON* j = cJSON_CreateObject();
                 auto stats = tnc.get_decoder_stats();
                 {
@@ -1170,8 +1177,8 @@ int main(int argc, char** argv) {
                     cJSON_AddNumberToObject(j, "net_bps_estimate",
                         net_bps_estimate(c.csma_enabled, c.csma_quiet_ms, c.csma_cw,
                                          c.slot_time_ms, c.csma_burst, c.tx_lead_tone,
-                                         c.tx_delay_ms, ui_state.airtime_seconds,
-                                         ui_state.mtu_bytes));
+                                         c.tx_delay_ms, modem_airtime_s,
+                                         modem_mtu_bytes));
                 }
 
                 // Channel state

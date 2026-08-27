@@ -82,8 +82,9 @@ public:
         running_ = true;
         
         while (running_ && g_running) {
-            int ch = getch();
-            if (ch != ERR) {
+            for (int n = 0; n < 64 && running_; n++) {
+                int ch = getch();
+                if (ch == ERR) break;
                 handle_input(ch);
             }
             tick_auto_send();
@@ -230,7 +231,17 @@ private:
         if (ch == KEY_MOUSE) {
             MEVENT event;
             if (getmouse(&event) == OK) {
-                handle_mouse(event);
+                if (show_terms_) {
+                    const mmask_t wheel_up = BUTTON4_PRESSED | BUTTON4_RELEASED | BUTTON4_CLICKED
+                                           | BUTTON4_DOUBLE_CLICKED | BUTTON4_TRIPLE_CLICKED;
+                    const mmask_t wheel_down = BUTTON5_PRESSED | BUTTON5_RELEASED | BUTTON5_CLICKED
+                                             | BUTTON5_DOUBLE_CLICKED | BUTTON5_TRIPLE_CLICKED;
+                    if (event.bstate & wheel_up) terms_wheel_--;
+                    else if (event.bstate & wheel_down) terms_wheel_++;
+                    else if (event.bstate & (BUTTON1_CLICKED | BUTTON1_PRESSED)) show_terms_ = false;
+                } else {
+                    handle_mouse(event);
+                }
             }
             return;
         }
@@ -242,7 +253,7 @@ private:
 
         if (ch == KEY_F(2)) {
             show_terms_ = !show_terms_;
-            terms_scroll_ = 0;
+            terms_wheel_ = 0;
             return;
         }
 
@@ -5805,20 +5816,20 @@ private:
 
     static const std::vector<TermEntry>& terms_table() {
         static const std::vector<TermEntry> t = {
-            {nullptr, "BASICS"},
             {"SNR", "Signal to noise ratio. This is how far your signal sits above the noise floor in dB. A higher SNR is always better and combined with bit error rate determines link quality."},
             {"Bit error rate", "The total percentage of raw bit errors before forward error correction. modem73 works it out by re-encoding the frame once it decodes, then counting how many of the received bits disagreed. A frame can come through perfectly clean at 15% BER, because fixing those errors is the entire job of the FEC. What BER tells you is how much margin is left before frames start failing."},
-            {"Frame size", "How many bytes go out in one transmission. OFDM frames run from 256 to 6144 bytes depending on modulation and code rate (MICRO, SHORT, NORMAL or LONG), ROBUST frames are 510, 170 or 30 bytes, and the info panel shows the exact number for the mode you have picked. A bigger frame wastes less time on sync and overhead but spends longer on air, and one deep fade can take the whole frame with it. Packets bigger than the frame are split up by fragmentation."},
+            {"Frame size", "How many bytes go out in one transmission. OFDM frames run from 256 to 6144 bytes depending on modulation and code rate (SHORT, NORMAL or LONG), ROBUST frames are 510, 170 or speciality modes like RDM-QB, and the info panel shows the exact number for the mode you have picked. A bigger frame wastes less time on sync and overhead but spends longer on air, and one deep fade can take the whole frame with it. Longer frames are less of an issue on line of sight FM. Packets bigger than the frame are split up by fragmentation when enabled."},
             {"Modulation", "What carrier, number of carriers, and how many bits we send at once. Higher carriers (like QAM4096) require a better signal, or SNR. Lower modulation orders like BPSK require a lot less."},
             {"Mode", "modem73 has 3 modes: OFDM, ROBUST, or MFSK."},
             {"OFDM", "The fast family. Hundreds of carriers side by side in 2400 Hz, each carrying a PSK or QAM symbol. From about 790 bps at BPSK to over 13 kbps at QAM4096. Use it for anything over FM, and on good HF SSB paths at 8PSK or below."},
             {"ROBUST", "Built for fading HF such as 40 and 80 meter NVIS. QPSK on widely spaced carriers with a guard interval between symbols, so Doppler spread and multipath echoes do not smear one symbol into the next. RDM-1200 (about 1150 bps) decodes down to 5 dB SNR and RDM-600 near 0 dB. The RDMN modes are 600 Hz wide versions, RDMN-300 and RDMN-150, for narrow filters and crowded bands."},
             {"MFSK", "One tone at a time out of 8, 16 or 32. The receiver only has to find the loudest tone, with no phase tracking, which is why it decodes below the noise floor (MFSK-8 to about -9 dB) and why it is slow: 34 bps for MFSK-8, 99 bps for MFSK-32R. Keep it as the weak signal backup."},
-            {"How do I pick a mode?", "Start with the lowest mode first. Then, go up. Don't pick something like QAM256 right out of the box. Check your SNR and BER and step up one notch at a time while frames keep decoding. BER is the number to watch: low means you have margin to go faster, climbing means you are near the edge and the next step up will start dropping frames. SNR tells you roughly where you will land. modem73 shows it green above 10 dB and yellow between 5 and 10, and the higher modulations need the green. When frames start failing, step back down one notch and stay there.\nIf you're on HF, start with the ROBUST modes. RDM-600 while the band is fading, RDM-1200 once it decodes cleanly with SNR over 5 dB. Only move to OFDM when the path is steady, and keep it at 8PSK or below. If nothing decodes at all, drop to MFSK."},
+            {"How do I pick a mode?", "Start with the lowest mode first. Then, go up. Don't pick something like QAM256 right out of the box. Check your SNR and BER and step up one notch at a time while frames keep decoding. BER is the number to watch: low means you have margin to go faster, climbing means you are near the edge and the next step up will start dropping frames. SNR tells you roughly where you will land. modem73 shows it green above 10 dB and yellow between 5 and 10, and the higher modulations need the green. When frames start failing, step back down one notch and stay there.\nIf you're on HF, start with the ROBUST modes. RDM-600 while the band is fading, RDM-1200 once it decodes cleanly with SNR over 5 dB. Only move to OFDM when the path is steady, and keep it at 8PSK or below. If nothing decodes at all, drop to MFSK.\nRemember that two stations can use different settings, and as long as they have the RX decoder on, can hear you. This enables setups with asymmetric conditions.\nYou should always make sure your audio input and output are tuned properly. Use the TX level and check to see if your packets are distorted or overmodulated. If you use Hamlib or Rigctl PTT, there is an auto-ALC tune feature under RIG."},
+            {nullptr, "EVERY OTHER SETTING"},
             {nullptr, "MODEM SETTINGS"},
-            {"Code rate", "How much of the frame is data and how much is error correction. 5/6 is almost all data and needs a clean channel. 1/4 spends three quarters of the frame on correction and decodes deep in the noise. The x2 rates send the whole codeword twice so the receiver can combine both copies; use them when the path fades in and out."},
+            {"Code rate", "How much of the frame is data and how much is error correction. 5/6 is almost all data and needs a clean channel. 1/4 spends three quarters of the frame on correction and decodes deep in the noise."},
             {"Postamble", "A second sync marker at the end of an OFDM frame. If the receiver missed the start, it can still lock on at the end and recover the frame. Costs 0.4 s of airtime. Worth it on noisy or fading channels."},
-            {"RDM mode", "Which ROBUST speed to send. Lower numbers are slower and decode at a worse SNR.  "},
+            {"RDM mode", "Which ROBUST speed to send. Lower numbers are slower and decode at a lower SNR."},
             {"MFSK mode", "How many tones. More tones means more bits per symbol and a wider signal: MFSK-8 is 250 Hz wide, MFSK-32 is 1000 Hz. 32R keeps 32 tones with less error correction for more speed."},
             {"RX decoders", "Which families the receiver listens for. The receiver decodes all three at once by default. Each one costs CPU, so on a Pi Zero 2 turn off the ones you are not using."},
             {nullptr, "SIGNAL"},
@@ -5832,20 +5843,20 @@ private:
             {"Band / Preset", "Timing presets. Band picks HF or VHF/UHF numbers and Preset picks how busy the channel is. The knobs below are filled in from these; changing one by hand overrides it."},
             {"Quiet", "How long the channel has to be idle before you contend for it."},
             {"Window", "The random wait drawn after Quiet, so two stations that are ready at the same moment do not collide."},
-            {"Lead tone", "A short tone at keyup so other stations hear you before the data starts. RANKED needs it."},
+            {"Lead tone", "A short tone at keyup so other stations hear you before the data starts. Always on when RANKED is enabled."},
             {"Dither", "A small per-callsign delay so replies from several stations do not land on the same instant."},
             {"Burst", "How many queued packets you send once you win the channel."},
             {"FastFloor", "Shorter waits in SYNC mode. Only if every station runs 2.3 or newer."},
             {"Beacon", "In RANKED, an idle station sends a presence tone every 45 to 90 s so the others keep it in the turn order."},
             {nullptr, "TX AND RX"},
-            {"Fragmentation", "Splits packets bigger than one frame into pieces and reassembles them at the far end. Turn it on whenever another program talks to modem73 and is sending frames that exceed your frame size. "},
+            {"Fragmentation", "Splits packets bigger than one frame into pieces and reassembles them at the far end. Turn it on whenever another program talks to modem73 over KISS. Recommended to turn on when you're receiving packets from applications that may exceed your frame size."},
             {"TX blanking", "Mutes the decoder while you transmit so you do not decode your own signal through the mic."},
             {"TX delay", "Time between keying PTT and the start of audio, 250 to 2500 ms, so the radio is fully on transmit before the data starts."},
             {"TX level", "Sound card output drive, 5 to 100 percent. Set it so the radio's ALC barely moves. Too hot distorts the signal and other stations decode less, not more."},
             {"PTT", "How modem73 keys the radio. NONE: no keying, speaker into mic. RIGCTL: through rigctld over TCP. VOX: a tone before the data trips the radio's VOX. COM: DTR or RTS on a serial port, which is what the AIOC uses. CM108: the GPIO pin on a CM108 USB sound card. HAMLIB: direct Hamlib control without rigctld."},
             {"VOX tone / lead / tail", "For VOX PTT: the tone frequency, how long it plays before the data so the radio keys up, and how long after so the radio does not drop early."},
             {nullptr, "NETWORK"},
-            {"Callsign", "Goes in every frame header so other stations can see who transmitted. Also drives the CSMA dither and the RANKED turn order."},
+            {"Callsign", "Goes in every frame header so other stations can see who transmitted. Also drives the CSMA dither."},
             {"KISS port", "TCP port, 8001 by default, where applications send and receive packets."},
             {"Control port", "TCP port, 8073 by default, for the JSON control API: read SNR and channel state, change modes, or pass commands through to rigctl."},
             {"LAN mode", "Listen on every network interface instead of only localhost, so other machines on your LAN can use the modem."},
@@ -5908,6 +5919,11 @@ private:
 
         int content_rows = h - 3;
         int max_scroll = std::max(0, (int)lines.size() - content_rows);
+        if (terms_wheel_ != 0) {
+            terms_scroll_ += terms_wheel_ > 0 ? 3 : -3;
+            terms_wheel_ = 0;
+        }
+        if (terms_scroll_ < 0) terms_scroll_ = 0;
         if (terms_scroll_ > max_scroll) terms_scroll_ = max_scroll;
         terms_page_ = content_rows;
 
@@ -5938,7 +5954,7 @@ private:
         }
 
         attron(A_DIM);
-        mvaddstr(y0 + h - 2, x0 + 3, "^/v PgUp/Dn scroll   any other key closes");
+        mvaddstr(y0 + h - 2, x0 + 3, "^/v PgUp/Dn wheel scroll   any other key closes");
         char pos[16];
         int pct = max_scroll > 0 ? terms_scroll_ * 100 / max_scroll : 100;
         snprintf(pos, sizeof(pos), "%3d%%", pct);
@@ -6200,6 +6216,7 @@ private:
     bool show_terms_ = false;
     int terms_scroll_ = 0;
     int terms_page_ = 10;
+    int terms_wheel_ = 0;
     
     bool calibrating_threshold_ = false;
     int calibration_start_frame_ = 0;
