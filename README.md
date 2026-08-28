@@ -125,6 +125,21 @@ sudo make install
 
 and run `./modem73`
 
+### macOS
+
+Apple's default bundled ncurses is too old for the UI, so install Homebrew's and build with the same `make`:
+
+```
+brew install ncurses
+git clone https://github.com/RFnexus/modem73
+cd modem73
+make
+```
+
+The Makefile picks up Homebrew's ncurses through `brew --prefix ncurses`.
+
+if your Homebrew lives elsewhere pass the prefix explicitly with `make NCURSES_PREFIX=/path/to/ncurses`. Hamlib and hidapi from Homebrew are detected the same way as on Linux when `pkg-config` can see them.
+
 ## Running & Operations
 
 By default, MODEM73 will listen on port 8001

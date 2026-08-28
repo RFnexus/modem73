@@ -6,6 +6,9 @@
 #include <chrono>
 #include <mutex>
 #include <sys/socket.h>
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>

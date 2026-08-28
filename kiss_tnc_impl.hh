@@ -22,6 +22,9 @@
 
 // Network
 #include <sys/socket.h>
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
 #include <sys/stat.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>

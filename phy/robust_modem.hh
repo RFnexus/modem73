@@ -1059,7 +1059,7 @@ private:
             int64_t uc = u0 + c * RobustParams::NFFT;
             if (uc - 4 * D - D - RobustParams::CP < 0)
                 continue;
-            value m = abs(cp_corr(uc - 4 * D, 112, 192));
+            value m = abs(cp_corr(uc - 4 * D, RDM_WIN_BACK + 64, 192));
             if (m > best_m) {
                 best_m = m;
                 u = uc;
@@ -1071,17 +1071,17 @@ private:
             return false;
         const value bin_step = 2 * (value)M_PI * RobustParams::SPACING
                              / RobustParams::SAMPLE_RATE;
-        value omega0 = arg(cp_corr(u - 4 * D, 112, 192))
+        value omega0 = arg(cp_corr(u - 4 * D, RDM_WIN_BACK + 64, 192))
                      / (value)RobustParams::NFFT;
         {
             int m = 1;
-            while ((nc_ * m) % 255 != 1)
+            while (m < 255 && (nc_ * m) % 255 != 1)
                 ++m;
             if (!seq_init_)
                 init_seqs();
             int cj[3] = {j, j - m, j + m}, cb[3] = {boff, boff - 1, boff + 1};
             value qs[3] = {-1, -1, -1};
-            bool ok = true;
+            bool ok = m < 255;
             for (int c = 0; c < 3 && ok; ++c) {
                 if (cj[c] < 0 || cj[c] + 1 >= npat_ || cb[c] < -2 || cb[c] > 2 ||
                     base_ + cb[c] < 2 ||
@@ -1327,7 +1327,7 @@ private:
         if (p2u - D - RobustParams::CP < 0)
             return 0;
 
-        omega_ = arg(cp_corr(p2u, 96, 128)) / (value)RobustParams::NFFT;
+        omega_ = arg(cp_corr(p2u, RDM_WIN_BACK + 96, 128)) / (value)RobustParams::NFFT;
 
         cmplx bins[RobustParams::NC_MAX + 4], bins1[RobustParams::NC_MAX + 4];
         base_use_ = base_;
@@ -1369,7 +1369,7 @@ private:
         p2u += shift;
         if (p2u - D - RobustParams::CP < 0)
             return 0;
-        omega_ = arg(cp_corr(p2u, 112, 192)) / (value)RobustParams::NFFT
+        omega_ = arg(cp_corr(p2u, RDM_WIN_BACK + 64, 192)) / (value)RobustParams::NFFT
                + best_off * bin_step;
 
         if (best_kind == 2) {
@@ -1609,7 +1609,7 @@ private:
         value s_om = omega_;
         int s_bu = base_use_;
         frame_pos_ = p2u;
-        omega_ = arg(cp_corr(p2u, 96, 128)) / (value)RobustParams::NFFT;
+        omega_ = arg(cp_corr(p2u, RDM_WIN_BACK + 96, 128)) / (value)RobustParams::NFFT;
         base_use_ = base_;
         cmplx bins[RobustParams::NC_MAX + 4], bins1[RobustParams::NC_MAX + 4];
         window_fft(p2u, bins);
@@ -1637,7 +1637,7 @@ private:
             p2u += shift;
             if (p2u - D - RobustParams::CP >= 0 &&
                 p2u + RobustParams::NFFT + 192 <= (int64_t)buf_.size()) {
-                omega_ = arg(cp_corr(p2u, 112, 192)) / (value)RobustParams::NFFT
+                omega_ = arg(cp_corr(p2u, RDM_WIN_BACK + 64, 192)) / (value)RobustParams::NFFT
                        + best_off * bin_step;
                 int64_t a_abs = total_in_ - (int64_t)buf_.size() + p2u;
                 if (std::llabs(a_abs - spent_anchor_) >= RobustParams::SYM / 2) {
