@@ -1,7 +1,9 @@
 CXX = g++
 CC = gcc
-CXXFLAGS = -std=c++17 -O3 -march=native -Wall -Wextra
-LDFLAGS = -lpthread  -ltinfo -lncurses -ldl -lm
+UNAME_S := $(shell uname -s)
+ARCHFLAGS ?= -march=native
+CXXFLAGS = -std=c++17 -O3 $(ARCHFLAGS) -Wall -Wextra
+LDFLAGS = -lpthread -ldl -lm
 
 GIT_EXACT := $(shell git describe --tags --exact-match 2>/dev/null | sed 's/^v//')
 BASE_VERSION := 2.3.9
@@ -14,6 +16,24 @@ AICODIX_CODE ?= deps/aicodix/code
 MODEM_SRC ?= deps/aicodix/modem
 
 INCLUDES = -I$(AICODIX_DSP) -I$(AICODIX_CODE) -I$(MODEM_SRC)
+
+# macOS ships a 5.x libncurses which is too old
+ifeq ($(UNAME_S),Darwin)
+    ifndef NCURSES_PREFIX
+        NCURSES_PREFIX := $(shell brew --prefix ncurses 2>/dev/null)
+    endif
+    ifneq ($(NCURSES_PREFIX),)
+        INCLUDES += -I$(NCURSES_PREFIX)/include
+        LDFLAGS += -L$(NCURSES_PREFIX)/lib
+    endif
+    NCURSES_LIBS ?= -lncurses
+else
+    NCURSES_LIBS ?= -lncurses -ltinfo
+endif
+ifdef NCURSES_SRC
+    INCLUDES += -I$(NCURSES_SRC)
+endif
+LDFLAGS += $(NCURSES_LIBS)
 
 TARGET = modem73
 
@@ -129,6 +149,10 @@ help:
 	@echo "  AICODIX_DSP  - Path to aicodix/dsp (default: deps/aicodix/dsp)"
 	@echo "  AICODIX_CODE - Path to aicodix/code (default: deps/aicodix/code)"
 	@echo "  MODEM_SRC    - Path to modem source (default: deps/aicodix/modem)"
+	@echo "  NCURSES_PREFIX - ncurses install prefix (macOS: default from 'brew --prefix ncurses')"
+	@echo "  NCURSES_SRC  - extra ncurses include directory"
+	@echo "  NCURSES_LIBS - ncurses link flags (default: -lncurses -ltinfo, macOS: -lncurses)"
+	@echo "  ARCHFLAGS    - CPU tuning flags (default: -march=native)"
 	@echo ""
 	@echo "Optional features:"
 	@echo "  CM108 PTT    - Requires libhidapi-dev (auto-detected)"
