@@ -14,6 +14,7 @@ Wire format: 4-byte big-endian length prefix + JSON payload.
 | `rigctl` | Passthrough command to rigctld |
 | `tx` | Transmit data via KISS |
 | `send_beacon` | Queue a presence tone transmission |
+| `rx_frame_history` | Data for recently decoded frames (mode, SNR, BER) |
 
 ---
 
@@ -136,6 +137,34 @@ Queues one presence tone
 
 ---
 
+## `rx_frame_history`
+
+**Request:** `{"cmd": "rx_frame_history", "limit": 64, "since_seq": 0}`
+
+| Field | Type | Description |
+|---|---|---|
+| `limit` | int | Maximum frames to return (default 64) |
+| `since_seq` | int | Only return frames with `seq` greater than this (default 0 = all). Pass the last `seq` you saw to catch up after a reconnect |
+
+Returns meta data for recently decoded frames with the of newest first.
+
+Example:
+```json
+{"ok": true, "frames": [
+  {"seq": 3, "age_s": 12.4, "time": 1787956059.99, "snr": 23.6, "ber_pct": 0.0, "level_db": -8.0,
+   "size": 19, "reassembled": false, "modem": "robust", "mode": "RDM-1200", "robust_mode": 0,
+   "callsign": "VK2ABC", "callsign_source": "payload"},
+  {"seq": 2, "age_s": 18.0, "time": 1787956054.37, "snr": 38.1, "ber_pct": 0.0, "level_db": -21.0,
+   "size": 14, "reassembled": false, "modem": "ofdm", "mode": "QPSK 1/2 N", "oper_mode": 17,
+   "modulation": "QPSK", "code_rate": "1/2", "frame_size": "normal",
+   "callsign": "VK2ABC", "callsign_source": "phy"}
+]}
+```
+
+Each entry carries the same fields as the `rx_frame` event plus `age_s` which is seconds since the frame was decoded.
+
+---
+
 ## Events
 
 The control port broadcasts  events to all connected clients:
@@ -147,10 +176,22 @@ The control port broadcasts  events to all connected clients:
 
 ### `rx_frame`
 
-Sent just before the decoded frame is written to the KISS port, so stats consumers can associate the event with the next KISS frame.
+Sent just before the decoded frame is written to the KISS port, so stats consumers can associate the event with the next KISS frame. Fragmented packets produce one event for the reassembled packet, not one per fragment.
 
 | Field | Type | Description |
 |---|---|---|
+| `seq` | int | Frame sequence number, increments by one per decoded frame since startup. Matches `seq` in `rx_frame_history` |
+| `time` | float | Unix time of the decode (seconds) |
 | `snr` | float | Frame SNR (dB) |
 | `ber_pct` | float | Pre-FEC bit error rate in percent (0-100, negative if unavailable) |
 | `level_db` | float | Receive audio level (dBFS) sampled at frame end |
+| `size` | int | Payload bytes delivered to KISS |
+| `reassembled` | bool | Packet was reassembled from fragments |
+| `modem` | string | `"ofdm"`, `"robust"` or `"mfsk"`; which decoder produced the frame |
+| `mode` | string | Received mode as shown in the TUI, e.g. `"QPSK 1/2 N"`, `"RDM-600"`, `"MFSK-16"` |
+| `oper_mode` | int | OFDM only. Decoded operating-mode byte from the meta symbol |
+| `modulation` | string | OFDM only. `"BPSK"`..`"QAM4096"` |
+| `code_rate` | string | OFDM only. `"1/2"`, `"2/3"`, `"3/4"`, `"5/6"`, `"1/4"` |
+| `frame_size` | string | OFDM only. `"short"`, `"normal"`, `"long"` or `"micro"` |
+| `robust_mode` | int | ROBUST only. Detected mode, same numbering as the `robust_mode` config field |
+| `mfsk_mode` | int | MFSK only. Detected mode, same numbering as the `mfsk_mode` config field |

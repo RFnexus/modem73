@@ -13,6 +13,7 @@
 #endif
 #include <vector>
 #include <list>
+#include <deque>
 #include <set>
 #include <mutex>
 #include <memory>
@@ -167,25 +168,34 @@ static int parse_seq(const std::vector<uint8_t>& p) {
 }
 
 // human-readable name for a decoded OFDM operating-mode byte
-static std::string ofdm_mode_name(int m) {
+static const char* ofdm_modulation_name(int m) {
     static const char* mods[] = {"BPSK", "QPSK", "8PSK", "QAM16",
                                  "QAM64", "QAM256", "QAM1024", "QAM4096"};
+    return mods[(m >> 4) & 7];
+}
+
+static const char* ofdm_code_rate_name(int m) {
     static const char* rates[] = {"1/2", "2/3", "3/4", "5/6", "1/4",
                                   "1/2x2", "1/4x2", "?"};
+    return rates[(m >> 1) & 7];
+}
 
-    std::string s = mods[(m >> 4) & 7];
+static const char* ofdm_frame_size_name(int m) {
+    return Common::is_micro_mode(m) ? "micro" : (m & 128) ? "long" : (m & 1) ? "normal" : "short";
+}
 
-
+static std::string ofdm_mode_name(int m) {
+    std::string s = ofdm_modulation_name(m);
     s += " ";
-    s += rates[(m >> 1) & 7];
-    s += (m & 128) ? " L" : (m & 1) ? " N" : " S";
+    s += ofdm_code_rate_name(m);
+    s += Common::is_micro_mode(m) ? " M" : (m & 128) ? " L" : (m & 1) ? " N" : " S";
     return s;
 }
 
 class KISSTNC {
 public:
     PerfLogger perf_log_;
-    std::function<void(float snr, float ber_pct, float level_db)> rx_stats_callback;
+    std::function<void(const RxFrameInfo&)> rx_frame_callback;
     std::function<bool(bool on)> external_ptt;
     std::function<void(const float* samples, int n)> rx_tap;
 
@@ -1384,24 +1394,42 @@ private:
         const int LEVEL_UPDATE_INTERVAL = 5;
         
         auto deliver_to_clients = [this](const std::vector<uint8_t>& payload, float snr, float ber_pct, bool was_reassembled,
-                                         const std::string& mode = "", std::string callsign = "") {
+                                         RxFrameInfo info) {
             last_rx_done_ms_.store(steady_now_ms());
             ui_log("RX: " + std::to_string(payload.size()) + " bytes" +
-                   (mode.empty() ? "" : " " + mode) + ", SNR=" +
+                   (info.mode.empty() ? "" : " " + info.mode) + ", SNR=" +
                    std::to_string((int)snr) + "dB" + (was_reassembled ? " (reassembled)" : ""));
             if (g_verbose) {
                 std::cerr << packet_visualize(payload.data(), payload.size(), false, false) << std::endl;
             }
 
-#ifdef WITH_UI
-            if (g_ui_state) {
-                if (callsign.empty() && payload.size() > 4 && !memcmp(payload.data(), "M73:", 4)) {
-                    auto sep = std::find(payload.begin() + 4, payload.end(), (uint8_t)':');
-                    if (sep != payload.end() && sep - payload.begin() <= 16)
-                        callsign.assign(payload.begin() + 4, sep);
+            info.snr = snr;
+            info.ber_pct = ber_pct;
+            info.size = (int)payload.size();
+            info.reassembled = was_reassembled;
+            info.level_db = audio_ ? audio_->instant_level_db(200) : 0.0f;
+            info.steady_ms = steady_now_ms();
+            info.time = std::chrono::duration<double>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            if (info.callsign_source != "phy" && payload.size() > 4 && !memcmp(payload.data(), "M73:", 4)) {
+                auto sep = std::find(payload.begin() + 4, payload.end(), (uint8_t)':');
+                if (sep != payload.end() && sep > payload.begin() + 4 && sep - payload.begin() <= 16 &&
+                    std::all_of(payload.begin() + 4, sep, [](uint8_t c) { return c > 32 && c < 127; })) {
+                    info.callsign.assign(payload.begin() + 4, sep);
+                    info.callsign_source = "payload";
                 }
-                g_ui_state->add_packet(false, payload.size(), snr, ber_pct, mode, callsign);
             }
+            {
+                std::lock_guard<std::mutex> lock(rx_history_mutex_);
+                info.seq = ++rx_seq_;
+                rx_history_.push_back(info);
+                while (rx_history_.size() > RX_HISTORY_MAX)
+                    rx_history_.pop_front();
+            }
+
+#ifdef WITH_UI
+            if (g_ui_state)
+                g_ui_state->add_packet(false, payload.size(), snr, ber_pct, info.mode, info.callsign);
 #endif
 
             if (payload.size() > 4 && !memcmp(payload.data(), "M73:", 4)) {
@@ -1425,10 +1453,8 @@ private:
                 }
             }
 
-            if (rx_stats_callback) {
-                float level_db = audio_ ? audio_->instant_level_db(200) : 0.0f;
-                rx_stats_callback(snr, ber_pct, level_db);
-            }
+            if (rx_frame_callback)
+                rx_frame_callback(info);
 
             auto kiss_frame = KISSParser::wrap(payload);
 
@@ -1438,8 +1464,42 @@ private:
             }
         };
         
+        auto ofdm_info = [this]() {
+            RxFrameInfo info;
+            info.modem = "ofdm";
+            info.oper_mode = decoder_->oper_mode;
+            info.mode = ofdm_mode_name(info.oper_mode);
+            info.modulation = ofdm_modulation_name(info.oper_mode);
+            info.code_rate = ofdm_code_rate_name(info.oper_mode);
+            info.frame_size = ofdm_frame_size_name(info.oper_mode);
+            const char* call = decoder_->last_call_;
+            while (*call == ' ')
+                ++call;
+            if (*call) {
+                info.callsign = call;
+                while (!info.callsign.empty() && info.callsign.back() == ' ')
+                    info.callsign.pop_back();
+                info.callsign_source = decoder_->last_call_fresh_ ? "phy" : "stale";
+            }
+            return info;
+        };
+        auto robust_info = [](RobustDecoder* dec) {
+            RxFrameInfo info;
+            info.modem = "robust";
+            info.robust_mode = (int)dec->get_last_mode();
+            info.mode = ROBUST_MODE_NAMES[info.robust_mode];
+            return info;
+        };
+        auto mfsk_info = [](MFSKDecoder* dec) {
+            RxFrameInfo info;
+            info.modem = "mfsk";
+            info.mfsk_mode = (int)dec->get_last_decoded_mode();
+            info.mode = MFSK_MODE_NAMES[info.mfsk_mode];
+            return info;
+        };
+
         // OFDM frame callback
-        auto frame_callback = [this, &deliver_to_clients](const uint8_t* data, size_t len) {
+        auto frame_callback = [this, &deliver_to_clients, &ofdm_info](const uint8_t* data, size_t len) {
             set_tx_lockout(RX_LOCKOUT_SECONDS);
 
             float snr = decoder_->get_last_snr();
@@ -1477,16 +1537,14 @@ private:
                 auto reassembled = reassembler_.process(payload);
                 if (!reassembled.empty()) {
                     ui_log("RX: Reassembled " + std::to_string(reassembled.size()) + " bytes from fragments");
-                    deliver_to_clients(reassembled, snr, ber_pct, true,
-                                       ofdm_mode_name(decoder_->oper_mode), decoder_->last_call_);
+                    deliver_to_clients(reassembled, snr, ber_pct, true, ofdm_info());
                 }
             } else {
-                deliver_to_clients(payload, snr, ber_pct, false,
-                                   ofdm_mode_name(decoder_->oper_mode), decoder_->last_call_);
+                deliver_to_clients(payload, snr, ber_pct, false, ofdm_info());
             }
         };
 
-        auto robust_frame_callback = [this, &deliver_to_clients](const uint8_t* data, size_t len) {
+        auto robust_frame_callback = [this, &deliver_to_clients, &robust_info](const uint8_t* data, size_t len) {
             set_tx_lockout(RX_LOCKOUT_SECONDS);
             float snr = robust_decoder_->get_last_snr();
             float ber_pct = 100.0f * robust_decoder_->get_last_ber();
@@ -1512,16 +1570,14 @@ private:
                 auto reassembled = reassembler_.process(payload);
                 if (!reassembled.empty()) {
                     ui_log("RDM RX: Reassembled " + std::to_string(reassembled.size()) + " bytes");
-                    deliver_to_clients(reassembled, snr, ber_pct, true,
-                                       ROBUST_MODE_NAMES[(int)robust_decoder_->get_last_mode()]);
+                    deliver_to_clients(reassembled, snr, ber_pct, true, robust_info(robust_decoder_.get()));
                 }
             } else {
-                deliver_to_clients(payload, snr, ber_pct, false,
-                                   ROBUST_MODE_NAMES[(int)robust_decoder_->get_last_mode()]);
+                deliver_to_clients(payload, snr, ber_pct, false, robust_info(robust_decoder_.get()));
             }
         };
 
-        auto robust_n_frame_callback = [this, &deliver_to_clients](const uint8_t* data, size_t len) {
+        auto robust_n_frame_callback = [this, &deliver_to_clients, &robust_info](const uint8_t* data, size_t len) {
             set_tx_lockout(RX_LOCKOUT_SECONDS);
             float snr = robust_decoder_n_->get_last_snr();
             float ber_pct = 100.0f * robust_decoder_n_->get_last_ber();
@@ -1547,17 +1603,15 @@ private:
                 auto reassembled = reassembler_.process(payload);
                 if (!reassembled.empty()) {
                     ui_log("RDMn RX: Reassembled " + std::to_string(reassembled.size()) + " bytes");
-                    deliver_to_clients(reassembled, snr, ber_pct, true,
-                                       ROBUST_MODE_NAMES[(int)robust_decoder_n_->get_last_mode()]);
+                    deliver_to_clients(reassembled, snr, ber_pct, true, robust_info(robust_decoder_n_.get()));
                 }
             } else {
-                deliver_to_clients(payload, snr, ber_pct, false,
-                                   ROBUST_MODE_NAMES[(int)robust_decoder_n_->get_last_mode()]);
+                deliver_to_clients(payload, snr, ber_pct, false, robust_info(robust_decoder_n_.get()));
             }
         };
 
-        auto make_mfsk_callback = [this, &deliver_to_clients](MFSKDecoder* dec) {
-          return [this, &deliver_to_clients, dec](const uint8_t* data, size_t len) {
+        auto make_mfsk_callback = [this, &deliver_to_clients, &mfsk_info](MFSKDecoder* dec) {
+          return [this, &deliver_to_clients, &mfsk_info, dec](const uint8_t* data, size_t len) {
             set_tx_lockout(RX_LOCKOUT_SECONDS);
 
             float snr = dec->get_last_snr();
@@ -1590,12 +1644,10 @@ private:
                 auto reassembled = reassembler_.process(payload);
                 if (!reassembled.empty()) {
                     ui_log("MFSK RX: Reassembled " + std::to_string(reassembled.size()) + " bytes");
-                    deliver_to_clients(reassembled, snr, ber_pct, true,
-                                       MFSK_MODE_NAMES[(int)dec->get_last_decoded_mode()]);
+                    deliver_to_clients(reassembled, snr, ber_pct, true, mfsk_info(dec));
                 }
             } else {
-                deliver_to_clients(payload, snr, ber_pct, false,
-                                   MFSK_MODE_NAMES[(int)dec->get_last_decoded_mode()]);
+                deliver_to_clients(payload, snr, ber_pct, false, mfsk_info(dec));
             }
           };
         };
@@ -2046,6 +2098,10 @@ private:
     static constexpr int64_t PARTICIPATION_MS = 720000;
     int yield_attempt_ = 0;
     std::map<uint16_t, int64_t> heard_ids_;
+    static constexpr size_t RX_HISTORY_MAX = 256;
+    std::mutex rx_history_mutex_;
+    std::deque<RxFrameInfo> rx_history_;
+    uint64_t rx_seq_ = 0;
     int64_t last_id_ms_ = -1000000;
     int64_t last_dcd_ms_ = -1000000;
     int64_t pending_unattrib_ms_ = -1;
@@ -2403,6 +2459,17 @@ public:
     size_t tx_queue_depth() const { return tx_queue_.size(); }
 
     int channel_population() { return known_others(); }
+
+    std::vector<RxFrameInfo> rx_frame_history(size_t limit, uint64_t since_seq) {
+        std::vector<RxFrameInfo> out;
+        std::lock_guard<std::mutex> lock(rx_history_mutex_);
+        for (auto it = rx_history_.rbegin(); it != rx_history_.rend() && out.size() < limit; ++it) {
+            if (it->seq <= since_seq)
+                break;
+            out.push_back(*it);
+        }
+        return out;
+    }
 
     bool queue_beacon() {
         TxPacket b;

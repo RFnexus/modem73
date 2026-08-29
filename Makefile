@@ -38,7 +38,7 @@ LDFLAGS += $(NCURSES_LIBS)
 TARGET = modem73
 
 SRCS = kiss_tnc.cc
-HDRS = kiss_tnc.hh kiss_tnc_impl.hh csma.hh tone_dcd.hh miniaudio_audio.hh rigctl_ptt.hh hamlib_ptt.hh modem.hh phy/mfsk_modem.hh phy/robust_modem.hh phy/common.hh tnc_ui.hh tnc_ui_state.hh control_port.hh
+HDRS = kiss_tnc.hh kiss_tnc_impl.hh rx_frame_info.hh csma.hh tone_dcd.hh miniaudio_audio.hh rigctl_ptt.hh hamlib_ptt.hh modem.hh phy/mfsk_modem.hh phy/robust_modem.hh phy/common.hh tnc_ui.hh tnc_ui_state.hh control_port.hh
 OBJS = deps/miniaudio.o deps/cJSON.o
 
 # defualt to build with UI, headless operations through --headless

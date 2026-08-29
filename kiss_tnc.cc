@@ -1395,11 +1395,15 @@ int main(int argc, char** argv) {
                 return true;
             };
 
+            ctrl_iface.rx_frame_history = [&tnc](size_t limit, uint64_t since_seq) {
+                return tnc.rx_frame_history(limit, since_seq);
+            };
+
             ctrl = std::make_unique<ControlPort>(config.control_port, config.control_bind_address, ctrl_iface);
             ctrl->start();
 
-            tnc.rx_stats_callback = [&ctrl](float snr, float ber_pct, float level_db) {
-                if (ctrl) ctrl->notify_rx_frame(snr, ber_pct, level_db);
+            tnc.rx_frame_callback = [&ctrl](const RxFrameInfo& info) {
+                if (ctrl) ctrl->notify_rx_frame(info);
             };
         }
 
