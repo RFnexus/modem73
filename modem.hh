@@ -543,6 +543,7 @@ template<typename value, typename cmplx, int rate>
 class ModemDecoder : public Common {
 public:
     char last_call_[10] = {0};
+    bool last_call_fresh_ = false;
     typedef int16_t code_type;
     typedef SIMD<code_type, 32> mesg_type;
     typedef DSP::Const<value> Const;
@@ -1119,6 +1120,7 @@ private:
                 return false;
             }
             mode = last_good_mode_;
+            last_call_fresh_ = false;
             if (!replaying_)
                 ++stats_sticky_syncs;
             std::cerr << "Decoder: Meta symbol damaged, trying last good mode " << mode << std::endl;
@@ -1141,6 +1143,7 @@ private:
             base40_decoder(call_sign, call, 9);
             call_sign[9] = 0;
             std::memcpy(last_call_, call_sign, sizeof(last_call_));
+            last_call_fresh_ = true;
             std::cerr << "Decoder: Call sign: " << call_sign << std::endl;
 
             mode = meta_info & 255;

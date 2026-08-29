@@ -14,6 +14,8 @@
 #include <iomanip>
 #include <iostream>
 
+#include "rx_frame_info.hh"
+
 // KISS protocol
 namespace KISS {
     constexpr uint8_t FEND  = 0xC0;

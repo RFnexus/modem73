@@ -9,6 +9,7 @@
 #include <mutex>
 #include <cstring>
 #include <iostream>
+#include <chrono>
 
 #include <sys/socket.h>
 #ifndef MSG_NOSIGNAL
@@ -23,6 +24,32 @@
 
 extern "C" {
 #include "deps/cJSON.h"
+}
+
+#include "rx_frame_info.hh"
+
+inline void add_rx_frame_fields(cJSON* j, const RxFrameInfo& f) {
+    cJSON_AddNumberToObject(j, "seq", (double)f.seq);
+    cJSON_AddNumberToObject(j, "time", f.time);
+    cJSON_AddNumberToObject(j, "snr", f.snr);
+    cJSON_AddNumberToObject(j, "ber_pct", f.ber_pct);
+    cJSON_AddNumberToObject(j, "level_db", f.level_db);
+    cJSON_AddNumberToObject(j, "size", f.size);
+    cJSON_AddBoolToObject(j, "reassembled", f.reassembled);
+    cJSON_AddStringToObject(j, "modem", f.modem.c_str());
+    cJSON_AddStringToObject(j, "mode", f.mode.c_str());
+    if (f.modem == "ofdm") {
+        cJSON_AddNumberToObject(j, "oper_mode", f.oper_mode);
+        cJSON_AddStringToObject(j, "modulation", f.modulation.c_str());
+        cJSON_AddStringToObject(j, "code_rate", f.code_rate.c_str());
+        cJSON_AddStringToObject(j, "frame_size", f.frame_size.c_str());
+    } else if (f.modem == "robust") {
+        cJSON_AddNumberToObject(j, "robust_mode", f.robust_mode);
+    } else if (f.modem == "mfsk") {
+        cJSON_AddNumberToObject(j, "mfsk_mode", f.mfsk_mode);
+    }
+    cJSON_AddStringToObject(j, "callsign", f.callsign.c_str());
+    cJSON_AddStringToObject(j, "callsign_source", f.callsign_source.c_str());
 }
 
 // Base64 decode (RFC 4648)
@@ -71,6 +98,7 @@ public:
         std::function<std::string(const std::string&)> rigctl_command;
         std::function<bool(const std::vector<uint8_t>&, int oper_mode)> tx_data;
         std::function<bool()> send_beacon;
+        std::function<std::vector<RxFrameInfo>(size_t limit, uint64_t since_seq)> rx_frame_history;
     };
 
     ControlPort(int port, const std::string& bind_address, TNCInterface iface)
@@ -149,12 +177,10 @@ public:
     }
 
     // Push per-frame receive stats to all connected clients
-    void notify_rx_frame(float snr, float ber_pct, float level_db) {
+    void notify_rx_frame(const RxFrameInfo& info) {
         cJSON* event = cJSON_CreateObject();
         cJSON_AddStringToObject(event, "event", "rx_frame");
-        cJSON_AddNumberToObject(event, "snr", snr);
-        cJSON_AddNumberToObject(event, "ber_pct", ber_pct);
-        cJSON_AddNumberToObject(event, "level_db", level_db);
+        add_rx_frame_fields(event, info);
         broadcast_event(event);
         cJSON_Delete(event);
     }
@@ -310,6 +336,8 @@ private:
             handle_tx(client_fd, request);
         } else if (strcmp(cmd_str, "send_beacon") == 0) {
             handle_send_beacon(client_fd);
+        } else if (strcmp(cmd_str, "rx_frame_history") == 0) {
+            handle_rx_frame_history(client_fd, request);
         } else {
             send_error(client_fd, "unknown command");
         }
@@ -391,6 +419,37 @@ private:
         }
         cJSON* response = cJSON_CreateObject();
         cJSON_AddBoolToObject(response, "ok", iface_.send_beacon() ? 1 : 0);
+        send_json(client_fd, response);
+        cJSON_Delete(response);
+    }
+
+    void handle_rx_frame_history(int client_fd, cJSON* request) {
+        if (!iface_.rx_frame_history) {
+            send_error(client_fd, "rx_frame_history not available");
+            return;
+        }
+        size_t limit = 64;
+        uint64_t since_seq = 0;
+        cJSON* item = cJSON_GetObjectItemCaseSensitive(request, "limit");
+        if (cJSON_IsNumber(item) && item->valuedouble > 0)
+            limit = (size_t)item->valuedouble;
+        item = cJSON_GetObjectItemCaseSensitive(request, "since_seq");
+        if (cJSON_IsNumber(item) && item->valuedouble > 0)
+            since_seq = (uint64_t)item->valuedouble;
+
+        auto frames = iface_.rx_frame_history(limit, since_seq);
+        int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+
+        cJSON* response = cJSON_CreateObject();
+        cJSON_AddBoolToObject(response, "ok", 1);
+        cJSON* arr = cJSON_AddArrayToObject(response, "frames");
+        for (const auto& f : frames) {
+            cJSON* j = cJSON_CreateObject();
+            add_rx_frame_fields(j, f);
+            cJSON_AddNumberToObject(j, "age_s", (double)(now_ms - f.steady_ms) / 1000.0);
+            cJSON_AddItemToArray(arr, j);
+        }
         send_json(client_fd, response);
         cJSON_Delete(response);
     }
