@@ -12,6 +12,8 @@
 #include <iostream>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <algorithm>
 #include <atomic>
 #include <functional>
@@ -22,68 +24,16 @@
 
 class MiniAudio {
 public:
+    // Device lists are {id, label}. On the ALSA backend the id is the real ALSA
+    // PCM name ("pipewire", "pulse", "default", "hw:1,0", "plughw:CARD=USB,DEV=0"...),
+    // which is what you pass back to the constructor / set_*_device().
+    // Any ALSA PCM name works as a selector even if it wasn't enumerated.
     static std::vector<std::pair<std::string, std::string>> list_capture_devices() {
-        std::vector<std::pair<std::string, std::string>> result;
-
-        ma_context context;
-        if (ma_context_init(NULL, 0, NULL, &context) != MA_SUCCESS) {
-            result.push_back({"default", "default - System Default"});
-            return result;
-        }
-
-        ma_device_info* playback_devices;
-        ma_uint32 playback_count;
-        ma_device_info* capture_devices;
-        ma_uint32 capture_count;
-
-        if (ma_context_get_devices(&context, &playback_devices, &playback_count,
-                                   &capture_devices, &capture_count) != MA_SUCCESS) {
-            ma_context_uninit(&context);
-            result.push_back({"default", "default - System Default"});
-            return result;
-        }
-
-        result.push_back({"default", "default - System Default"});
-
-        for (ma_uint32 i = 0; i < capture_count; i++) {
-            std::string name = capture_devices[i].name;
-            result.push_back({name, name});
-        }
-
-        ma_context_uninit(&context);
-        return result;
+        return list_devices_impl(true);
     }
 
     static std::vector<std::pair<std::string, std::string>> list_playback_devices() {
-        std::vector<std::pair<std::string, std::string>> result;
-
-        ma_context context;
-        if (ma_context_init(NULL, 0, NULL, &context) != MA_SUCCESS) {
-            result.push_back({"default", "default - System Default"});
-            return result;
-        }
-
-        ma_device_info* playback_devices;
-        ma_uint32 playback_count;
-        ma_device_info* capture_devices;
-        ma_uint32 capture_count;
-
-        if (ma_context_get_devices(&context, &playback_devices, &playback_count,
-                                   &capture_devices, &capture_count) != MA_SUCCESS) {
-            ma_context_uninit(&context);
-            result.push_back({"default", "default - System Default"}); // ====!====
-            return result;
-        }
-
-        result.push_back({"default", "default - System Default"});
-
-        for (ma_uint32 i = 0; i < playback_count; i++) {
-            std::string name = playback_devices[i].name;
-            result.push_back({name, name});
-        }
-
-        ma_context_uninit(&context);
-        return result;
+        return list_devices_impl(false);
     }
     // temp
     static std::vector<std::pair<std::string, std::string>> list_devices() {
@@ -274,9 +224,6 @@ public:
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
-
-
-
     bool capture_alive() {
         return capture_open_.load(std::memory_order_acquire) &&
                block_seq_.load(std::memory_order_acquire) > 0 &&
@@ -312,6 +259,99 @@ private:
     static constexpr size_t RING_BUFFER_SIZE = 48000;
     static constexpr size_t CAPTURE_RING_SIZE = 8 * 48000;
 
+    // ---- backend / context helpers -------------------------------------------------
+
+    // On desktop Linux, use ALSA first so PipeWire's ALSA plugin PCMs ("pipewire",
+    // "pulse", "default") and hw/plughw devices are what gets enumerated and opened.
+    // Override with env MINIAUDIO_BACKEND=pulse|jack|alsa.
+    static std::vector<ma_backend> preferred_backends() {
+#if defined(__linux__) && !defined(__ANDROID__)
+        if (const char* env = std::getenv("MINIAUDIO_BACKEND")) {
+            std::string b = env;
+            if (b == "pulse" || b == "pulseaudio")
+                return {ma_backend_pulseaudio, ma_backend_alsa, ma_backend_jack};
+            if (b == "jack")
+                return {ma_backend_jack, ma_backend_alsa, ma_backend_pulseaudio};
+        }
+        return {ma_backend_alsa, ma_backend_pulseaudio, ma_backend_jack};
+#else
+        return {};
+#endif
+    }
+
+    static ma_result init_context(ma_context* ctx) {
+        ma_context_config cfg = ma_context_config_init();
+        // Without this miniaudio only lists hw devices and hides plugin PCMs
+        // like "pipewire" / "pulse" / "default".
+        cfg.alsa.useVerboseDeviceEnumeration = MA_TRUE;
+        std::vector<ma_backend> backends = preferred_backends();
+        return ma_context_init(backends.empty() ? NULL : backends.data(),
+                               (ma_uint32)backends.size(), &cfg, ctx);
+    }
+
+    // Stable selector for a device: the ALSA PCM string on ALSA, the name elsewhere.
+    static std::string device_key(const ma_context& ctx, const ma_device_info& info) {
+        if (ctx.backend == ma_backend_alsa && info.id.alsa[0] != '\0')
+            return std::string(info.id.alsa);
+        return std::string(info.name);
+    }
+
+    // ALSA hint descriptions are often multi-line ("Card\nFront output").
+    static std::string one_line(const char* s) {
+        std::string out;
+        for (const char* p = s; *p; ++p) {
+            if (*p == '\n' || *p == '\r') {
+                if (!out.empty() && out.compare(out.size() - 3, 3, " / ") != 0) out += " / ";
+            } else {
+                out += *p;
+            }
+        }
+        return out;
+    }
+
+    static std::vector<std::pair<std::string, std::string>> list_devices_impl(bool capture) {
+        std::vector<std::pair<std::string, std::string>> result;
+        result.push_back({"default", "default - System Default"});
+
+        ma_context context;
+        if (init_context(&context) != MA_SUCCESS) return result;
+
+        ma_device_info* playback_devices;
+        ma_uint32 playback_count;
+        ma_device_info* capture_devices;
+        ma_uint32 capture_count;
+
+        if (ma_context_get_devices(&context, &playback_devices, &playback_count,
+                                   &capture_devices, &capture_count) != MA_SUCCESS) {
+            ma_context_uninit(&context);
+            return result;
+        }
+
+        ma_device_info* devices = capture ? capture_devices : playback_devices;
+        ma_uint32 count = capture ? capture_count : playback_count;
+
+        for (ma_uint32 i = 0; i < count; i++) {
+            std::string key = device_key(context, devices[i]);
+            if (key.empty()) continue;
+            bool dup = std::any_of(result.begin(), result.end(),
+                                   [&](const auto& p) { return p.first == key; });
+            if (dup) continue;
+
+            std::string desc = one_line(devices[i].name);
+            std::string label = (desc.empty() || desc == key) ? key : key + " - " + desc;
+            result.push_back({key, label});
+        }
+
+        ma_context_uninit(&context);
+        return result;
+    }
+
+    static bool alsa_id_is_hw(const ma_device_id* id) {
+        return id && std::strncmp(id->alsa, "hw:", 3) == 0;
+    }
+
+    // ---------------------------------------------------------------------------------
+
     void log_msg(const std::string& msg) {
         if (log_sink_) log_sink_(msg);
         else std::cerr << msg << std::endl;
@@ -320,11 +360,12 @@ private:
     bool ensure_context() {
         if (context_initialized_) return true;
 
-        if (ma_context_init(NULL, 0, NULL, &context_) != MA_SUCCESS) {
+        if (init_context(&context_) != MA_SUCCESS) {
             log_msg("(!) Failed to initialize audio context");
             return false;
         }
         context_initialized_ = true;
+        log_msg(std::string("Audio backend: ") + ma_get_backend_name(context_.backend));
         return true;
     }
 
@@ -334,28 +375,45 @@ private:
         ma_device_info* capture_devices;
         ma_uint32 capture_count;
 
-        if (ma_context_get_devices(&context_, &playback_devices, &playback_count,
-                                   &capture_devices, &capture_count) != MA_SUCCESS) {
-            return false;
-        }
+        bool have_list = ma_context_get_devices(&context_, &playback_devices, &playback_count,
+                                                &capture_devices, &capture_count) == MA_SUCCESS;
 
-        ma_device_info* devices = capture ? capture_devices : playback_devices;
-        ma_uint32 count = capture ? capture_count : playback_count;
+        if (have_list) {
+            ma_device_info* devices = capture ? capture_devices : playback_devices;
+            ma_uint32 count = capture ? capture_count : playback_count;
 
-        for (ma_uint32 i = 0; i < count; i++) {
-            if (selector == devices[i].name) {
-                *out = devices[i].id;
-                return true;
+            // 1. exact ALSA PCM id / key
+            for (ma_uint32 i = 0; i < count; i++) {
+                if (selector == device_key(context_, devices[i])) {
+                    *out = devices[i].id;
+                    return true;
+                }
+            }
+            // 2. human-readable name (old behaviour)
+            for (ma_uint32 i = 0; i < count; i++) {
+                if (selector == devices[i].name || selector == one_line(devices[i].name)) {
+                    *out = devices[i].id;
+                    return true;
+                }
+            }
+            // 3. numeric index
+            if (!selector.empty() &&
+                selector.find_first_not_of("0123456789") == std::string::npos) {
+                int idx = std::atoi(selector.c_str());
+                if (idx >= 0 && idx < (int)count) {
+                    *out = devices[idx].id;
+                    return true;
+                }
             }
         }
 
-        if (!selector.empty() &&
-            selector.find_first_not_of("0123456789") == std::string::npos) {
-            int idx = std::atoi(selector.c_str());
-            if (idx >= 0 && idx < (int)count) {
-                *out = devices[idx].id;
-                return true;
-            }
+        // 4. ALSA: accept any PCM name verbatim ("pipewire", "plughw:CARD=X,DEV=0", ...)
+        //    even if enumeration didn't report it.
+        if (context_.backend == ma_backend_alsa && !selector.empty() &&
+            selector.size() < sizeof(out->alsa)) {
+            std::memset(out, 0, sizeof(*out));
+            std::memcpy(out->alsa, selector.c_str(), selector.size());
+            return true;
         }
 
         return false;
@@ -383,8 +441,14 @@ private:
             }
         }
 
+        // PipeWire/Pulse ALSA plugins emulate mmap poorly; use read/write I/O
+        // for anything that isn't a raw hw: device.
+        if (context_.backend == ma_backend_alsa)
+            config.alsa.noMMap = alsa_id_is_hw(config.playback.pDeviceID) ? MA_FALSE : MA_TRUE;
+
         if (ma_device_init(&context_, &config, &playback_device_) != MA_SUCCESS) {
-            log_msg("(!) Failed to init playback device");
+            log_msg("(!) Failed to init playback device '" + playback_device_id_ +
+                    "' (if it's hw:, PipeWire may hold it - try 'pipewire' or 'plughw:...')");
             return false;
         }
 
@@ -395,7 +459,7 @@ private:
         }
 
         playback_open_.store(true, std::memory_order_release);
-        log_msg(std::string("Playback: ") + playback_device_.playback.name);
+        log_msg(std::string("Playback: ") + one_line(playback_device_.playback.name));
         return true;
     }
 
@@ -425,8 +489,12 @@ private:
             }
         }
 
+        if (context_.backend == ma_backend_alsa)
+            config.alsa.noMMap = alsa_id_is_hw(config.capture.pDeviceID) ? MA_FALSE : MA_TRUE;
+
         if (ma_device_init(&context_, &config, &capture_device_) != MA_SUCCESS) {
-            log_msg("(!) Failed to initialize capture device");
+            log_msg("(!) Failed to initialize capture device '" + capture_device_id_ +
+                    "' (if it's hw:, PipeWire may hold it - try 'pipewire' or 'plughw:...')");
             return false;
         }
 
@@ -437,7 +505,7 @@ private:
         }
 
         capture_open_.store(true, std::memory_order_release);
-        log_msg(std::string("Capture: ") + capture_device_.capture.name +
+        log_msg(std::string("Capture: ") + one_line(capture_device_.capture.name) +
                 " (device " + std::to_string(capture_device_.capture.internalSampleRate) + " Hz, " +
                 std::to_string(capture_device_.capture.internalChannels) + " ch, period " +
                 std::to_string(capture_device_.capture.internalPeriodSizeInFrames) + ")");
