@@ -3,9 +3,37 @@
 #include "tnc_ui.hh"
 #endif
 
+static std::atomic<int> g_signal_count{0};
+static std::atomic<KISSTNC*> g_shutdown_tnc{nullptr};
+
 void signal_handler(int /*sig*/) {
-    std::cerr << "\nShutting down..." << std::endl;
-    g_running = false;
+    if (g_signal_count.fetch_add(1) == 0) {
+        static const char msg[] = "\nShutting down... (Ctrl+C again forces exit)\n";
+        ssize_t r = write(STDERR_FILENO, msg, sizeof(msg) - 1);
+        (void)r;
+        g_running = false;
+        return;
+    }
+    static const char msg[] = "\nForced exit\n";
+    ssize_t r = write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    (void)r;
+    _exit(130);
+}
+
+static void arm_shutdown_deadline(int grace_ms) {
+    std::thread([grace_ms]() {
+        while (g_running)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::this_thread::sleep_for(std::chrono::milliseconds(grace_ms));
+        if (KISSTNC* tnc = g_shutdown_tnc.load()) {
+            std::thread([tnc]() { tnc->unkey(); }).detach();
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+        }
+        static const char msg[] = "\nShutdown did not complete in time, forcing exit\n";
+        ssize_t r = write(STDERR_FILENO, msg, sizeof(msg) - 1);
+        (void)r;
+        _exit(1);
+    }).detach();
 }
 
 static const char* const MOD_OPTS[] = {
@@ -742,6 +770,7 @@ int main(int argc, char** argv) {
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     signal(SIGPIPE, SIG_IGN);
+    arm_shutdown_deadline(10000);
 
     if (!g_use_ui) {
         std::string settings_path;
@@ -1214,6 +1243,7 @@ int main(int argc, char** argv) {
 
     try {
         KISSTNC tnc(config);
+        g_shutdown_tnc.store(&tnc);
 #ifdef WITH_UI
         const float& modem_airtime_s = ui_state.airtime_seconds;
         const int& modem_mtu_bytes = ui_state.mtu_bytes;
@@ -1444,6 +1474,10 @@ int main(int argc, char** argv) {
                 return tnc.queue_beacon();
             };
 
+            ctrl_iface.reconnect_audio = [&tnc]() -> bool {
+                return tnc.reconnect_audio();
+            };
+
             ctrl_iface.rigctl_command = [&tnc](const std::string& cmd) -> std::string {
                 return tnc.rigctl_command(cmd);
             };
@@ -1563,7 +1597,7 @@ int main(int argc, char** argv) {
                 while (g_running) {
                     ui_state.rigctl_connected = tnc.is_rigctl_connected();
                     ui_state.audio_connected = tnc.is_audio_healthy();
-                    if (ui_state.rig_poll_enabled.load()) {
+                    if (ui_state.rig_poll_enabled.load() && g_running) {
                         ui_state.poll_rig();
                     }
                     std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -1588,7 +1622,9 @@ int main(int argc, char** argv) {
         tnc.run();
 #endif
         if (ctrl) ctrl->stop();
+        g_shutdown_tnc.store(nullptr);
     } catch (const std::exception& e) {
+        g_shutdown_tnc.store(nullptr);
         std::cerr << "error " << e.what() << std::endl;
         return 1;
     }
