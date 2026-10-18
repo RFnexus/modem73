@@ -12,6 +12,7 @@
 #include <iostream>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <algorithm>
 #include <atomic>
 #include <functional>
@@ -24,78 +25,28 @@
 
 class MiniAudio {
 public:
-    static std::vector<std::pair<std::string, std::string>> list_capture_devices() {
-        std::vector<std::pair<std::string, std::string>> result;
-
-        ma_context context;
-        if (ma_context_init(NULL, 0, NULL, &context) != MA_SUCCESS) {
-            result.push_back({"default", "default - System Default"});
-            return result;
-        }
-
-        ma_device_info* playback_devices;
-        ma_uint32 playback_count;
-        ma_device_info* capture_devices;
-        ma_uint32 capture_count;
-
-        if (ma_context_get_devices(&context, &playback_devices, &playback_count,
-                                   &capture_devices, &capture_count) != MA_SUCCESS) {
-            ma_context_uninit(&context);
-            result.push_back({"default", "default - System Default"});
-            return result;
-        }
-
-        result.push_back({"default", "default - System Default"});
-
-        for (ma_uint32 i = 0; i < capture_count; i++) {
-            std::string name = capture_devices[i].name;
-            result.push_back({name, name});
-        }
-
-        ma_context_uninit(&context);
-        return result;
+    static std::vector<std::pair<std::string, std::string>> list_capture_devices(const std::string& backend = "auto") {
+        return list_devices_impl(true, backend);
     }
 
-    static std::vector<std::pair<std::string, std::string>> list_playback_devices() {
-        std::vector<std::pair<std::string, std::string>> result;
-
-        ma_context context;
-        if (ma_context_init(NULL, 0, NULL, &context) != MA_SUCCESS) {
-            result.push_back({"default", "default - System Default"});
-            return result;
-        }
-
-        ma_device_info* playback_devices;
-        ma_uint32 playback_count;
-        ma_device_info* capture_devices;
-        ma_uint32 capture_count;
-
-        if (ma_context_get_devices(&context, &playback_devices, &playback_count,
-                                   &capture_devices, &capture_count) != MA_SUCCESS) {
-            ma_context_uninit(&context);
-            result.push_back({"default", "default - System Default"}); // ====!====
-            return result;
-        }
-
-        result.push_back({"default", "default - System Default"});
-
-        for (ma_uint32 i = 0; i < playback_count; i++) {
-            std::string name = playback_devices[i].name;
-            result.push_back({name, name});
-        }
-
-        ma_context_uninit(&context);
-        return result;
+    static std::vector<std::pair<std::string, std::string>> list_playback_devices(const std::string& backend = "auto") {
+        return list_devices_impl(false, backend);
     }
     // temp
     static std::vector<std::pair<std::string, std::string>> list_devices() {
         return list_capture_devices();
     }
 
+    static bool valid_backend(const std::string& b) {
+        return b == "auto" || b == "alsa" || b == "pulse" || b == "pulseaudio" || b == "jack";
+    }
+
     MiniAudio(const std::string& capture_dev = "default",
               const std::string& playback_dev = "default",
-              int sample_rate = 48000)
-        : capture_device_id_(capture_dev), playback_device_id_(playback_dev), sample_rate_(sample_rate) {
+              int sample_rate = 48000,
+              const std::string& backend = "auto")
+        : capture_device_id_(capture_dev), playback_device_id_(playback_dev),
+          sample_rate_(sample_rate), backend_pref_(backend) {
         capture_buffer_.resize(CAPTURE_RING_SIZE, 0.0f);
         playback_buffer_.resize(RING_BUFFER_SIZE, 0.0f);
     }
@@ -110,6 +61,12 @@ public:
 
     const std::string& capture_device() const { return capture_device_id_; }
     const std::string& playback_device() const { return playback_device_id_; }
+    const std::string& backend_preference() const { return backend_pref_; }
+
+    std::string backend_name() {
+        std::lock_guard<std::mutex> guard(lifecycle_mutex_);
+        return context_ ? ma_get_backend_name(context_->backend) : std::string("none");
+    }
 
     void set_log_sink(std::function<void(const std::string&)> sink) {
         log_sink_ = std::move(sink);
@@ -125,6 +82,14 @@ public:
         std::lock_guard<std::mutex> guard(lifecycle_mutex_);
         close_playback_locked();
         playback_device_id_ = device;
+    }
+
+    void set_backend(const std::string& backend) {
+        std::lock_guard<std::mutex> guard(lifecycle_mutex_);
+        close_capture_locked();
+        close_playback_locked();
+        release_context_locked();
+        backend_pref_ = backend;
     }
 
     bool open_playback(bool strict = false) {
@@ -360,16 +325,115 @@ private:
         else std::cerr << msg << std::endl;
     }
 
+    static std::vector<ma_backend> backend_order(const std::string& pref) {
+#if defined(__linux__) && !defined(__ANDROID__)
+        if (pref == "alsa")
+            return {ma_backend_alsa, ma_backend_pulseaudio, ma_backend_jack};
+        if (pref == "pulse" || pref == "pulseaudio")
+            return {ma_backend_pulseaudio, ma_backend_alsa, ma_backend_jack};
+        if (pref == "jack")
+            return {ma_backend_jack, ma_backend_pulseaudio, ma_backend_alsa};
+#else
+        (void)pref;
+#endif
+        return {};
+    }
+
+    static ma_result init_context(ma_context* ctx, const std::string& pref, bool verbose) {
+        ma_context_config cfg = ma_context_config_init();
+        cfg.alsa.useVerboseDeviceEnumeration = verbose ? MA_TRUE : MA_FALSE;
+        std::vector<ma_backend> order = backend_order(pref);
+        return ma_context_init(order.empty() ? NULL : order.data(),
+                               (ma_uint32)order.size(), &cfg, ctx);
+    }
+
+    static std::string one_line(const char* s) {
+        std::string out;
+        for (const char* p = s; *p; ++p) {
+            if (*p == '\n' || *p == '\r') {
+                bool has_sep = out.size() >= 3 && out.compare(out.size() - 3, 3, " / ") == 0;
+                if (!out.empty() && !has_sep) out += " / ";
+            } else {
+                out += *p;
+            }
+        }
+        while (out.size() >= 3 && out.compare(out.size() - 3, 3, " / ") == 0)
+            out.erase(out.size() - 3);
+        return out;
+    }
+
+    static std::string backend_id(const ma_context* ctx, const ma_device_info& info) {
+        if (ctx->backend == ma_backend_alsa) return std::string(info.id.alsa);
+        if (ctx->backend == ma_backend_pulseaudio) return std::string(info.id.pulse);
+        return std::string();
+    }
+
+    static bool alsa_listed(const std::string& id) {
+        if (id == "default" || id == "pipewire" || id == "pulse") return true;
+        return id.rfind("hw:CARD=", 0) == 0 || id.rfind("plughw:CARD=", 0) == 0;
+    }
+
+    static bool looks_like_alsa_pcm(const std::string& s) {
+        return s.find(':') != std::string::npos || s == "pipewire" || s == "pulse";
+    }
+
+    static std::vector<std::pair<std::string, std::string>> list_devices_impl(bool capture, const std::string& backend) {
+        std::vector<std::pair<std::string, std::string>> result;
+        result.push_back({"default", "default - System Default"});
+
+        ma_context context;
+        if (init_context(&context, backend, true) != MA_SUCCESS) return result;
+
+        ma_device_info* playback_devices;
+        ma_uint32 playback_count;
+        ma_device_info* capture_devices;
+        ma_uint32 capture_count;
+
+        if (ma_context_get_devices(&context, &playback_devices, &playback_count,
+                                   &capture_devices, &capture_count) != MA_SUCCESS) {
+            ma_context_uninit(&context);
+            return result;
+        }
+
+        ma_device_info* devices = capture ? capture_devices : playback_devices;
+        ma_uint32 count = capture ? capture_count : playback_count;
+        bool alsa = context.backend == ma_backend_alsa;
+
+        for (ma_uint32 i = 0; i < count; i++) {
+            std::string key = alsa ? std::string(devices[i].id.alsa) : std::string(devices[i].name);
+            if (key.empty()) continue;
+            if (alsa && !alsa_listed(key)) continue;
+            std::string desc = one_line(devices[i].name);
+            std::string label = alsa && !desc.empty() && desc != key ? key + " - " + desc : key;
+            if (key == "default") {
+                if (alsa && !desc.empty()) result[0].second = label;
+                continue;
+            }
+            bool dup = std::any_of(result.begin(), result.end(),
+                                   [&](const std::pair<std::string, std::string>& p) { return p.first == key; });
+            if (dup) continue;
+            result.push_back({key, label});
+        }
+
+        ma_context_uninit(&context);
+        return result;
+    }
+
     bool ensure_context() {
         if (context_) return true;
 
         ma_context* ctx = new ma_context;
-        if (ma_context_init(NULL, 0, NULL, ctx) != MA_SUCCESS) {
+        if (init_context(ctx, backend_pref_, false) != MA_SUCCESS) {
             delete ctx;
             log_msg("(!) Failed to initialize audio context");
             return false;
         }
         context_ = ctx;
+        std::string name = ma_get_backend_name(ctx->backend);
+        if (name != last_backend_logged_) {
+            last_backend_logged_ = name;
+            log_msg("Audio backend: " + name);
+        }
         return true;
     }
 
@@ -397,37 +461,84 @@ private:
         return fut.wait_for(std::chrono::milliseconds(UNINIT_TIMEOUT_MS)) == std::future_status::ready;
     }
 
-    bool find_device_id(bool capture, const std::string& selector, ma_device_id* out) {
+    bool find_device_id(bool capture, const std::string& selector, ma_device_id* out, bool* verbatim) {
+        *verbatim = false;
+
         ma_device_info* playback_devices;
         ma_uint32 playback_count;
         ma_device_info* capture_devices;
         ma_uint32 capture_count;
 
         if (ma_context_get_devices(context_, &playback_devices, &playback_count,
-                                   &capture_devices, &capture_count) != MA_SUCCESS) {
-            return false;
-        }
+                                   &capture_devices, &capture_count) == MA_SUCCESS) {
+            ma_device_info* devices = capture ? capture_devices : playback_devices;
+            ma_uint32 count = capture ? capture_count : playback_count;
 
-        ma_device_info* devices = capture ? capture_devices : playback_devices;
-        ma_uint32 count = capture ? capture_count : playback_count;
-
-        for (ma_uint32 i = 0; i < count; i++) {
-            if (selector == devices[i].name) {
-                *out = devices[i].id;
-                return true;
+            for (ma_uint32 i = 0; i < count; i++) {
+                if (selector == devices[i].name) {
+                    *out = devices[i].id;
+                    return true;
+                }
+            }
+            for (ma_uint32 i = 0; i < count; i++) {
+                std::string id = backend_id(context_, devices[i]);
+                if (!id.empty() && selector == id) {
+                    *out = devices[i].id;
+                    return true;
+                }
+            }
+            if (!selector.empty() &&
+                selector.find_first_not_of("0123456789") == std::string::npos) {
+                int idx = std::atoi(selector.c_str());
+                if (idx >= 0 && idx < (int)count) {
+                    *out = devices[idx].id;
+                    return true;
+                }
             }
         }
 
-        if (!selector.empty() &&
-            selector.find_first_not_of("0123456789") == std::string::npos) {
-            int idx = std::atoi(selector.c_str());
-            if (idx >= 0 && idx < (int)count) {
-                *out = devices[idx].id;
-                return true;
+        if (context_->backend != ma_backend_alsa) return false;
+
+        ma_context verbose;
+        if (init_context(&verbose, backend_pref_, true) == MA_SUCCESS) {
+            bool found = false;
+            if (ma_context_get_devices(&verbose, &playback_devices, &playback_count,
+                                       &capture_devices, &capture_count) == MA_SUCCESS) {
+                ma_device_info* devices = capture ? capture_devices : playback_devices;
+                ma_uint32 count = capture ? capture_count : playback_count;
+                for (ma_uint32 i = 0; i < count && !found; i++) {
+                    if (selector == devices[i].id.alsa) {
+                        *out = devices[i].id;
+                        found = true;
+                    }
+                }
+                for (ma_uint32 i = 0; i < count && !found; i++) {
+                    if (selector == devices[i].name || selector == one_line(devices[i].name)) {
+                        *out = devices[i].id;
+                        found = true;
+                    }
+                }
             }
+            ma_context_uninit(&verbose);
+            if (found) return true;
+        }
+
+        if (looks_like_alsa_pcm(selector) && selector.size() < sizeof(out->alsa)) {
+            std::memset(out, 0, sizeof(*out));
+            std::memcpy(out->alsa, selector.c_str(), selector.size());
+            *verbatim = true;
+            return true;
         }
 
         return false;
+    }
+
+    std::string open_hint(const ma_device_id* id) const {
+        if (!context_ || context_->backend != ma_backend_alsa || !id) return "";
+        std::string s(id->alsa);
+        if (s.rfind("hw:", 0) == 0 || s.rfind("plughw:", 0) == 0)
+            return " - the card may be held by PipeWire or another program";
+        return "";
     }
 
     bool open_playback_locked(bool strict) {
@@ -444,8 +555,11 @@ private:
         config.periodSizeInFrames = 480;
         config.periods = 4;
 
+        bool verbatim = false;
+        bool resolved = false;
         if (playback_device_id_ != "default" && !playback_device_id_.empty()) {
-            if (find_device_id(false, playback_device_id_, &stored_playback_id_)) {
+            resolved = find_device_id(false, playback_device_id_, &stored_playback_id_, &verbatim);
+            if (resolved) {
                 config.playback.pDeviceID = &stored_playback_id_;
             } else if (strict) {
                 log_msg("(!) Playback device '" + playback_device_id_ + "' not found");
@@ -458,9 +572,21 @@ private:
 
         ma_device* dev = new ma_device;
         if (ma_device_init(context_, &config, dev) != MA_SUCCESS) {
-            delete dev;
-            log_msg("(!) Failed to init playback device");
-            return false;
+            if (!(resolved && verbatim && !strict)) {
+                delete dev;
+                log_msg("(!) Failed to open playback device '" + playback_device_id_ + "'" +
+                        open_hint(config.playback.pDeviceID));
+                return false;
+            }
+            log_msg("(!) Playback device '" + playback_device_id_ +
+                    "' could not be opened" + open_hint(config.playback.pDeviceID) +
+                    ", using system default");
+            config.playback.pDeviceID = nullptr;
+            if (ma_device_init(context_, &config, dev) != MA_SUCCESS) {
+                delete dev;
+                log_msg("(!) Failed to open default playback device");
+                return false;
+            }
         }
 
         playback_lost_.store(false);
@@ -474,7 +600,7 @@ private:
         }
 
         playback_open_.store(true, std::memory_order_release);
-        log_msg(std::string("Playback: ") + dev->playback.name);
+        log_msg(std::string("Playback: ") + one_line(dev->playback.name));
         return true;
     }
 
@@ -496,8 +622,11 @@ private:
         config.performanceProfile = ma_performance_profile_conservative;
 #endif
 
+        bool verbatim = false;
+        bool resolved = false;
         if (capture_device_id_ != "default" && !capture_device_id_.empty()) {
-            if (find_device_id(true, capture_device_id_, &stored_capture_id_)) {
+            resolved = find_device_id(true, capture_device_id_, &stored_capture_id_, &verbatim);
+            if (resolved) {
                 config.capture.pDeviceID = &stored_capture_id_;
             } else if (strict) {
                 log_msg("(!) Capture device '" + capture_device_id_ + "' not found");
@@ -510,9 +639,21 @@ private:
 
         ma_device* dev = new ma_device;
         if (ma_device_init(context_, &config, dev) != MA_SUCCESS) {
-            delete dev;
-            log_msg("(!) Failed to initialize capture device");
-            return false;
+            if (!(resolved && verbatim && !strict)) {
+                delete dev;
+                log_msg("(!) Failed to open capture device '" + capture_device_id_ + "'" +
+                        open_hint(config.capture.pDeviceID));
+                return false;
+            }
+            log_msg("(!) Capture device '" + capture_device_id_ +
+                    "' could not be opened" + open_hint(config.capture.pDeviceID) +
+                    ", using system default");
+            config.capture.pDeviceID = nullptr;
+            if (ma_device_init(context_, &config, dev) != MA_SUCCESS) {
+                delete dev;
+                log_msg("(!) Failed to open default capture device");
+                return false;
+            }
         }
 
         capture_lost_.store(false);
@@ -526,7 +667,7 @@ private:
         }
 
         capture_open_.store(true, std::memory_order_release);
-        log_msg(std::string("Capture: ") + dev->capture.name +
+        log_msg(std::string("Capture: ") + one_line(dev->capture.name) +
                 " (device " + std::to_string(dev->capture.internalSampleRate) + " Hz, " +
                 std::to_string(dev->capture.internalChannels) + " ch, period " +
                 std::to_string(dev->capture.internalPeriodSizeInFrames) + ")");
@@ -661,10 +802,12 @@ private:
     std::string capture_device_id_;
     std::string playback_device_id_;
     int sample_rate_;
+    std::string backend_pref_;
     std::function<void(const std::string&)> log_sink_;
 
     ma_context* context_ = nullptr;
     bool context_abandoned_ = false;
+    std::string last_backend_logged_;
 
     std::atomic<ma_device*> playback_device_{nullptr};
     std::atomic<ma_device*> capture_device_{nullptr};

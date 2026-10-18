@@ -178,6 +178,7 @@ struct TNCUIState {
     // Audio settings 
     std::string audio_input_device = "default";
     std::string audio_output_device = "default";
+    std::string audio_backend = "auto";
     std::vector<std::string> available_input_devices;
     std::vector<std::string> input_device_descriptions;
     std::vector<std::string> available_output_devices;
@@ -765,6 +766,7 @@ struct TNCUIState {
         fprintf(f, "# Audio/PTT\n");
         fprintf(f, "audio_input=%s\n", audio_input_device.c_str());
         fprintf(f, "audio_output=%s\n", audio_output_device.c_str());
+        fprintf(f, "audio_backend=%s\n", audio_backend.c_str());
         fprintf(f, "ptt_type=%d\n", ptt_type_index);
         fprintf(f, "vox_tone_freq=%d\n", vox_tone_freq);
         fprintf(f, "vox_lead_ms=%d\n", vox_lead_ms);
@@ -884,6 +886,7 @@ struct TNCUIState {
                 else if (strcmp(key, "mfsk_rx_enabled") == 0) mfsk_rx_enabled = atoi(value) != 0;
                 else if (strcmp(key, "audio_input") == 0) audio_input_device = value;
                 else if (strcmp(key, "audio_output") == 0) audio_output_device = value;
+                else if (strcmp(key, "audio_backend") == 0) audio_backend = value;
                 else if (strcmp(key, "audio_device") == 0) {
                     audio_input_device = value;
                     audio_output_device = value;
@@ -1137,6 +1140,7 @@ struct TNCUIState {
     std::function<void(TNCUIState&)> on_settings_changed;
     std::function<void()> on_stop_requested;
     std::function<bool()> on_reconnect_audio;
+    std::function<void()> on_refresh_audio_devices;
     std::function<float()> on_get_audio_level;  
     
     void add_log(const std::string& msg) {

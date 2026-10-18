@@ -1894,6 +1894,7 @@ private:
     void show_device_select_dialog(bool is_input) {
         int rows, cols;
         getmaxyx(stdscr, rows, cols);
+        if (state_.on_refresh_audio_devices) state_.on_refresh_audio_devices();
         
         const std::vector<std::string>& devices = is_input ? 
             state_.available_input_devices : state_.available_output_devices;

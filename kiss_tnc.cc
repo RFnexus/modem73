@@ -6,6 +6,45 @@
 static std::atomic<int> g_signal_count{0};
 static std::atomic<KISSTNC*> g_shutdown_tnc{nullptr};
 
+#ifdef WITH_UI
+static void refresh_audio_device_lists(TNCUIState& ui_state) {
+    ui_state.available_input_devices.clear();
+    ui_state.input_device_descriptions.clear();
+    for (const auto& dev : MiniAudio::list_capture_devices(ui_state.audio_backend)) {
+        ui_state.available_input_devices.push_back(dev.first);
+        ui_state.input_device_descriptions.push_back(dev.second);
+    }
+    if (ui_state.available_input_devices.empty()) {
+        ui_state.available_input_devices.push_back("default");
+        ui_state.input_device_descriptions.push_back("default - System Default");
+    }
+    ui_state.available_output_devices.clear();
+    ui_state.output_device_descriptions.clear();
+    for (const auto& dev : MiniAudio::list_playback_devices(ui_state.audio_backend)) {
+        ui_state.available_output_devices.push_back(dev.first);
+        ui_state.output_device_descriptions.push_back(dev.second);
+    }
+    if (ui_state.available_output_devices.empty()) {
+        ui_state.available_output_devices.push_back("default");
+        ui_state.output_device_descriptions.push_back("default - System Default");
+    }
+    ui_state.audio_input_index = 0;
+    ui_state.audio_output_index = 0;
+    for (size_t i = 0; i < ui_state.available_input_devices.size(); i++) {
+        if (ui_state.available_input_devices[i] == ui_state.audio_input_device) {
+            ui_state.audio_input_index = i;
+            break;
+        }
+    }
+    for (size_t i = 0; i < ui_state.available_output_devices.size(); i++) {
+        if (ui_state.available_output_devices[i] == ui_state.audio_output_device) {
+            ui_state.audio_output_index = i;
+            break;
+        }
+    }
+}
+#endif
+
 void signal_handler(int /*sig*/) {
     if (g_signal_count.fetch_add(1) == 0) {
         static const char msg[] = "\nShutting down... (Ctrl+C again forces exit)\n";
@@ -124,6 +163,9 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
         }
         else if (!strcmp(key, "audio_input") && take(key)) config.audio_input_device = value;
         else if (!strcmp(key, "audio_output") && take(key)) config.audio_output_device = value;
+        else if (!strcmp(key, "audio_backend") && take(key)) {
+            if (MiniAudio::valid_backend(value)) config.audio_backend = value;
+        }
         else if (!strcmp(key, "audio_device")) {
             if (take("audio_input")) config.audio_input_device = value;
             if (take("audio_output")) config.audio_output_device = value;
@@ -246,6 +288,8 @@ void print_help(const char* prog) {
               << "  -d, --device DEV        Audio device for both capture and playback\n"
               << "      --input-device DEV  Audio capture device\n"
               << "      --output-device DEV Audio playback device\n"
+              << "      --audio-backend B   Audio backend: auto, alsa, pulse, jack (default: auto)\n"
+              << "                          Place before --list-audio to list that backend's devices\n"
               << "      --tx-level PCT      TX audio output level, 5-100 (default: 100)\n"
               << "\nModem:\n"
               << "  -c, --callsign CALL     Callsign (default: N0CALL)\n"
@@ -366,12 +410,12 @@ int main(int argc, char** argv) {
             return 0;
         } else if (arg == "--list-audio") {
             std::cout << "Input devices:\n";
-            auto input_devices = MiniAudio::list_capture_devices();
+            auto input_devices = MiniAudio::list_capture_devices(config.audio_backend);
             for (const auto& dev : input_devices) {
                 std::cout << "  " << dev.second << "\n";
             }
             std::cout << "\nOutput devices:\n";
-            auto output_devices = MiniAudio::list_playback_devices();
+            auto output_devices = MiniAudio::list_playback_devices(config.audio_backend);
             for (const auto& dev : output_devices) {
                 std::cout << "  " << dev.second << "\n";
             }
@@ -434,6 +478,14 @@ int main(int argc, char** argv) {
         } else if (arg == "--output-device" && i + 1 < argc) {
             config.audio_output_device = argv[++i];
             cli_set.insert("audio_output");
+        } else if (arg == "--audio-backend" && i + 1 < argc) {
+            std::string b = argv[++i];
+            if (!MiniAudio::valid_backend(b)) {
+                std::cerr << "Invalid --audio-backend '" << b << "' (auto, alsa, pulse, jack)" << std::endl;
+                return 1;
+            }
+            config.audio_backend = b;
+            cli_set.insert("audio_backend");
         } else if (arg == "--tx-level" && i + 1 < argc) {
             config.tx_drive = clamp_arg("--tx-level", argv[++i], 5, 100) / 100.0f;
             cli_set.insert("tx_drive");
@@ -804,26 +856,6 @@ int main(int argc, char** argv) {
                                        : config_dir + "/settings";
             ui_state.presets_file = config_dir + "/presets";
             
-            auto input_devices = MiniAudio::list_capture_devices();
-            for (const auto& dev : input_devices) {
-                ui_state.available_input_devices.push_back(dev.first);
-                ui_state.input_device_descriptions.push_back(dev.second);
-            }
-            if (ui_state.available_input_devices.empty()) {
-                ui_state.available_input_devices.push_back("default");
-                ui_state.input_device_descriptions.push_back("default - System Default");
-            }
-            
-            auto output_devices = MiniAudio::list_playback_devices();
-            for (const auto& dev : output_devices) {
-                ui_state.available_output_devices.push_back(dev.first);
-                ui_state.output_device_descriptions.push_back(dev.second);
-            }
-            if (ui_state.available_output_devices.empty()) {
-                ui_state.available_output_devices.push_back("default");
-                ui_state.output_device_descriptions.push_back("default - System Default");
-            }
-            
             // Try to load saved settings
             if (ui_state.load_settings()) {
                 // Apply loaded settings to config
@@ -911,6 +943,8 @@ int main(int argc, char** argv) {
                     config.audio_input_device = ui_state.audio_input_device;
                 if (!cli_set.count("audio_output"))
                     config.audio_output_device = ui_state.audio_output_device;
+                if (!cli_set.count("audio_backend"))
+                    config.audio_backend = ui_state.audio_backend;
                 // PTT settings
                 if (!cli_set.count("ptt_type"))
                     config.ptt_type = static_cast<PTTType>(ui_state.ptt_type_index);
@@ -970,20 +1004,6 @@ int main(int argc, char** argv) {
                 if (!cli_set.count("control_bind_address"))
                     config.control_bind_address = ui_state.control_bind_address;
 
-                // Find audio device indices
-                for (size_t i = 0; i < ui_state.available_input_devices.size(); i++) {
-                    if (ui_state.available_input_devices[i] == ui_state.audio_input_device) {
-                        ui_state.audio_input_index = i;
-                        break;
-                    }
-                }
-                for (size_t i = 0; i < ui_state.available_output_devices.size(); i++) {
-                    if (ui_state.available_output_devices[i] == ui_state.audio_output_device) {
-                        ui_state.audio_output_index = i;
-                        break;
-                    }
-                }
-                
                 std::cerr << "Loaded settings from " << ui_state.config_file << std::endl;
             } else {
 
@@ -1087,6 +1107,7 @@ int main(int argc, char** argv) {
         ui_state.tx_drive = config.tx_drive;
         ui_state.audio_input_device = config.audio_input_device;
         ui_state.audio_output_device = config.audio_output_device;
+        ui_state.audio_backend = config.audio_backend;
         ui_state.com_port = config.com_port;
         ui_state.hamlib_model = config.hamlib_model;
         ui_state.hamlib_device = config.hamlib_device;
@@ -1118,18 +1139,7 @@ int main(int argc, char** argv) {
                 break;
             }
         }
-        for (size_t i = 0; i < ui_state.available_input_devices.size(); i++) {
-            if (ui_state.available_input_devices[i] == ui_state.audio_input_device) {
-                ui_state.audio_input_index = i;
-                break;
-            }
-        }
-        for (size_t i = 0; i < ui_state.available_output_devices.size(); i++) {
-            if (ui_state.available_output_devices[i] == ui_state.audio_output_device) {
-                ui_state.audio_output_index = i;
-                break;
-            }
-        }
+        refresh_audio_device_lists(ui_state);
 
         // Set PTT info for display
         ui_state.ptt_type_index = static_cast<int>(config.ptt_type);
@@ -1302,6 +1312,9 @@ int main(int argc, char** argv) {
                 TNCConfig cfg = tnc.get_config();
 
                 cJSON_AddStringToObject(j, "callsign", cfg.callsign.c_str());
+                cJSON_AddStringToObject(j, "audio_input", cfg.audio_input_device.c_str());
+                cJSON_AddStringToObject(j, "audio_output", cfg.audio_output_device.c_str());
+                cJSON_AddStringToObject(j, "audio_backend", cfg.audio_backend.c_str());
                 cJSON_AddNumberToObject(j, "modem_type", cfg.modem_type);
                 cJSON_AddNumberToObject(j, "mfsk_mode", cfg.mfsk_mode);
                 cJSON_AddNumberToObject(j, "robust_mode", cfg.robust_mode);
@@ -1379,6 +1392,13 @@ int main(int argc, char** argv) {
                     new_config.center_freq = 1500;
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "postamble")) && cJSON_IsBool(item))
                     new_config.postamble = cJSON_IsTrue(item);
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "audio_input")) && cJSON_IsString(item))
+                    new_config.audio_input_device = item->valuestring;
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "audio_output")) && cJSON_IsString(item))
+                    new_config.audio_output_device = item->valuestring;
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "audio_backend")) && cJSON_IsString(item)
+                    && MiniAudio::valid_backend(item->valuestring))
+                    new_config.audio_backend = item->valuestring;
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "csma_enabled")) && cJSON_IsBool(item))
                     new_config.csma_enabled = cJSON_IsTrue(item);
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "csma_sync_only")) && cJSON_IsBool(item))
@@ -1534,6 +1554,7 @@ int main(int argc, char** argv) {
                 new_config.tx_drive = state.tx_drive;
                 new_config.audio_input_device = state.audio_input_device;
                 new_config.audio_output_device = state.audio_output_device;
+                new_config.audio_backend = state.audio_backend;
                 // PTT settings
                 new_config.ptt_type = static_cast<PTTType>(state.ptt_type_index);
                 new_config.vox_tone_freq = state.vox_tone_freq;
@@ -1566,6 +1587,10 @@ int main(int argc, char** argv) {
             // Set up audio reconnect callback
             ui_state.on_reconnect_audio = [&tnc]() -> bool {
                 return tnc.reconnect_audio();
+            };
+
+            ui_state.on_refresh_audio_devices = [&ui_state]() {
+                refresh_audio_device_lists(ui_state);
             };
 
             ui_state.on_get_audio_level = [&tnc]() -> float {

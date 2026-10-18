@@ -283,7 +283,8 @@ public:
     void run() {
         audio_ = std::make_unique<MiniAudio>(config_.audio_input_device,
                                              config_.audio_output_device,
-                                             config_.sample_rate);
+                                             config_.sample_rate,
+                                             config_.audio_backend);
         audio_->set_log_sink([](const std::string& msg) { ui_log(msg); });
         if (!audio_->open_capture()) {
             throw std::runtime_error("Failed to open audio capture");
@@ -2380,6 +2381,15 @@ public:
             if (config_.tx_drive != new_config.tx_drive) {
                 config_.tx_drive = new_config.tx_drive;
                 if (audio_) audio_->set_tx_gain(config_.tx_drive);
+            }
+            if (config_.audio_backend != new_config.audio_backend &&
+                MiniAudio::valid_backend(new_config.audio_backend)) {
+                config_.audio_backend = new_config.audio_backend;
+                if (audio_) {
+                    audio_->set_backend(config_.audio_backend);
+                    audio_reconnect_requested_.store(true);
+                    ui_log("Audio backend changed to '" + config_.audio_backend + "', reconnecting");
+                }
             }
             if (config_.audio_input_device != new_config.audio_input_device ||
                 config_.audio_output_device != new_config.audio_output_device) {
