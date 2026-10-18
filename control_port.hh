@@ -98,6 +98,7 @@ public:
         std::function<std::string(const std::string&)> rigctl_command;
         std::function<bool(const std::vector<uint8_t>&, int oper_mode)> tx_data;
         std::function<bool()> send_beacon;
+        std::function<bool()> reconnect_audio;
         std::function<std::vector<RxFrameInfo>(size_t limit, uint64_t since_seq)> rx_frame_history;
     };
 
@@ -336,6 +337,8 @@ private:
             handle_tx(client_fd, request);
         } else if (strcmp(cmd_str, "send_beacon") == 0) {
             handle_send_beacon(client_fd);
+        } else if (strcmp(cmd_str, "reconnect_audio") == 0) {
+            handle_reconnect_audio(client_fd);
         } else if (strcmp(cmd_str, "rx_frame_history") == 0) {
             handle_rx_frame_history(client_fd, request);
         } else {
@@ -419,6 +422,17 @@ private:
         }
         cJSON* response = cJSON_CreateObject();
         cJSON_AddBoolToObject(response, "ok", iface_.send_beacon() ? 1 : 0);
+        send_json(client_fd, response);
+        cJSON_Delete(response);
+    }
+
+    void handle_reconnect_audio(int client_fd) {
+        if (!iface_.reconnect_audio) {
+            send_error(client_fd, "reconnect_audio not available");
+            return;
+        }
+        cJSON* response = cJSON_CreateObject();
+        cJSON_AddBoolToObject(response, "ok", iface_.reconnect_audio() ? 1 : 0);
         send_json(client_fd, response);
         cJSON_Delete(response);
     }

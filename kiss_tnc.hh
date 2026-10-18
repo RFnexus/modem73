@@ -86,6 +86,7 @@ struct TNCConfig {
     // Audio settings
     std::string audio_input_device = "default";
     std::string audio_output_device = "default";
+    std::string audio_backend = "auto";
     int sample_rate = 48000;
     float tx_drive = 1.0f;
     

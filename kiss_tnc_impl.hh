@@ -283,13 +283,14 @@ public:
     void run() {
         audio_ = std::make_unique<MiniAudio>(config_.audio_input_device,
                                              config_.audio_output_device,
-                                             config_.sample_rate);
+                                             config_.sample_rate,
+                                             config_.audio_backend);
         audio_->set_log_sink([](const std::string& msg) { ui_log(msg); });
-        if (!audio_->open_playback()) {
-            throw std::runtime_error("Failed to open audio output");
-        }
         if (!audio_->open_capture()) {
             throw std::runtime_error("Failed to open audio capture");
+        }
+        if (!audio_->open_playback()) {
+            throw std::runtime_error("Failed to open audio output");
         }
         audio_->set_tx_gain(config_.tx_drive);
         
@@ -470,10 +471,7 @@ public:
         std::thread rx_thread(&KISSTNC::rx_loop, this);
         std::thread tx_thread(&KISSTNC::tx_loop, this);
         std::thread watchdog_thread(&KISSTNC::ptt_watchdog_loop, this);
-
-        int64_t last_audio_check_ms = 0;
-        int64_t next_audio_retry_ms = 0;
-        int64_t audio_retry_backoff_ms = 5000;
+        std::thread audio_thread(&KISSTNC::audio_supervisor_loop, this);
 
         // Main
         while (g_running) {
@@ -558,35 +556,18 @@ public:
                 }
             }
             
-            int64_t audio_now_ms = steady_now_ms();
-            if (audio_now_ms - last_audio_check_ms >= 1000) {
-                last_audio_check_ms = audio_now_ms;
-                if (audio_ && !audio_->is_healthy() && audio_now_ms >= next_audio_retry_ms) {
-                    ui_log("(!) Audio unhealthy - attempting reconnect");
-                    if (audio_->reconnect()) {
-                        audio_->set_tx_gain(config_.tx_drive);
-                        ui_log("Audio reconnected");
-                        audio_retry_backoff_ms = 5000;
-                        next_audio_retry_ms = 0;
-                    } else {
-                        next_audio_retry_ms = audio_now_ms + audio_retry_backoff_ms;
-                        ui_log("(!) Audio reconnect failed, retrying in " +
-                               std::to_string(audio_retry_backoff_ms / 1000) + "s");
-                        audio_retry_backoff_ms = std::min<int64_t>(audio_retry_backoff_ms * 2, 60000);
-                    }
-                }
-            }
-
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
 
         // Cleanup
         tx_running_ = false;
         rx_running_ = false;
+        if (audio_) audio_->request_stop();
 
         tx_thread.join();
         rx_thread.join();
         watchdog_thread.join();
+        audio_thread.join();
 
         set_ptt(false);
 
@@ -1282,7 +1263,7 @@ private:
             // Lead tone
             for (size_t i = 0; i < lead_tone.size(); i += chunk_size) {
                 int n = std::min(chunk_size, (int)(lead_tone.size() - i));
-                audio_->write(lead_tone.data() + i, n);
+                if (!g_running || audio_->write(lead_tone.data() + i, n) < n) break;
             }
             if (gap_frames > 0)
                 audio_->write_silence(gap_frames);
@@ -1290,13 +1271,13 @@ private:
             // OFDM data
             for (size_t i = 0; i < samples.size(); i += chunk_size) {
                 int n = std::min(chunk_size, (int)(samples.size() - i));
-                if (audio_->write(samples.data() + i, n) < n) break;
+                if (!g_running || audio_->write(samples.data() + i, n) < n) break;
             }
 
             // Tail tone
             for (size_t i = 0; i < tail_tone.size(); i += chunk_size) {
                 int n = std::min(chunk_size, (int)(tail_tone.size() - i));
-                audio_->write(tail_tone.data() + i, n);
+                if (!g_running || audio_->write(tail_tone.data() + i, n) < n) break;
             }
             
             audio_->drain_playback();
@@ -1340,7 +1321,7 @@ private:
                                                         station_id_);
                     for (size_t i = 0; i < lead.size(); i += 1024) {
                         int n = std::min(1024, (int)(lead.size() - i));
-                        audio_->write(lead.data() + i, n);
+                        if (!g_running || audio_->write(lead.data() + i, n) < n) break;
                     }
                     audio_->write_silence(gap_frames);
                 } else {
@@ -1354,7 +1335,7 @@ private:
             const int chunk_size = 1024;
             for (size_t i = 0; i < samples.size(); i += chunk_size) {
                 int n = std::min(chunk_size, (int)(samples.size() - i));
-                if (audio_->write(samples.data() + i, n) < n) break;
+                if (!g_running || audio_->write(samples.data() + i, n) < n) break;
             }
 
             if (last) {
@@ -1753,7 +1734,7 @@ private:
                         robust_decoder_n_->configure(cf);
                         tone_dcd_->configure(cf);
                     }
-                    if (was_blanking) {
+                    if (was_blanking || rx_reset_pending_.exchange(false)) {
                         decoder_->reset();
                         for (auto& d : mfsk_decoders_) d->reset();
                         robust_decoder_->reset();
@@ -2009,6 +1990,47 @@ private:
         ptt_deadline_ms_.store(steady_now_ms() + expected_ms + PTT_WATCHDOG_SLACK_MS);
     }
 
+    void audio_supervisor_loop() {
+        int64_t last_check_ms = 0;
+        int64_t next_retry_ms = 0;
+        int64_t backoff_ms = 5000;
+        while (g_running) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (!audio_) continue;
+            int64_t now = steady_now_ms();
+            bool requested = audio_reconnect_requested_.exchange(false);
+            if (!requested && now - last_check_ms < 1000) continue;
+            last_check_ms = now;
+            bool healthy = audio_->is_healthy();
+            if (!requested && (healthy || now < next_retry_ms)) continue;
+            if (requested && healthy && tx_on_air_.load()) {
+                audio_reconnect_requested_.store(true);
+                continue;
+            }
+            if (requested)
+                ui_log("Audio: reconnect requested");
+            else
+                ui_log("(!) Audio unhealthy (" + audio_->health_detail() + ") - attempting reconnect");
+            if (audio_->reconnect()) {
+                float drive;
+                {
+                    std::lock_guard<std::mutex> lock(config_mutex_);
+                    drive = config_.tx_drive;
+                }
+                audio_->set_tx_gain(drive);
+                rx_reset_pending_.store(true);
+                ui_log("Audio reconnected");
+                backoff_ms = 5000;
+                next_retry_ms = 0;
+            } else {
+                next_retry_ms = steady_now_ms() + backoff_ms;
+                ui_log("(!) Audio reconnect failed, retrying in " +
+                       std::to_string(backoff_ms / 1000) + "s");
+                backoff_ms = std::min<int64_t>(backoff_ms * 2, 60000);
+            }
+        }
+    }
+
     void ptt_watchdog_loop() {
         while (g_running) {
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -2080,6 +2102,8 @@ private:
     std::unique_ptr<RobustDecoder> robust_decoder_n_;
 
     std::unique_ptr<MiniAudio> audio_;
+    std::atomic<bool> audio_reconnect_requested_{false};
+    std::atomic<bool> rx_reset_pending_{false};
     std::unique_ptr<RigctlPTT> rigctl_;
 #ifdef WITH_HAMLIB
     std::unique_ptr<HamlibPTT> hamlib_ptt_;
@@ -2358,6 +2382,27 @@ public:
                 config_.tx_drive = new_config.tx_drive;
                 if (audio_) audio_->set_tx_gain(config_.tx_drive);
             }
+            if (config_.audio_backend != new_config.audio_backend &&
+                MiniAudio::valid_backend(new_config.audio_backend)) {
+                config_.audio_backend = new_config.audio_backend;
+                if (audio_) {
+                    audio_->set_backend(config_.audio_backend);
+                    audio_reconnect_requested_.store(true);
+                    ui_log("Audio backend changed to '" + config_.audio_backend + "', reconnecting");
+                }
+            }
+            if (config_.audio_input_device != new_config.audio_input_device ||
+                config_.audio_output_device != new_config.audio_output_device) {
+                config_.audio_input_device = new_config.audio_input_device;
+                config_.audio_output_device = new_config.audio_output_device;
+                if (audio_) {
+                    audio_->set_capture_device(config_.audio_input_device);
+                    audio_->set_playback_device(config_.audio_output_device);
+                    audio_reconnect_requested_.store(true);
+                    ui_log("Audio devices changed to in '" + config_.audio_input_device +
+                           "' out '" + config_.audio_output_device + "', reconnecting");
+                }
+            }
         }
         
         // Update callsign if changed
@@ -2576,10 +2621,9 @@ public:
     }
     
     bool reconnect_audio() {
-        if (audio_) {
-            return audio_->reconnect();
-        }
-        return false;
+        if (!audio_) return false;
+        audio_reconnect_requested_.store(true);
+        return true;
     }
     
     void queue_data(const std::vector<uint8_t>& data) {
