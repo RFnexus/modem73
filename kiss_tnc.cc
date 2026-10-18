@@ -915,6 +915,10 @@ int main(int argc, char** argv) {
                     config.robust_rx_enabled = ui_state.robust_rx_enabled;
                 if (!cli_set.count("mfsk_rx_enabled"))
                     config.mfsk_rx_enabled = ui_state.mfsk_rx_enabled;
+                if (!cli_set.count("audio_backend"))
+                    config.audio_backend = ui_state.audio_backend;
+                ui_state.audio_backend = config.audio_backend;
+                refresh_audio_device_lists(ui_state);
                 bool devices_migrated = false;
                 if (!ui_state.audio_input_device.empty() &&
                     ui_state.audio_input_device.find_first_not_of("0123456789") == std::string::npos) {
@@ -943,8 +947,6 @@ int main(int argc, char** argv) {
                     config.audio_input_device = ui_state.audio_input_device;
                 if (!cli_set.count("audio_output"))
                     config.audio_output_device = ui_state.audio_output_device;
-                if (!cli_set.count("audio_backend"))
-                    config.audio_backend = ui_state.audio_backend;
                 // PTT settings
                 if (!cli_set.count("ptt_type"))
                     config.ptt_type = static_cast<PTTType>(ui_state.ptt_type_index);

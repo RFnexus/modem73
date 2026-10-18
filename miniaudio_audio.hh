@@ -74,21 +74,16 @@ public:
 
     void set_capture_device(const std::string& device) {
         std::lock_guard<std::mutex> guard(lifecycle_mutex_);
-        close_capture_locked();
         capture_device_id_ = device;
     }
 
     void set_playback_device(const std::string& device) {
         std::lock_guard<std::mutex> guard(lifecycle_mutex_);
-        close_playback_locked();
         playback_device_id_ = device;
     }
 
     void set_backend(const std::string& backend) {
         std::lock_guard<std::mutex> guard(lifecycle_mutex_);
-        close_capture_locked();
-        close_playback_locked();
-        release_context_locked();
         backend_pref_ = backend;
     }
 
