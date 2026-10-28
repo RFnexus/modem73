@@ -667,8 +667,7 @@ private:
         std::mt19937 gen(rd());
         if (station_id_ == 0)
             station_id_ = (uint16_t)((gen() % 0xFFFE) + 1);
-        int csma_stage = 0;
-        int64_t csma_stage_ms = 0;
+        bool csma_crowded = false;
         int boot_attempt = 0;
         int64_t last_burst_end = steady_now_ms() - PARTICIPATION_MS - 1;
         auto beacon_interval_ms = [&]() {
@@ -763,22 +762,18 @@ private:
                     gcfg.contenders = csma_sync_only
                                         ? n_contenders(csma_band == 0) : -1;
                     int raw_pop = gcfg.contenders;
-                    while (csma_stage > 0 &&
-                           steady_now_ms() - csma_stage_ms >= CSMA_STAGE_DECAY_MS) {
-                        csma_stage--;
-                        csma_stage_ms += CSMA_STAGE_DECAY_MS;
-                    }
-                    if (occupancy_pct_.load() > 55 || csma_stage >= 1)
+                    if (gcfg.contenders == 0 &&
+                        (occupancy_pct_.load() > 55 || csma_crowded))
                         gcfg.contenders = -1;
+                    if (csma_sync_only && csma_quiet_ms <= 0 && gcfg.contenders >= 0)
+                        gcfg.quiet_ms = std::min(gcfg.quiet_ms, 1000);
                     if (steady_now_ms() - last_burst_end < 3000 &&
                         gcfg.contenders >= 0 && gcfg.contenders <= 1)
                         gcfg.contenders = 2;
-                    if (csma_sync_only && csma_quiet_ms <= 0 &&
-                        gcfg.contenders >= 0 && gcfg.contenders <= 1)
-                        gcfg.quiet_ms = std::min(gcfg.quiet_ms, 1000);
                     if (pkt.beacon) {
                         gcfg.quiet_ms = RANKED_QUIET_MS;
                         gcfg.contenders = 0;
+                        gcfg.redraw_on_busy = true;
                         gcfg.slot_ms = 500;
                         gcfg.dcd_detect_ms = 550;
                         gcfg.extra_delay_ms =
@@ -791,8 +786,6 @@ private:
                         bool forgotten =
                             steady_now_ms() - last_id_air_ms > HEARD_EXPIRY_MS;
                         gcfg.rank = forgotten ? -1 : ranked_slot(&gcfg.rank_n);
-                        if (gcfg.rank >= gcfg.rank_n)
-                            yield_attempt_++;
                         if (gcfg.rank < 0) {
                             if (forgotten) {
                                 boot_rank = (int)(id_mix(station_id_.load(),
@@ -824,9 +817,9 @@ private:
                             snprintf(rankbuf, sizeof rankbuf, "%d/%d",
                                      gcfg.rank, gcfg.rank_n);
                         snprintf(dbg, sizeof dbg,
-                                 "CSMA: pop %d stage %d occupancy %d%% "
+                                 "CSMA: pop %d crowded %d occupancy %d%% "
                                  "quiet %d ms rank %s winner %04X",
-                                 raw_pop, csma_stage,
+                                 raw_pop, csma_crowded ? 1 : 0,
                                  occupancy_pct_.load(), gcfg.quiet_ms,
                                  rankbuf, last_winner_id_.load());
                         ui_log(dbg);
@@ -890,7 +883,11 @@ private:
                             }
                             gate.set_rank(cur_rank, cur_rank_n);
                         }
-                        auto v = gate.step(level_db, alive, allowed);
+                        int idle_since = (int)std::max<int64_t>(0,
+                            std::min<int64_t>(steady_now_ms() -
+                                                  last_channel_busy_ms_.load(),
+                                              1000000));
+                        auto v = gate.step(level_db, alive, allowed, idle_since);
                         if (v == CsmaGate::Verdict::TRANSMIT) {
                             switch (gate.reason()) {
                             case CsmaGate::Reason::NO_AUDIO:
@@ -959,13 +956,11 @@ private:
                         beacon_due_ms = beacon_due();
                         continue;
                     }
-                    if (csma_sync_only) {
-                        if (busy_episodes >= 2)
-                            csma_stage = 2;
-                        else if (csma_stage > 0)
-                            csma_stage--;
-                        csma_stage_ms = steady_now_ms();
-                    }
+                    if (csma_sync_only)
+                        csma_crowded = busy_episodes >= 2;
+                    if (csma_ranked && csma_sync_only && cur_rank_n > 0 &&
+                        cur_rank >= cur_rank_n)
+                        yield_attempt_++;
                     if (!g_running)
                         break;
                 }
@@ -1675,7 +1670,7 @@ private:
                     int64_t now_ms = steady_now_ms();
                     bool loud = audio_->instant_level_db(config_.carrier_sense_ms) >
                                 config_.carrier_threshold_db;
-                    bool occupied = (loud && !config_.csma_sync_only) || !is_tx_allowed();
+                    bool occupied = (loud && !config_.csma_sync_only) || dcd_active_;
                     if (occupied || blanking)
                         last_channel_busy_ms_.store(now_ms);
                     if (occupied) {
@@ -2145,7 +2140,7 @@ private:
     // TX lockout - prevents TX while receiving
     mutable std::mutex lockout_mutex_;
     std::chrono::steady_clock::time_point tx_lockout_until_;
-    static constexpr float RX_LOCKOUT_SECONDS = 0.5f;
+    static constexpr float RX_LOCKOUT_SECONDS = 1.0f;
     std::atomic<int64_t> last_rx_done_ms_{0};
     std::atomic<int64_t> last_channel_busy_ms_{steady_now_ms()};
     std::atomic<int> heard_air_ms_{0};
@@ -2161,10 +2156,7 @@ private:
     static constexpr int64_t HEARD_EXPIRY_MS = 300000;
     static constexpr int64_t UNATTRIB_DISTRUST_MS = 90000;
     static constexpr int RANKED_QUIET_MS = 1000;
-
-    // stage a decay after 60 seconds for our contention window
-    static constexpr int64_t CSMA_STAGE_DECAY_MS = 60000;
-    static constexpr int YIELD_BUCKETS = 4;
+    static constexpr int YIELD_BUCKETS = 2;
     static constexpr int64_t PARTICIPATION_MS = 720000;
     int yield_attempt_ = 0;
     std::map<uint16_t, int64_t> heard_ids_;
