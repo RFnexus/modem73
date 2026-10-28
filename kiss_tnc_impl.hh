@@ -958,8 +958,7 @@ private:
                     }
                     if (csma_sync_only)
                         csma_crowded = busy_episodes >= 2;
-                    if (csma_ranked && csma_sync_only && cur_rank_n > 0 &&
-                        cur_rank >= cur_rank_n)
+                    if (csma_ranked && csma_sync_only && cur_rank_n > 0)
                         yield_attempt_++;
                     if (!g_running)
                         break;
