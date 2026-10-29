@@ -23,6 +23,8 @@
 #include <thread>
 #include <chrono>
 
+#include "net_audio.hh"
+
 class MiniAudio {
 public:
     static std::vector<std::pair<std::string, std::string>> list_capture_devices(const std::string& backend = "auto") {
@@ -65,6 +67,7 @@ public:
 
     std::string backend_name() {
         std::lock_guard<std::mutex> guard(lifecycle_mutex_);
+        if (net_in_use_.load()) return "network";
         return context_ ? ma_get_backend_name(context_->backend) : std::string("none");
     }
 
@@ -200,6 +203,8 @@ public:
             playback_lost_.load(std::memory_order_acquire) ||
             rerouted_.load(std::memory_order_acquire))
             return false;
+        if (net_in_use_.load() && !net_.alive())
+            return false;
         if (consecutive_read_failures_.load() >= 3 ||
             consecutive_write_failures_.load() >= 3)
             return false;
@@ -217,6 +222,7 @@ public:
         if (capture_lost_.load()) return "capture device stopped";
         if (playback_lost_.load()) return "playback device stopped";
         if (rerouted_.load()) return "stream moved to another device";
+        if (net_in_use_.load() && !net_.alive()) return "network audio disconnected";
         int64_t now = steady_ms();
         if (now - last_block_ms_.load() > HEARTBEAT_STALE_MS) return "no capture callbacks";
         if (now - last_playback_ms_.load() > HEARTBEAT_STALE_MS) return "no playback callbacks";
@@ -536,8 +542,49 @@ private:
         return "";
     }
 
+    // Shared by capture and playback: both must name the same tcp: device,
+    // and one connection carries both directions.
+    bool open_net_locked(bool capture) {
+        if (capture_device_id_ != playback_device_id_) {
+            log_msg("(!) Network audio needs the same tcp: address for input and output");
+            return false;
+        }
+        if (!net_.alive()) {
+            std::string err;
+            bool ok = net_.open(
+                capture_device_id_,
+                [this](const float* in, size_t n) { push_capture(in, (ma_uint32)n); },
+                [this](float* out, size_t n) { pull_playback(out, (ma_uint32)n); },
+                &err);
+            if (!ok) {
+                log_msg("(!) Network audio " + capture_device_id_ + ": " + err);
+                return false;
+            }
+        }
+        net_in_use_.store(true);
+        if (capture) {
+            capture_lost_.store(false);
+            last_block_ms_.store(steady_ms(), std::memory_order_relaxed);
+            capture_open_.store(true, std::memory_order_release);
+            log_msg("Capture: network audio " + capture_device_id_);
+        } else {
+            playback_lost_.store(false);
+            last_playback_ms_.store(steady_ms(), std::memory_order_relaxed);
+            playback_open_.store(true, std::memory_order_release);
+            log_msg("Playback: network audio " + playback_device_id_);
+        }
+        return true;
+    }
+
+    // Any close stops the shared connection; reconnect() reopens both sides.
+    void close_net_locked() {
+        if (!net_in_use_.exchange(false)) return;
+        net_.close();
+    }
+
     bool open_playback_locked(bool strict) {
         if (playback_open_.load(std::memory_order_acquire)) return true;
+        if (NetAudioLink::is_net_device(playback_device_id_)) return open_net_locked(false);
         if (!ensure_context()) return false;
 
         ma_device_config config = ma_device_config_init(ma_device_type_playback);
@@ -601,6 +648,7 @@ private:
 
     bool open_capture_locked(bool strict) {
         if (capture_open_.load(std::memory_order_acquire)) return true;
+        if (NetAudioLink::is_net_device(capture_device_id_)) return open_net_locked(true);
         if (!ensure_context()) return false;
 
         ma_device_config config = ma_device_config_init(ma_device_type_capture);
@@ -671,6 +719,7 @@ private:
 
     void close_playback_locked() {
         bool was_open = playback_open_.exchange(false, std::memory_order_acq_rel);
+        close_net_locked();
         ma_device* dev = playback_device_.exchange(nullptr, std::memory_order_acq_rel);
         std::unique_lock<std::shared_mutex> lock(playback_rw_);
         if (dev) {
@@ -687,6 +736,7 @@ private:
 
     void close_capture_locked() {
         bool was_open = capture_open_.exchange(false, std::memory_order_acq_rel);
+        close_net_locked();
         ma_device* dev = capture_device_.exchange(nullptr, std::memory_order_acq_rel);
         std::unique_lock<std::shared_mutex> lock(capture_rw_);
         if (dev) {
@@ -733,22 +783,7 @@ private:
             for (ma_uint32 i = 0; i < frame_count; i++) out[i] = 0.0f;
             return;
         }
-
-        size_t read_pos = self->playback_read_pos_.load();
-        size_t write_pos = self->playback_write_pos_.load();
-        size_t available = (write_pos - read_pos + RING_BUFFER_SIZE) % RING_BUFFER_SIZE;
-
-        ma_uint32 to_read = std::min((ma_uint32)available, frame_count);
-
-        for (ma_uint32 i = 0; i < to_read; i++) {
-            out[i] = self->playback_buffer_[(read_pos + i) % RING_BUFFER_SIZE];
-        }
-        for (ma_uint32 i = to_read; i < frame_count; i++) {
-            out[i] = 0.0f;
-        }
-
-        self->playback_read_pos_ = (read_pos + to_read) % RING_BUFFER_SIZE;
-        self->last_playback_ms_.store(steady_ms(), std::memory_order_relaxed);
+        self->pull_playback(out, frame_count);
     }
 
     static void capture_callback(ma_device* device, void* output, const void* input, ma_uint32 frame_count) {
@@ -757,35 +792,58 @@ private:
         const float* in = static_cast<const float*>(input);
 
         if (device != self->capture_device_.load(std::memory_order_acquire)) return;
+        self->push_capture(in, frame_count);
+    }
 
-        size_t read_pos = self->capture_read_pos_.load();
-        size_t write_pos = self->capture_write_pos_.load();
+    // Fill out with queued playback samples, silence once the queue is empty.
+    void pull_playback(float* out, ma_uint32 frame_count) {
+        size_t read_pos = playback_read_pos_.load();
+        size_t write_pos = playback_write_pos_.load();
+        size_t available = (write_pos - read_pos + RING_BUFFER_SIZE) % RING_BUFFER_SIZE;
+
+        ma_uint32 to_read = std::min((ma_uint32)available, frame_count);
+
+        for (ma_uint32 i = 0; i < to_read; i++) {
+            out[i] = playback_buffer_[(read_pos + i) % RING_BUFFER_SIZE];
+        }
+        for (ma_uint32 i = to_read; i < frame_count; i++) {
+            out[i] = 0.0f;
+        }
+
+        playback_read_pos_ = (read_pos + to_read) % RING_BUFFER_SIZE;
+        last_playback_ms_.store(steady_ms(), std::memory_order_relaxed);
+    }
+
+    // Queue captured samples for read() and track the level for CSMA.
+    void push_capture(const float* in, ma_uint32 frame_count) {
+        size_t read_pos = capture_read_pos_.load();
+        size_t write_pos = capture_write_pos_.load();
         size_t used = (write_pos - read_pos + CAPTURE_RING_SIZE) % CAPTURE_RING_SIZE;
         size_t available = CAPTURE_RING_SIZE - 1 - used;
 
         ma_uint32 to_write = std::min((ma_uint32)available, frame_count);
 
         for (ma_uint32 i = 0; i < to_write; i++) {
-            self->capture_buffer_[(write_pos + i) % CAPTURE_RING_SIZE] = in[i];
+            capture_buffer_[(write_pos + i) % CAPTURE_RING_SIZE] = in[i];
         }
 
-        self->capture_write_pos_ = (write_pos + to_write) % CAPTURE_RING_SIZE;
+        capture_write_pos_ = (write_pos + to_write) % CAPTURE_RING_SIZE;
 
         float sum_sq = 0.0f;
         for (ma_uint32 i = 0; i < frame_count; i++) {
             sum_sq += in[i] * in[i];
         }
-        self->capture_energy_.store(self->capture_energy_.load() + sum_sq);
-        self->capture_samples_.store(self->capture_samples_.load() + frame_count);
+        capture_energy_.store(capture_energy_.load() + sum_sq);
+        capture_samples_.store(capture_samples_.load() + frame_count);
 
         if (frame_count > 0) {
-            uint64_t seq = self->block_seq_.load(std::memory_order_relaxed);
-            self->block_msq_[seq % LEVEL_RING].store(sum_sq / frame_count,
-                                                     std::memory_order_relaxed);
-            self->block_frames_[seq % LEVEL_RING].store(frame_count,
-                                                        std::memory_order_relaxed);
-            self->block_seq_.store(seq + 1, std::memory_order_release);
-            self->last_block_ms_.store(steady_ms(), std::memory_order_relaxed);
+            uint64_t seq = block_seq_.load(std::memory_order_relaxed);
+            block_msq_[seq % LEVEL_RING].store(sum_sq / frame_count,
+                                               std::memory_order_relaxed);
+            block_frames_[seq % LEVEL_RING].store(frame_count,
+                                                  std::memory_order_relaxed);
+            block_seq_.store(seq + 1, std::memory_order_release);
+            last_block_ms_.store(steady_ms(), std::memory_order_relaxed);
         }
     }
 
@@ -839,4 +897,7 @@ private:
     std::atomic<uint64_t> block_seq_{0};
     std::atomic<int64_t> last_block_ms_{0};
     std::atomic<int64_t> last_playback_ms_{0};
+
+    NetAudioLink net_;
+    std::atomic<bool> net_in_use_{false};
 };
