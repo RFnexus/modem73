@@ -631,16 +631,24 @@ int main(int argc, char** argv) {
             cli_set.insert("postamble");
         } else if (arg == "--short") {
             config.frame_size = 0;
+            config.frame_size_auto = false;
             cli_set.insert("frame_size");
+            cli_set.insert("frame_size_auto");
         } else if (arg == "--normal") {
             config.frame_size = 1;
+            config.frame_size_auto = false;
             cli_set.insert("frame_size");
+            cli_set.insert("frame_size_auto");
         } else if (arg == "--long") {
             config.frame_size = 2;
+            config.frame_size_auto = false;
             cli_set.insert("frame_size");
+            cli_set.insert("frame_size_auto");
         } else if (arg == "--micro") {
             config.frame_size = 3;
+            config.frame_size_auto = false;
             cli_set.insert("frame_size");
+            cli_set.insert("frame_size_auto");
         } else if (arg == "--frame-auto") {
             config.frame_size_auto = true;
             cli_set.insert("frame_size_auto");
@@ -1573,9 +1581,13 @@ int main(int argc, char** argv) {
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "mfsk_mode")) && cJSON_IsNumber(item)
                     && item->valueint >= 0 && item->valueint <= 3)
                     new_config.mfsk_mode = item->valueint;
+                bool explicit_size = false;
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "robust_mode")) && cJSON_IsNumber(item)
-                    && item->valueint >= 0 && item->valueint < ROBUST_MODE_COUNT)
+                    && item->valueint >= 0 && item->valueint < ROBUST_MODE_COUNT) {
                     new_config.robust_mode = item->valueint;
+                    RobustMode rm = (RobustMode)item->valueint;
+                    if (RobustParams::is_short(rm) || RobustParams::is_micro(rm)) explicit_size = true;
+                }
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "callsign")) && cJSON_IsString(item)) {
                     if (!ModemConfig::valid_callsign(item->valuestring)) {
                         ui_log(std::string("(!) Control port: invalid callsign '") +
@@ -1588,13 +1600,19 @@ int main(int argc, char** argv) {
                     new_config.modulation = item->valuestring;
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "code_rate")) && cJSON_IsString(item))
                     new_config.code_rate = item->valuestring;
-                if ((item = cJSON_GetObjectItemCaseSensitive(params, "short_frame")) && cJSON_IsBool(item))
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "short_frame")) && cJSON_IsBool(item)) {
                     new_config.frame_size = cJSON_IsTrue(item) ? 0 : 1;
+                    explicit_size = true;
+                }
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "frame_size")) && cJSON_IsNumber(item)
-                    && item->valueint >= 0 && item->valueint <= 2)
+                    && item->valueint >= 0 && item->valueint <= 2) {
                     new_config.frame_size = item->valueint;
+                    explicit_size = true;
+                }
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "frame_size_auto")) && cJSON_IsBool(item))
                     new_config.frame_size_auto = cJSON_IsTrue(item);
+                else if (explicit_size)
+                    new_config.frame_size_auto = false;
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "auto_long")) && cJSON_IsBool(item))
                     new_config.auto_long = cJSON_IsTrue(item);
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "center_freq")) && cJSON_IsNumber(item))

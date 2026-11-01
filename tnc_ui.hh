@@ -1619,12 +1619,17 @@ private:
                 state_.update_modem_info();
                 break;
             }
-            case FIELD_ROBUST_MTU:
-                state_.robust_mode_index = robust_mode_of(
-                    robust_base_index(state_.robust_mode_index),
-                    !RobustParams::is_short((RobustMode)state_.robust_mode_index));
+            case FIELD_ROBUST_MTU: {
+                int base = robust_base_index(state_.robust_mode_index);
+                if (base == 6) break;
+                int idx = state_.frame_size_auto ? 2
+                        : RobustParams::is_short((RobustMode)state_.robust_mode_index) ? 1 : 0;
+                idx = (idx + delta + 3) % 3;
+                state_.frame_size_auto = (idx == 2);
+                state_.robust_mode_index = robust_mode_of(base, idx == 1);
                 state_.update_modem_info();
                 break;
+            }
             case FIELD_MFSK_MODE:
                 state_.mfsk_mode_index = (state_.mfsk_mode_index + delta + 4) % 4;
                 state_.update_modem_info();
@@ -3838,7 +3843,8 @@ private:
                 row++;
                 dy = visible_y(row);
                 if (dy >= 0) draw_selector_field(dy, c1, c2, "Frame", FIELD_ROBUST_MTU,
-                                   ROBUST_MTU_OPTIONS[robust_mtu_index(state_.robust_mode_index)]);
+                                   state_.frame_size_auto && state_.robust_mode_index != 12 ? "AUTO"
+                                   : ROBUST_MTU_OPTIONS[robust_mtu_index(state_.robust_mode_index)]);
                 row++;
             }
 

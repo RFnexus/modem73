@@ -559,6 +559,8 @@ struct TNCUIState {
     void update_modem_info() {
         if (modem_type_index == 2) {
             RobustMode rmode = (RobustMode)robust_mode_index;
+            if (frame_size_auto && !RobustParams::is_micro(rmode))
+                rmode = RobustParams::with_framing(rmode, false);
             mtu_bytes = RobustParams::data_bytes(rmode) - 2;
             bitrate_bps = RobustParams::bitrate(rmode);
             airtime_seconds = RobustParams::frame_duration(rmode);

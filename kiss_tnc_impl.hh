@@ -197,6 +197,13 @@ static int effective_frame_size(const TNCConfig& c) {
     return 1;
 }
 
+static RobustMode effective_robust_mode(const TNCConfig& c) {
+    RobustMode m = (RobustMode)c.robust_mode;
+    if (c.frame_size_auto && !RobustParams::is_micro(m))
+        return RobustParams::with_framing(m, false);
+    return m;
+}
+
 static std::string ofdm_mode_name(int m) {
     std::string s = ofdm_modulation_name(m);
     s += " ";
@@ -283,7 +290,7 @@ public:
         if (config.modem_type == 1) {
             payload_size_ = mfsk_encoder_->get_payload_size((MFSKMode)config.mfsk_mode);
         } else if (config.modem_type == 2) {
-            payload_size_ = robust_encoder_->get_payload_size((RobustMode)config.robust_mode);
+            payload_size_ = robust_encoder_->get_payload_size(effective_robust_mode(config));
         } else {
             payload_size_ = encoder_->get_payload_size(modem_config_.oper_mode);
         }
@@ -2445,9 +2452,10 @@ public:
             (config_.modem_type != new_config.modem_type && new_config.modem_type == 2)) {
             config_.robust_mode = new_config.robust_mode;
             if (new_config.modem_type == 2) {
-                RobustMode rmode = (RobustMode)config_.robust_mode;
+                RobustMode rmode = effective_robust_mode(new_config);
                 payload_size_ = robust_encoder_->get_payload_size(rmode);
                 ui_log("Mode changed to " + std::string(ROBUST_MODE_NAMES[(int)rmode]) +
+                       (new_config.frame_size_auto && !RobustParams::is_micro(rmode) ? " (auto)" : "") +
                        " (" + std::to_string(RobustParams::bitrate(rmode)) + " bps)");
             }
         }
@@ -2460,7 +2468,7 @@ public:
                 ui_log("Mode changed to " + std::string(MFSK_MODE_NAMES[(int)mmode]) +
                        " (" + std::to_string(MFSKParams::max_payload(mmode)) + " bytes)");
             } else if (config_.modem_type == 2) {
-                payload_size_ = robust_encoder_->get_payload_size((RobustMode)config_.robust_mode);
+                payload_size_ = robust_encoder_->get_payload_size(effective_robust_mode(new_config));
             } else {
                 payload_size_ = encoder_->get_payload_size(modem_config_.oper_mode);
             }
@@ -2489,6 +2497,8 @@ public:
                 modem_config_.oper_mode = new_mode;
                 if (config_.modem_type == 0) {
                     payload_size_ = encoder_->get_payload_size(modem_config_.oper_mode);
+                } else if (config_.modem_type == 2) {
+                    payload_size_ = robust_encoder_->get_payload_size(effective_robust_mode(config_));
                 }
                 ui_log("OFDM mode changed to " + config_.modulation + " " + config_.code_rate +
                        " " + ModemConfig::frame_size_name(effective_frame_size(config_)) +
@@ -2685,11 +2695,31 @@ public:
     }
 
     int auto_mode_for(size_t len) const {
-        if (!config_.frame_size_auto || config_.modem_type != 0) return -1;
+        TNCConfig c;
+        {
+            std::lock_guard<std::mutex> lock(config_mutex_);
+            if (!config_.frame_size_auto) return -1;
+            c = config_;
+        }
+        if (c.modem_type == 2) {
+            RobustMode base = (RobustMode)c.robust_mode;
+            if (RobustParams::is_micro(base)) return -1;
+            RobustMode tiers[3];
+            int n = 0;
+            if (!RobustParams::is_narrow(base)) tiers[n++] = RobustMode::RDM_QB;
+            tiers[n++] = RobustParams::with_framing(base, true);
+            tiers[n++] = RobustParams::with_framing(base, false);
+            for (int i = 0; i < n; i++) {
+                int cap = RobustParams::data_bytes(tiers[i]);
+                if (cap >= 2 && len <= (size_t)(cap - 2)) return (int)tiers[i];
+            }
+            return -1;
+        }
+        if (c.modem_type != 0) return -1;
         static const int tiers[] = {3, 0, 1, 2};
         for (int fs : tiers) {
-            if (fs == 2 && effective_frame_size(config_) != 2) continue;
-            int m = compute_oper_mode(fs);
+            if (fs == 2 && effective_frame_size(c) != 2) continue;
+            int m = ModemConfig::encode_mode(c.modulation.c_str(), c.code_rate.c_str(), fs);
             if (m < 0) continue;
             int cap = Encoder48k::get_payload_size(m);
             if (cap >= 2 && len <= (size_t)(cap - 2)) return m;
