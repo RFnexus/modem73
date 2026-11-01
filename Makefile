@@ -26,9 +26,10 @@ ifeq ($(UNAME_S),Darwin)
         INCLUDES += -I$(NCURSES_PREFIX)/include
         LDFLAGS += -L$(NCURSES_PREFIX)/lib
     endif
-    NCURSES_LIBS ?= -lncurses
+    NCURSES_LIBS ?= -lncursesw
 else
-    NCURSES_LIBS ?= -lncurses -ltinfo
+    # distros disagree on libtinfo, so ask pkg-config first
+    NCURSES_LIBS ?= $(shell pkg-config --libs ncursesw 2>/dev/null || echo -lncursesw -ltinfo)
 endif
 ifdef NCURSES_SRC
     INCLUDES += -I$(NCURSES_SRC)
@@ -38,7 +39,7 @@ LDFLAGS += $(NCURSES_LIBS)
 TARGET = modem73
 
 SRCS = kiss_tnc.cc
-HDRS = kiss_tnc.hh kiss_tnc_impl.hh rx_frame_info.hh csma.hh tone_dcd.hh miniaudio_audio.hh rigctl_ptt.hh hamlib_ptt.hh modem.hh phy/mfsk_modem.hh phy/robust_modem.hh phy/common.hh tnc_ui.hh tnc_ui_state.hh control_port.hh
+HDRS = kiss_tnc.hh kiss_tnc_impl.hh rx_frame_info.hh csma.hh tone_dcd.hh miniaudio_audio.hh net_audio.hh rigctl_ptt.hh hamlib_ptt.hh modem.hh phy/mfsk_modem.hh phy/robust_modem.hh phy/common.hh tnc_ui.hh tnc_ui_state.hh glyphs.hh control_port.hh attach_client.hh
 OBJS = deps/miniaudio.o deps/cJSON.o
 
 # defualt to build with UI, headless operations through --headless
@@ -157,7 +158,7 @@ help:
 	@echo "  MODEM_SRC    - Path to modem source (default: deps/aicodix/modem)"
 	@echo "  NCURSES_PREFIX - ncurses install prefix (macOS: default from 'brew --prefix ncurses')"
 	@echo "  NCURSES_SRC  - extra ncurses include directory"
-	@echo "  NCURSES_LIBS - ncurses link flags (default: -lncurses -ltinfo, macOS: -lncurses)"
+	@echo "  NCURSES_LIBS - ncurses link flags (default: pkg-config ncursesw, else -lncursesw -ltinfo; macOS: -lncursesw)"
 	@echo "  ARCHFLAGS    - CPU tuning flags (default: -march=native)"
 	@echo ""
 	@echo "Optional features:"

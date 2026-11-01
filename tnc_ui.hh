@@ -1,12 +1,23 @@
 #pragma once
 
 #include <locale.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <langinfo.h>
+#include <strings.h>
+#endif
+#if __has_include(<ncursesw/ncurses.h>)
+#include <ncursesw/ncurses.h>
+#else
 #include <ncurses.h>
+#endif
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <arpa/inet.h>
 #include <glob.h>
 #include "tnc_ui_state.hh"
+#include "glyphs.hh"
 
 class TNCUI {
 public:
@@ -23,18 +34,142 @@ public:
         }
     }
     
-    int modal_getch() {
-        timeout(250);
-        for (;;) {
-            int key = getch();
-            if (key != ERR || !g_running) return key;
+    bool unicode_icons() const {
+        if (state_.ascii_ui) return false;
+        if (state_.icon_mode == 1) return false;
+        if (state_.icon_mode == 2) return true;
+        return locale_utf8_;
+    }
+    const char* gl(GlyphId id) const { return glyph(id, unicode_icons()); }
+    const char* ico_info() const { return gl(G_INFO); }
+    const char* ico_warn() const { return gl(G_WARN); }
+
+    void apply_theme() {
+        if (!has_colors()) return;
+        int accent = COLOR_CYAN, special = COLOR_MAGENTA;
+        if (state_.theme == 1) {
+            accent = COLORS >= 256 ? 93 : COLOR_MAGENTA;
+            special = COLORS >= 256 ? 141 : COLOR_MAGENTA;
+        } else if (state_.theme == 2) {
+            accent = COLORS >= 256 ? 196 : COLOR_RED;
+            special = COLORS >= 256 ? 203 : COLOR_RED;
+        }
+        init_pair(4, accent, -1);
+        init_pair(6, special, -1);
+    }
+
+    std::vector<int> visible_tabs() const {
+        std::vector<int> v = {0, 1, 2, 3, 4};
+        if (rig_ui()) v.push_back(5);
+        return v;
+    }
+
+    bool tab_visible(int tab) const {
+        for (int t : visible_tabs()) if (t == tab) return true;
+        return false;
+    }
+
+    void cycle_tab(int delta) {
+        std::vector<int> v = visible_tabs();
+        int n = (int)v.size();
+        int pos = 0;
+        for (int i = 0; i < n; i++) if (v[i] == current_tab_) pos = i;
+        current_tab_ = v[(pos + delta + n) % n];
+    }
+
+    static int config_tab_of(int f) {
+        if (f == FIELD_NET_PORT || f == FIELD_CONTROL_PORT || f == FIELD_LAN_MODE ||
+            f == FIELD_NET_AUDIO || f == FIELD_RESTART) return 1;
+        if (f == FIELD_STYLE_ICONS || f == FIELD_STYLE_THEME || f == FIELD_STYLE_GRAPH) return 2;
+        return 0;
+    }
+
+    void select_config_tab(int t) {
+        if (t == config_tab_) return;
+        config_tab_ = t;
+        config_scroll_ = 0;
+        config_follow_ = true;
+        if (config_tab_of(current_field_) != t) {
+            if (t == 1) current_field_ = FIELD_NET_PORT;
+            else if (t == 2) current_field_ = FIELD_STYLE_ICONS;
+            else current_field_ = last_modem_field_;
         }
     }
 
+    void put_hline(int y, int x, int w) {
+        if (unicode_icons()) {
+            for (int i = 0; i < w; i++) mvaddstr(y, x + i, "\u2500");
+        } else {
+            mvhline(y, x, ACS_HLINE, w);
+        }
+    }
+
+    void put_vline(int y, int x, int h) {
+        if (unicode_icons()) {
+            for (int i = 0; i < h; i++) mvaddstr(y + i, x, "\u2502");
+        } else {
+            mvvline(y, x, ACS_VLINE, h);
+        }
+    }
+
+    void put_vline_here() {
+        if (unicode_icons()) addstr("\u2502");
+        else addch(ACS_VLINE);
+    }
+
+    enum Corner { C_UL, C_UR, C_LL, C_LR, C_LTEE, C_RTEE };
+
+    void put_corner(int y, int x, Corner c) {
+        static const char* u[] = {"\u250C", "\u2510", "\u2514", "\u2518", "\u251C", "\u2524"};
+        if (unicode_icons()) {
+            mvaddstr(y, x, u[c]);
+            return;
+        }
+        chtype a = ACS_HLINE;
+        switch (c) {
+            case C_UL: a = ACS_ULCORNER; break;
+            case C_UR: a = ACS_URCORNER; break;
+            case C_LL: a = ACS_LLCORNER; break;
+            case C_LR: a = ACS_LRCORNER; break;
+            case C_LTEE: a = ACS_LTEE; break;
+            case C_RTEE: a = ACS_RTEE; break;
+        }
+        mvaddch(y, x, a);
+    }
+
+    void put_block(int y, int x) {
+        if (unicode_icons()) mvaddstr(y, x, "\u2588");
+        else mvaddch(y, x, ACS_BLOCK);
+    }
+
+    void put_block_here() {
+        if (unicode_icons()) addstr("\u2588");
+        else addch(ACS_BLOCK);
+    }
+
+    int modal_getch() {
+        timeout(250);
+        int key;
+        for (;;) {
+            state_.run_ui_tasks();
+            key = getch();
+            if (key != ERR || !g_running) break;
+        }
+        nodelay(stdscr, TRUE);
+        return key;
+    }
+
     void run() {
+        state_.claim_ui_thread();
         // set locale LC_ALL for Unicode character support,  
         setlocale(LC_ALL, "");
-        
+        setlocale(LC_NUMERIC, "C");
+#ifdef _WIN32
+        locale_utf8_ = GetConsoleOutputCP() == 65001;
+#else
+        const char* codeset = nl_langinfo(CODESET);
+        locale_utf8_ = codeset && strcasecmp(codeset, "UTF-8") == 0;
+#endif
 
         saved_stderr_ = dup(STDERR_FILENO);
         int devnull = open("/dev/null", O_WRONLY);
@@ -64,6 +199,7 @@ public:
             init_pair(4, COLOR_CYAN, -1);     // Important 
             init_pair(5, COLOR_WHITE, -1);    // Normal 
             init_pair(6, COLOR_MAGENTA, -1);  // Special
+            apply_theme();
 
             if (COLORS >= 256 && COLOR_PAIRS > WF_PAIR_BASE + 31) {
                 static const short grad[31] = {
@@ -95,6 +231,7 @@ public:
                 if (ch == ERR) break;
                 handle_input(ch);
             }
+            state_.run_ui_tasks();
             tick_auto_send();
             tick_level_history();
             draw();
@@ -102,6 +239,8 @@ public:
                 draw_rx_off_dialog();
             if (lan_dialog_)
                 draw_lan_dialog();
+            if (restart_dialog_)
+                draw_restart_dialog();
             refresh();
             std::this_thread::sleep_for(std::chrono::milliseconds(33));
         }
@@ -125,6 +264,7 @@ private:
         FIELD_MODULATION,
         FIELD_CODERATE,
         FIELD_FRAMESIZE,
+        FIELD_AUTO_LONG,
         FIELD_POSTAMBLE,
         FIELD_MFSK_MODE,
         FIELD_ROBUST_MODE,
@@ -174,10 +314,16 @@ private:
         FIELD_HAMLIB_MODEL,
         FIELD_HAMLIB_DEVICE,
         FIELD_HAMLIB_BAUD,
+        FIELD_RESTART_MODEM,
+        FIELD_PRESET,
         FIELD_NET_PORT,
         FIELD_CONTROL_PORT,
         FIELD_LAN_MODE,
-        FIELD_PRESET,
+        FIELD_NET_AUDIO,
+        FIELD_RESTART,
+        FIELD_STYLE_ICONS,
+        FIELD_STYLE_THEME,
+        FIELD_STYLE_GRAPH,
         FIELD_COUNT
     };
 
@@ -215,7 +361,7 @@ private:
     }
 
     int tab_count() const {
-        return rig_ui() ? 6 : 5;
+        return (int)visible_tabs().size();
     }
 
     bool rig_should_skip(int field) const {
@@ -226,6 +372,20 @@ private:
     }
 
     void handle_input(int ch) {
+        if (restart_dialog_) {
+            if (ch == KEY_MOUSE) {
+                MEVENT event;
+                getmouse(&event);
+                return;
+            }
+            if (ch == 'y' || ch == 'Y') {
+                restart_dialog_ = false;
+                do_restart();
+            } else if (ch == 'n' || ch == 'N' || ch == 27 || ch == '\n' || ch == KEY_ENTER || ch == 'q') {
+                restart_dialog_ = false;
+            }
+            return;
+        }
         if (lan_dialog_) {
             if (ch == 'y' || ch == 'Y' || ch == '\n' || ch == KEY_ENTER) {
                 state_.bind_address = "0.0.0.0";
@@ -321,18 +481,17 @@ private:
 
             case 'r':
             case 'R':
-                if (state_.on_reconnect_audio && state_.on_reconnect_audio())
-                    state_.add_log("Audio: reconnect requested");
-                else
+                if (current_tab_ == 1) break;
+                if (!state_.on_reconnect_audio || !state_.on_reconnect_audio())
                     state_.add_log("(!) Audio reconnect unavailable");
                 break;
                 
             case '\t':
-                current_tab_ = (current_tab_ + 1) % tab_count();
+                cycle_tab(1);
                 break;
 
             case KEY_BTAB:  // shift tab prev
-                current_tab_ = (current_tab_ + tab_count() - 1) % tab_count();
+                cycle_tab(-1);
                 break;
                 
             case KEY_UP:
@@ -412,6 +571,8 @@ private:
                     state_.random_data_size = std::max(1, state_.random_data_size - step);
                 } else if (current_tab_ == 5) {
                     adjust_rig_field(-1);
+                } else if (current_tab_ == 4) {
+                    scope_tab_ = 0;
                 }
                 break;
                 
@@ -436,6 +597,8 @@ private:
                     state_.random_data_size = std::min(max_size, state_.random_data_size + step);
                 } else if (current_tab_ == 5) {
                     adjust_rig_field(1);
+                } else if (current_tab_ == 4) {
+                    scope_tab_ = 1;
                 }
                 break;
                 
@@ -473,6 +636,11 @@ private:
                         show_sync_help_ = true;
                     } else if (current_field_ == FIELD_CSMA_ADV) {
                         state_.csma_advanced_open = !state_.csma_advanced_open;
+                    } else if (current_field_ == FIELD_RESTART || current_field_ == FIELD_RESTART_MODEM) {
+                        confirm_restart();
+                    } else if (current_field_ == FIELD_STYLE_ICONS || current_field_ == FIELD_STYLE_THEME ||
+                               current_field_ == FIELD_STYLE_GRAPH) {
+                        adjust_field(1);
                     } else if (current_field_ == FIELD_CALLSIGN) {
 
 
@@ -492,6 +660,8 @@ private:
                         adjust_field(1);
                     } else if (current_field_ == FIELD_LAN_MODE) {
                         adjust_field(1);
+                    } else if (current_field_ == FIELD_NET_AUDIO) {
+                        edit_text_field(FIELD_NET_AUDIO);
                     } else if (current_field_ == FIELD_CONTROL_PORT) {
 
                         edit_text_field(FIELD_CONTROL_PORT);
@@ -581,6 +751,14 @@ private:
             // utils
             case '1':
 
+                if (current_tab_ == 1) {
+                    select_config_tab(0);
+                    break;
+                }
+                if (current_tab_ == 4) {
+                    scope_tab_ = 0;
+                    break;
+                }
                 if (current_tab_ == 3) {
 
                     utils_selection_ = 0;
@@ -591,6 +769,14 @@ private:
 
             case '2':
 
+                if (current_tab_ == 1) {
+                    select_config_tab(1);
+                    break;
+                }
+                if (current_tab_ == 4) {
+                    scope_tab_ = 1;
+                    break;
+                }
                 if (current_tab_ == 3) {
 
                     utils_selection_ = 1;
@@ -601,6 +787,10 @@ private:
 
             case '3':
 
+                if (current_tab_ == 1) {
+                    select_config_tab(2);
+                    break;
+                }
                 if (current_tab_ == 3) {
 
                     utils_selection_ = 2;
@@ -670,17 +860,19 @@ private:
         if (event.bstate & BUTTON1_CLICKED || event.bstate & BUTTON1_PRESSED) {
             // Tab clicks
             if (event.y == 2) {
-                int ntabs = tab_count();
+                std::vector<int> vis = visible_tabs();
+                int ntabs = (int)vis.size();
                 int tab_width = (cols - 4) / ntabs;
                 if (event.x >= 2 && tab_width > 0) {
                     int idx = (event.x - 2) / tab_width;
                     if (idx >= ntabs) idx = ntabs - 1;
-                    current_tab_ = idx;
+                    current_tab_ = vis[idx];
                 }
             }
             
-            if (current_tab_ == 1 && event.x < cols/2 - 2) {
-                int logical = event.y - 4 + config_scroll_;
+            if (current_tab_ == 1 && event.x < cols/2 - 2 &&
+                event.y >= 4 + CONFIG_LIST_TOP && event.y < rows - 4) {
+                int logical = event.y - 4 - CONFIG_LIST_TOP + config_scroll_;
                 int field = -1;
                 for (int f = 0; f < FIELD_COUNT; f++) {
                     if (should_skip_field(f)) continue;
@@ -729,6 +921,10 @@ private:
                             edit_text_field(field);
                         } else if (field == FIELD_PTT_TYPE) {
                             show_ptt_type_dialog();
+                        } else if (field == FIELD_RESTART || field == FIELD_RESTART_MODEM) {
+                            confirm_restart();
+                        } else if (field == FIELD_NET_AUDIO) {
+                            edit_text_field(field);
                         } else if (field >= FIELD_MODULATION) {
                             if (event.x < 22) adjust_field(-1);
                             else adjust_field(1);
@@ -738,8 +934,22 @@ private:
             }
         }
         
+        if (current_tab_ == 1 && event.y == 4 && event.x < cols/2 - 2 &&
+            (event.bstate & BUTTON1_CLICKED || event.bstate & BUTTON1_PRESSED)) {
+            for (int t = 0; t < 3; t++)
+                if (event.x >= config_tab_x_[t] && event.x < config_tab_x_[t] + config_tab_w_[t])
+                    select_config_tab(t);
+        }
+
+        if (current_tab_ == 4 && event.y == 4 &&
+            (event.bstate & BUTTON1_CLICKED || event.bstate & BUTTON1_PRESSED)) {
+            for (int t = 0; t < 2; t++)
+                if (event.x >= scope_tab_x_[t] && event.x < scope_tab_x_[t] + scope_tab_w_[t])
+                    scope_tab_ = t;
+        }
+
         if (current_tab_ == 1 && event.x < cols/2 - 2) {
-            int max_scroll = std::max(0, config_total_rows_ - (rows - 8));
+            int max_scroll = std::max(0, config_total_rows_ - (rows - 8 - CONFIG_LIST_TOP));
             if (event.bstate & BUTTON4_PRESSED) {
                 config_scroll_ = std::max(0, config_scroll_ - 3);
                 config_follow_ = false;
@@ -772,7 +982,7 @@ private:
     
     // line input at (y, x). returns true on enter, false if cancelled with esc.
     // buf must hold at least max_len + 1 bytes.
-    bool prompt_input(int y, int x, char* buf, int max_len) {
+    bool prompt_input(int y, int x, char* buf, int max_len, const char* placeholder = nullptr) {
         curs_set(1);
 
         int len = (int)strlen(buf);
@@ -780,6 +990,11 @@ private:
 
         while (true) {
             mvhline(y, x, ' ', max_len);
+            if (len == 0 && placeholder) {
+                attron(A_DIM);
+                mvaddnstr(y, x, placeholder, max_len);
+                attroff(A_DIM);
+            }
             mvaddnstr(y, x, buf, len);
             move(y, x + len);
             refresh();
@@ -828,19 +1043,54 @@ private:
             max_len = 5;
         } else if (field == FIELD_CONTROL_PORT) {
             max_len = 5;
+        } else if (field == FIELD_NET_AUDIO) {
+            max_len = std::max(20, std::min(40, getmaxx(stdscr) / 2 - 2 - col - 1));
         } else {
             return; // not text editable
         }
 
-        int row = 4 + config_field_row(field) - config_scroll_;
-        if (row < 4) return;
+        int row = 4 + CONFIG_LIST_TOP + config_field_row(field) - config_scroll_;
+        if (row < 4 + CONFIG_LIST_TOP) return;
         
         // Clear the value area
         move(row, col);
         for (int i = 0; i < 20; i++) addch(' ');
 
         char buf[64] = {0};
-        if (!prompt_input(row, col, buf, max_len)) return;
+        if (field == FIELD_NET_AUDIO) {
+            std::string cur = state_.net_audio_address();
+            if (!cur.empty()) snprintf(buf, sizeof(buf), "%s", cur.c_str() + 4);
+        }
+        if (!prompt_input(row, col, buf, max_len,
+                          field == FIELD_NET_AUDIO ? "host:port" : nullptr)) return;
+
+        if (field == FIELD_NET_AUDIO) {
+            std::string v = buf;
+            if (v.rfind("tcp:", 0) == 0) v = v.substr(4);
+            if (v.empty() || v == "off" || v == "OFF") {
+                if (state_.net_audio_address().empty()) return;
+                state_.audio_input_device = state_.audio_input_prev.empty() ? "default" : state_.audio_input_prev;
+                state_.audio_output_device = state_.audio_output_prev.empty() ? "default" : state_.audio_output_prev;
+                state_.add_log("Network audio off, using " + state_.audio_input_device);
+                apply_settings();
+                return;
+            }
+            size_t colon = v.rfind(':');
+            int port = colon == std::string::npos ? 0 : atoi(v.c_str() + colon + 1);
+            if (colon == std::string::npos || colon == 0 || port < 1 || port > 65535) {
+                state_.add_log("(!) Network audio needs host:port");
+                return;
+            }
+            if (state_.net_audio_address().empty()) {
+                state_.audio_input_prev = state_.audio_input_device;
+                state_.audio_output_prev = state_.audio_output_device;
+            }
+            state_.audio_input_device = "tcp:" + v;
+            state_.audio_output_device = "tcp:" + v;
+            state_.add_log("Network audio: connecting to " + v);
+            apply_settings();
+            return;
+        }
 
         if (strlen(buf) > 0) {
             if (field == FIELD_CALLSIGN) {
@@ -1029,14 +1279,14 @@ private:
         attron(COLOR_PAIR(4));
         for (int y = y0; y < y0 + h && y < rows; y++)
             mvhline(y, x0, ' ', w);
-        mvhline(y0, x0, ACS_HLINE, w);
-        mvhline(y0 + h - 1, x0, ACS_HLINE, w);
-        mvvline(y0, x0, ACS_VLINE, h);
-        mvvline(y0, x0 + w - 1, ACS_VLINE, h);
-        mvaddch(y0, x0, ACS_ULCORNER);
-        mvaddch(y0, x0 + w - 1, ACS_URCORNER);
-        mvaddch(y0 + h - 1, x0, ACS_LLCORNER);
-        mvaddch(y0 + h - 1, x0 + w - 1, ACS_LRCORNER);
+        put_hline(y0, x0, w);
+        put_hline(y0 + h - 1, x0, w);
+        put_vline(y0, x0, h);
+        put_vline(y0, x0 + w - 1, h);
+        put_corner(y0, x0, C_UL);
+        put_corner(y0, x0 + w - 1, C_UR);
+        put_corner(y0 + h - 1, x0, C_LL);
+        put_corner(y0 + h - 1, x0 + w - 1, C_LR);
         attron(A_BOLD);
         mvaddstr(y0, x0 + 3, " CONFIG TOKEN ");
         attroff(A_BOLD);
@@ -1076,6 +1326,7 @@ private:
     }
 
     bool should_skip_field(int field) {
+        if (config_tab_of(field) != config_tab_) return true;
         if (field == FIELD_FREQ) return true;
         
         // TX blanking is forced on while CSMA is enabled
@@ -1083,9 +1334,11 @@ private:
         // Hide OFDM-only fields when in MFSK mode
         if (state_.modem_type_index != 0) {
             if (field == FIELD_MODULATION || field == FIELD_CODERATE ||
-                field == FIELD_FRAMESIZE || field == FIELD_POSTAMBLE)
+                field == FIELD_FRAMESIZE || field == FIELD_AUTO_LONG ||
+                field == FIELD_POSTAMBLE)
                 return true;
         }
+        if (!state_.frame_size_auto && field == FIELD_AUTO_LONG) return true;
         if (state_.modem_type_index != 1 && field == FIELD_MFSK_MODE) return true;
         if (state_.modem_type_index != 2 &&
             (field == FIELD_ROBUST_MODE || field == FIELD_ROBUST_MTU)) return true;
@@ -1148,6 +1401,14 @@ private:
     // must mirror draw_config's order/spacing exactly -- a drifted map
     // scrolls the selection off-screen and breaks mouse click mapping
     int config_field_row(int field) const {
+        if (config_tab_ == 1) {
+            if (field == FIELD_NET_PORT) return 1;
+            if (field == FIELD_CONTROL_PORT) return 2;
+            if (field == FIELD_LAN_MODE) return 3;
+            if (field == FIELD_NET_AUDIO) return 4;
+            return 7;
+        }
+        if (config_tab_ == 2) return field == FIELD_STYLE_GRAPH ? 3 : field == FIELD_STYLE_THEME ? 2 : 1;
         int row = 0;
         row++;
         if (field == FIELD_CALLSIGN) return row;
@@ -1163,6 +1424,10 @@ private:
             row++;
             if (field == FIELD_FRAMESIZE) return row;
             row++;
+            if (state_.frame_size_auto) {
+                if (field == FIELD_AUTO_LONG) return row;
+                row++;
+            }
             if (field == FIELD_POSTAMBLE) return row;
             row++;
         } else if (state_.modem_type_index == 1) {
@@ -1293,8 +1558,8 @@ private:
             if (field == FIELD_HAMLIB_BAUD) return row;
             row++;
         }
+        row += 2;
         if (hamlib_info_field()) {
-            row += 2;
             if (field == FIELD_HAMLIB_INFO) return row;
             row++;
             if (state_.hamlib_info) {
@@ -1306,14 +1571,10 @@ private:
                 row++;
             }
         }
+        if (field == FIELD_RESTART_MODEM) return row;
         row++;
         row++;
-        if (field == FIELD_NET_PORT) return row;
         row++;
-        if (field == FIELD_CONTROL_PORT) return row;
-        row++;
-        if (field == FIELD_LAN_MODE) return row;
-        row += 2;
         if (field == FIELD_PRESET) return row;
         return row;
     }
@@ -1379,10 +1640,18 @@ private:
                 } while (state_.code_rate_index >= 5);
                 state_.clamp_micro();
                 break;
-            case FIELD_FRAMESIZE:
+            case FIELD_FRAMESIZE: {
+                int idx = state_.frame_size_auto ? 4 : state_.frame_size;
                 do {
-                    state_.frame_size = (state_.frame_size + delta + 4) % 4;
-                } while (state_.frame_size == 3 && !state_.micro_allowed());
+                    idx = (idx + delta + 5) % 5;
+                } while (idx == 3 && !state_.micro_allowed());
+                state_.frame_size_auto = (idx == 4);
+                if (idx < 4) state_.frame_size = idx;
+                else state_.frame_size = 1;
+                break;
+            }
+            case FIELD_AUTO_LONG:
+                state_.auto_long = !state_.auto_long;
                 break;
             case FIELD_POSTAMBLE:
                 state_.postamble = !state_.postamble;
@@ -1554,6 +1823,20 @@ private:
                     }
                 }
                 break;
+            case FIELD_STYLE_ICONS:
+                state_.icon_mode = (state_.icon_mode + delta + 3) % 3;
+                state_.save_appearance();
+                return;
+            case FIELD_STYLE_THEME:
+                state_.theme = (state_.theme + delta + 3) % 3;
+                apply_theme();
+                state_.save_appearance();
+                return;
+            case FIELD_STYLE_GRAPH:
+                if (!unicode_icons()) return;
+                state_.graph_style = (state_.graph_style + delta + 3) % 3;
+                state_.save_appearance();
+                return;
             case FIELD_NET_PORT:
                 state_.port += delta * 1;
                 state_.port = std::max(1024, std::min(65535, state_.port));
@@ -2182,6 +2465,19 @@ private:
     }
 #endif
 
+    void confirm_restart() {
+        restart_dialog_ = true;
+    }
+
+    void do_restart() {
+        if (state_.on_restart_requested) {
+            state_.add_log("Restart requested");
+            state_.on_restart_requested();
+        } else {
+            state_.add_log("(!) Restart unavailable");
+        }
+    }
+
     void save_preset_dialog() {
         int rows, cols;
         getmaxyx(stdscr, rows, cols);
@@ -2255,32 +2551,32 @@ private:
     
     void draw_box(int y, int x, int h, int w) {
         // corners
-        mvaddch(y, x, ACS_ULCORNER);
-        mvaddch(y, x + w - 1, ACS_URCORNER);
-        mvaddch(y + h - 1, x, ACS_LLCORNER);
-        mvaddch(y + h - 1, x + w - 1, ACS_LRCORNER);
+        put_corner(y, x, C_UL);
+        put_corner(y, x + w - 1, C_UR);
+        put_corner(y + h - 1, x, C_LL);
+        put_corner(y + h - 1, x + w - 1, C_LR);
         
         // horizontal lines
-        mvhline(y, x + 1, ACS_HLINE, w - 2);
-        mvhline(y + h - 1, x + 1, ACS_HLINE, w - 2);
+        put_hline(y, x + 1, w - 2);
+        put_hline(y + h - 1, x + 1, w - 2);
         
         // vertical lines
-        mvvline(y + 1, x, ACS_VLINE, h - 2);
-        mvvline(y + 1, x + w - 1, ACS_VLINE, h - 2);
+        put_vline(y + 1, x, h - 2);
+        put_vline(y + 1, x + w - 1, h - 2);
     }
     
 
     void draw_hline(int y, int x, int w, bool connect_left = false, bool connect_right = false) {
-        mvaddch(y, x, connect_left ? ACS_LTEE : ACS_HLINE);
-        mvhline(y, x + 1, ACS_HLINE, w - 2);
-        mvaddch(y, x + w - 1, connect_right ? ACS_RTEE : ACS_HLINE);
+        if (connect_left) put_corner(y, x, C_LTEE); else put_hline(y, x, 1);
+        put_hline(y, x + 1, w - 2);
+        if (connect_right) put_corner(y, x + w - 1, C_RTEE); else put_hline(y, x + w - 1, 1);
     }
     
     void draw() {
         frame_counter_++;
         update_calibration();
 
-        if (current_tab_ >= tab_count()) current_tab_ = 0;
+        if (!tab_visible(current_tab_)) current_tab_ = 0;
         {
             int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -2288,7 +2584,8 @@ private:
                 last_ptt_seen_ms_ = now_ms;
             state_.rig_poll_enabled = (current_tab_ == 5) || (current_tab_ == 0) ||
                 (last_ptt_seen_ms_ > 0 && now_ms - last_ptt_seen_ms_ < 3000);
-            state_.scope_active = (current_tab_ == 4);
+            state_.scope_active = (current_tab_ == 4 && scope_tab_ == 0) ||
+                                  state_.scope_remote_refs.load() > 0;
             if (now_ms - occ_hist_ms_ >= 5000) {
                 occ_hist_ms_ = now_ms;
                 occ_hist_[occ_hist_pos_] = state_.channel_occupancy.load();
@@ -2319,11 +2616,22 @@ private:
         attron(A_DIM);
         addstr(" v" MODEM73_VERSION);
         attroff(A_DIM);
+        if (!state_.attach_target.empty()) {
+            if (state_.attach_connected.load()) {
+                attron(A_DIM);
+                printw(" @%s", state_.attach_target.c_str());
+                attroff(A_DIM);
+            } else {
+                attron(COLOR_PAIR(2) | A_BOLD);
+                printw(" @%s LOST", state_.attach_target.c_str());
+                attroff(COLOR_PAIR(2) | A_BOLD);
+            }
+        }
         addstr(" ");
         
         // PTT status 
         attron(A_DIM);
-        addch(ACS_VLINE);
+        put_vline_here();
         attroff(A_DIM);
         if (state_.ptt_on || state_.transmitting) {
             attron(COLOR_PAIR(2) | A_BOLD);
@@ -2335,16 +2643,16 @@ private:
             attroff(COLOR_PAIR(1) | A_BOLD);
         }
         attron(A_DIM);
-        addch(ACS_VLINE);
+        put_vline_here();
         attroff(A_DIM);
 
         // high-SWR warning chip, visible from every tab
         if (state_.swr_warn_value.load() > 0.0f) {
             attron(COLOR_PAIR(2) | A_BOLD);
-            printw(" !SWR %.1f ", state_.swr_warn_value.load());
+            printw(" %s SWR %.1f ", ico_warn(), state_.swr_warn_value.load());
             attroff(COLOR_PAIR(2) | A_BOLD);
             attron(A_DIM);
-            addch(ACS_VLINE);
+            put_vline_here();
             attroff(A_DIM);
         }
 
@@ -2389,13 +2697,15 @@ private:
         mvprintw(0, rx, "%d", state_.rx_frame_count.load());
         attroff(COLOR_PAIR(1) | A_BOLD);
         attron(A_DIM);
-        addstr("v ");   // temp
+        addstr(gl(G_ARROW_DOWN));
+        addstr(" ");
         attroff(A_DIM);
         attron(COLOR_PAIR(2) | A_BOLD);
         printw("%d", state_.tx_frame_count.load());
         attroff(COLOR_PAIR(2) | A_BOLD);
         attron(A_DIM);
-        addstr("^ ");  // temp 
+        addstr(gl(G_ARROW_UP));
+        addstr(" ");
         attroff(A_DIM);
         printw(" %d", state_.client_count.load());
         attron(A_DIM);
@@ -2418,13 +2728,15 @@ private:
 
             snprintf(utils_tab, sizeof(utils_tab), "UTILS");
         bool log_err = state_.log_unread_error.load() && current_tab_ != 2;
-        const char* log_tab = log_err ? "LOG (!)" : "LOG";
-        const char* tabs[] = {"STATUS", "CONFIG", log_tab, utils_tab, "SCOPE", "RIG"};
-        int ntabs = tab_count();
+        std::string log_label = log_err ? std::string("LOG ") + ico_warn() : std::string("LOG");
+        const char* tabs[] = {"STATUS", "CONFIG", log_label.c_str(), utils_tab, "SCOPE", "RIG"};
+        std::vector<int> vis = visible_tabs();
+        int ntabs = (int)vis.size();
         int tab_width = (cols - 4) / ntabs;
 
-        for (int i = 0; i < ntabs; i++) {
-            int tx = 2 + i * tab_width;
+        for (int k = 0; k < ntabs; k++) {
+            int i = vis[k];
+            int tx = 2 + k * tab_width;
 
             if (i == current_tab_) {
                 attron(A_BOLD);
@@ -2470,7 +2782,7 @@ private:
         draw_hline(rows - 2, 0, cols, true, true);
         
         if (current_tab_ == 1) {
-            mvaddstr(rows - 1, 2, " ^/v nav  </> adjust  Enter edit  s save  x del  F1 help  F2 guide  Q quit ");
+            mvaddstr(rows - 1, 2, " ^/v nav  </> adjust  Enter edit  1-3 tab  s save  x del  F1 help  F2 guide  Q quit ");
         } else if (current_tab_ == 2) {
             mvaddstr(rows - 1, 2, " ^/v scroll  PgUp/Dn page  F1 help  F2 guide  Q quit ");
         } else if (current_tab_ == 3) {
@@ -2478,7 +2790,7 @@ private:
         } else if (current_tab_ == 5) {
             mvaddstr(rows - 1, 2, " ^/v nav  </> adjust  Enter set/tune  F1 help  F2 guide  Q quit ");
         } else if (current_tab_ == 4) {
-            mvaddstr(rows - 1, 2, " Tab switch  F1 help  F2 guide  Q quit ");
+            mvaddstr(rows - 1, 2, " 1-2 tab  </> tab  F1 help  F2 guide  Q quit ");
         } else {
             mvaddstr(rows - 1, 2, " Tab switch  F1 help  F2 guide  Q quit ");
         }
@@ -3110,6 +3422,18 @@ private:
     }
     
     void draw_signal_graph(int y, int x, int width, int height) {
+        if (height < 3 || width < 2) return;
+        int style = unicode_icons() ? state_.graph_style : 0;
+        if (style == 0) {
+            draw_signal_bars(y, x, width, height);
+            return;
+        }
+        if (style == 1) draw_signal_braille(y, x, width, height - 1);
+        else draw_signal_solid(y, x, width, height - 1);
+        draw_state_strip(y + height - 1, x, width);
+    }
+
+    void draw_signal_bars(int y, int x, int width, int height) {
         auto history = state_.get_level_history();
         auto dcd_hist = state_.get_level_dcd_history();
         auto tone_hist = state_.get_level_tone_history();
@@ -3120,7 +3444,8 @@ private:
         float thresh = state_.carrier_threshold_db;
 
 
-        const char* blocks[] = {" ", ".", ":", "|", "#"};
+        static const char* blocks[] = {" ", ".", ":", "|", "#"};
+        int thresh_row = (int)((max_db - thresh) / (max_db - min_db) * height);
 
         for (int row = 0; row < height; row++) {
             move(y + row, x);
@@ -3140,7 +3465,8 @@ private:
 
                 if (level >= row_max) {
                     attron(COLOR_PAIR(pair) | A_BOLD);
-                    addch(ACS_BLOCK);
+                    if (unicode_icons()) addstr("\u25AE");
+                    else put_block_here();
                     attroff(COLOR_PAIR(pair) | A_BOLD);
                 } else if (level > row_min) {
                     float frac = (level - row_min) / (row_max - row_min);
@@ -3151,19 +3477,169 @@ private:
                     attron(COLOR_PAIR(pair));
                     addstr(blocks[idx]);
                     attroff(COLOR_PAIR(pair));
+                } else if (unicode_icons() && row == thresh_row) {
+                    attron(A_DIM | COLOR_PAIR(3));
+                    addstr("\u2500");
+                    attroff(A_DIM | COLOR_PAIR(3));
                 } else {
                     addch(' ');
                 }
             }
         }
-        
-        int thresh_row = (int)((max_db - thresh) / (max_db - min_db) * height);
-        if (thresh_row >= 0 && thresh_row < height) {
+
+        if (!unicode_icons() && thresh_row >= 0 && thresh_row < height) {
             attron(A_DIM | COLOR_PAIR(3));
             for (int col = 0; col < width; col += 2) {
                 mvaddch(y + thresh_row, x + col, '-');
             }
             attroff(A_DIM | COLOR_PAIR(3));
+        }
+    }
+
+    void level_columns(int width, int trace_h, std::vector<int>& rows, std::vector<int>& pairs) {
+        auto history = state_.get_level_history();
+        auto dcd_hist = state_.get_level_dcd_history();
+        auto tone_hist = state_.get_level_tone_history();
+        float min_db = -80.0f;
+        float max_db = 0.0f;
+        float thresh = state_.carrier_threshold_db;
+        rows.assign(width, trace_h - 1);
+        pairs.assign(width, 1);
+        for (int col = 0; col < width; col++) {
+            int hist_idx = col * TNCUIState::LEVEL_HISTORY_SIZE / width;
+            if (hist_idx >= (int)history.size()) hist_idx = history.size() - 1;
+            float level = std::max(min_db, std::min(max_db, history[hist_idx]));
+            int r = (int)((max_db - level) / (max_db - min_db) * trace_h);
+            rows[col] = std::max(0, std::min(trace_h - 1, r));
+            pairs[col] = tone_hist[hist_idx] ? 2 : dcd_hist[hist_idx] ? 6
+                       : level > thresh ? 4 : 1;
+        }
+    }
+
+    void draw_signal_solid(int y, int x, int width, int trace_h) {
+        std::vector<int> rows, pairs;
+        level_columns(width, trace_h, rows, pairs);
+        for (int col = 0; col < width; col++) {
+            attron(COLOR_PAIR(pairs[col]));
+            for (int k = rows[col] + 1; k < trace_h; k++)
+                mvaddstr(y + k, x + col, "\u2593");
+            attroff(COLOR_PAIR(pairs[col]));
+        }
+        draw_signal_trace(y, x, width, trace_h);
+    }
+
+    void draw_state_strip(int y, int x, int width) {
+        auto history = state_.get_level_history();
+        auto dcd_hist = state_.get_level_dcd_history();
+        auto tone_hist = state_.get_level_tone_history();
+        float thresh = state_.carrier_threshold_db;
+        for (int col = 0; col < width; col++) {
+            int hist_idx = col * TNCUIState::LEVEL_HISTORY_SIZE / width;
+            if (hist_idx >= (int)history.size()) hist_idx = history.size() - 1;
+            int pair = tone_hist[hist_idx] ? 2 : dcd_hist[hist_idx] ? 6
+                     : history[hist_idx] > thresh ? 4 : 1;
+            if (pair != 1) {
+                attron(COLOR_PAIR(pair) | A_BOLD);
+                put_block(y, x + col);
+                attroff(COLOR_PAIR(pair) | A_BOLD);
+            } else {
+                attron(A_DIM);
+                mvaddstr(y, x + col, unicode_icons() ? "\u2591" : ".");
+                attroff(A_DIM);
+            }
+        }
+    }
+
+    void draw_signal_braille(int y, int x, int width, int trace_h) {
+        auto history = state_.get_level_history();
+        auto dcd_hist = state_.get_level_dcd_history();
+        auto tone_hist = state_.get_level_tone_history();
+
+        float min_db = -80.0f;
+        float max_db = 0.0f;
+        float thresh = state_.carrier_threshold_db;
+        int dot_w = width * 2;
+        int dot_h = trace_h * 4;
+        std::vector<uint8_t> bits(width * trace_h, 0);
+        std::vector<int> rank(width * trace_h, 0);
+        static const uint8_t dot_bit[4][2] = {{0x01, 0x08}, {0x02, 0x10}, {0x04, 0x20}, {0x40, 0x80}};
+        int prev = -1;
+        for (int i = 0; i < dot_w; i++) {
+            int hist_idx = i * TNCUIState::LEVEL_HISTORY_SIZE / dot_w;
+            if (hist_idx >= (int)history.size()) hist_idx = history.size() - 1;
+            float level = std::max(min_db, std::min(max_db, history[hist_idx]));
+            int dr = (int)((max_db - level) / (max_db - min_db) * dot_h);
+            dr = std::max(0, std::min(dot_h - 1, dr));
+            int st = tone_hist[hist_idx] ? 3 : dcd_hist[hist_idx] ? 2 : level > thresh ? 1 : 0;
+            int lo = prev < 0 ? dr : std::min(prev, dr);
+            int hi = prev < 0 ? dr : std::max(prev, dr);
+            for (int d = lo; d <= hi; d++) {
+                int cell = (d / 4) * width + i / 2;
+                bits[cell] |= dot_bit[d % 4][i % 2];
+                rank[cell] = std::max(rank[cell], st);
+            }
+            prev = dr;
+        }
+
+        static const int rank_pair[] = {1, 4, 6, 2};
+        int thresh_row = (int)((max_db - thresh) / (max_db - min_db) * trace_h);
+        for (int row = 0; row < trace_h; row++) {
+            for (int col = 0; col < width; col++) {
+                int cell = row * width + col;
+                if (bits[cell]) {
+                    int attr = COLOR_PAIR(rank_pair[rank[cell]]) | (rank[cell] ? A_BOLD : 0);
+                    char u[4] = {(char)0xE2, (char)(0xA0 | (bits[cell] >> 6)),
+                                 (char)(0x80 | (bits[cell] & 0x3F)), 0};
+                    attron(attr);
+                    mvaddstr(y + row, x + col, u);
+                    attroff(attr);
+                } else if (row == thresh_row) {
+                    attron(A_DIM | COLOR_PAIR(3));
+                    mvaddstr(y + row, x + col, "\u2504");
+                    attroff(A_DIM | COLOR_PAIR(3));
+                }
+            }
+        }
+    }
+
+    void draw_signal_trace(int y, int x, int width, int trace_h) {
+        float min_db = -80.0f;
+        float max_db = 0.0f;
+        float thresh = state_.carrier_threshold_db;
+        std::vector<int> rows, pairs;
+        level_columns(width, trace_h, rows, pairs);
+
+        int thresh_row = (int)((max_db - thresh) / (max_db - min_db) * trace_h);
+        if (thresh_row >= 0 && thresh_row < trace_h) {
+            attron(A_DIM | COLOR_PAIR(3));
+            for (int col = 0; col < width; col++) {
+                if (unicode_icons()) mvaddstr(y + thresh_row, x + col, "\u2504");
+                else if (col % 2 == 0) mvaddch(y + thresh_row, x + col, '-');
+            }
+            attroff(A_DIM | COLOR_PAIR(3));
+        }
+
+        for (int col = 0; col < width; col++) {
+            int r = rows[col];
+            int p = col > 0 ? rows[col - 1] : r;
+            int attr = COLOR_PAIR(pairs[col]) | (pairs[col] == 1 ? 0 : A_BOLD);
+            attron(attr);
+            if (r == p) {
+                put_hline(y + r, x + col, 1);
+            } else if (r > p) {
+                if (unicode_icons()) mvaddstr(y + p, x + col, "\u256E");
+                else put_corner(y + p, x + col, C_UR);
+                for (int k = p + 1; k < r; k++) put_vline(y + k, x + col, 1);
+                if (unicode_icons()) mvaddstr(y + r, x + col, "\u2570");
+                else put_corner(y + r, x + col, C_LL);
+            } else {
+                if (unicode_icons()) mvaddstr(y + p, x + col, "\u256F");
+                else put_corner(y + p, x + col, C_LR);
+                for (int k = r + 1; k < p; k++) put_vline(y + k, x + col, 1);
+                if (unicode_icons()) mvaddstr(y + r, x + col, "\u256D");
+                else put_corner(y + r, x + col, C_UL);
+            }
+            attroff(attr);
         }
     }
     
@@ -3173,7 +3649,8 @@ private:
         int divider = cols/2 - 2;  
         int c3 = cols/2 + 1; 
         int start_y = y;
-        int visible_rows = h - 2;  
+        int list_y = y + CONFIG_LIST_TOP;
+        int visible_rows = h - 2 - CONFIG_LIST_TOP;
         
 
         
@@ -3184,6 +3661,7 @@ private:
                 config_last_field_ = current_field_;
                 config_follow_ = true;
             }
+            if (config_tab_of(current_field_) == 0) last_modem_field_ = current_field_;
             if (config_follow_) {
                 int field_row = config_field_row(current_field_);
                 if (field_row < config_scroll_ + 2) {
@@ -3204,617 +3682,679 @@ private:
         auto visible_y = [&](int logical_row) -> int {
             int screen_row = logical_row - scroll;
             if (screen_row < 0 || screen_row >= visible_rows) return -1;
-            return start_y + screen_row;
+            return list_y + screen_row;
         };
-        
-//
+
         attron(A_DIM);
-        for (int r = start_y; r < start_y + visible_rows; r++) {
-            mvaddch(r, divider, ACS_VLINE);
+        for (int r = start_y; r < start_y + h - 2; r++) {
+            put_vline(r, divider, 1);
         }
-
         attroff(A_DIM);
-        
-        int dy = visible_y(row);
-        if (dy >= 0) {
-            attron(A_DIM);
-            mvaddstr(dy, c1, "MODEM");
-            attroff(A_DIM);
-        }
-        row++;
-        
-        dy = visible_y(row);
-        if (dy >= 0) draw_field(dy, c1, c2, "Callsign", FIELD_CALLSIGN, state_.callsign, true);
-        row++;
-
-        dy = visible_y(row);
-        if (dy >= 0) {
-            bool sel_t = (current_field_ == FIELD_CONFIG_TOKEN);
-            if (sel_t) attron(A_BOLD); else attron(A_DIM);
-            mvprintw(dy, c1, "%s[#] Config Token (copy or paste)", sel_t ? "> " : "  ");
-            if (sel_t) attroff(A_BOLD); else attroff(A_DIM);
-        }
-        row++;
-
-        dy = visible_y(row);
-        if (dy >= 0) draw_modem_tabs(dy, c1, c2, divider);
-        row++;
-
-        if (state_.modem_type_index == 0) {
-            // OFDM fields
+        draw_config_tabs(start_y, c1);
+        int dy = -1;
+        if (config_tab_ == 1) {
             dy = visible_y(row);
-            if (dy >= 0) draw_selector_field(dy, c1, c2, "Modulation", FIELD_MODULATION,
-                               MODULATION_OPTIONS[state_.modulation_index]);
+            if (dy >= 0) {
+                attron(A_DIM);
+                mvaddstr(dy, c1, "NETWORK");
+                mvaddstr(dy, c1 + 8, "(restart)");
+                attroff(A_DIM);
+            }
             row++;
-
             dy = visible_y(row);
-            if (dy >= 0) draw_selector_field(dy, c1, c2, "Code Rate", FIELD_CODERATE,
-                               CODE_RATE_OPTIONS[state_.code_rate_index]);
+            if (dy >= 0) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "%d", state_.port);
+                draw_field(dy, c1, c2, "KISS Port", FIELD_NET_PORT, buf, true);
+            }
             row++;
-
             dy = visible_y(row);
-            if (dy >= 0) draw_selector_field(dy, c1, c2, "Frame Size", FIELD_FRAMESIZE,
-                               state_.frame_size == 0 ? "SHORT" : state_.frame_size == 2 ? "LONG"
-                             : state_.frame_size == 3 ? "MICRO" : "NORMAL");
+            if (dy >= 0) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "%d", state_.control_port);
+                draw_field(dy, c1, c2, "Control Port", FIELD_CONTROL_PORT, buf, true);
+            }
             row++;
-
             dy = visible_y(row);
-            if (dy >= 0) draw_toggle_field(dy, c1, c2, "Postamble", FIELD_POSTAMBLE, state_.postamble);
+            if (dy >= 0) {
+                bool lan = state_.bind_address == "0.0.0.0" &&
+                           state_.control_bind_address == "0.0.0.0";
+                draw_field(dy, c1, c2, "LAN Mode", FIELD_LAN_MODE, lan ? "ON" : "OFF", true);
+            }
             row++;
-        } else if (state_.modem_type_index == 1) {
-            // MFSK field
             dy = visible_y(row);
-            if (dy >= 0) draw_selector_field(dy, c1, c2, "MFSK Mode", FIELD_MFSK_MODE,
-                               MFSK_MODE_OPTIONS[state_.mfsk_mode_index]);
+            if (dy >= 0) {
+                std::string na = state_.net_audio_address();
+                draw_field(dy, c1, c2, "Net Audio", FIELD_NET_AUDIO, na.empty() ? "OFF" : na, true);
+            }
+            row += 2;
+            dy = visible_y(row);
+            if (dy >= 0) {
+                attron(A_DIM);
+                mvaddstr(dy, c1, "SYSTEM");
+                attroff(A_DIM);
+            }
             row++;
+            dy = visible_y(row);
+            if (dy >= 0) draw_field(dy, c1, c2, "Restart", FIELD_RESTART,
+                                    state_.attach_target.empty() ? "[enter] restart modem73"
+                                                                 : "[enter] restart attached modem73",
+                                    true);
+        } else if (config_tab_ == 2) {
+            dy = visible_y(row);
+            if (dy >= 0) {
+                attron(A_DIM);
+                mvaddstr(dy, c1, "APPEARANCE");
+                attroff(A_DIM);
+            }
+            row++;
+            dy = visible_y(row);
+            if (dy >= 0) {
+                static const char* icon_names[] = {"AUTO", "TEXT", "UNICODE"};
+                std::string icons = icon_names[state_.icon_mode];
+                if (state_.icon_mode == 0) icons += unicode_icons() ? " (unicode now)" : " (text now)";
+                draw_selector_field(dy, c1, c2, "Icons", FIELD_STYLE_ICONS, icons);
+            }
+            row++;
+            dy = visible_y(row);
+            if (dy >= 0) {
+                static const char* theme_names[] = {"DEFAULT", "PURPLE", "RED"};
+                draw_selector_field(dy, c1, c2, "Theme", FIELD_STYLE_THEME, theme_names[state_.theme]);
+            }
+            row++;
+            dy = visible_y(row);
+            if (dy >= 0) {
+                static const char* graph_names[] = {"1 BARS", "2 CURVE", "3 SOLID"};
+                if (unicode_icons())
+                    draw_selector_field(dy, c1, c2, "Graph", FIELD_STYLE_GRAPH,
+                                        graph_names[state_.graph_style]);
+                else
+                    draw_field(dy, c1, c2, "Graph", FIELD_STYLE_GRAPH, "1 BARS (text icons)", false);
+            }
         } else {
             dy = visible_y(row);
-            if (dy >= 0) draw_selector_field(dy, c1, c2, "RDM Mode", FIELD_ROBUST_MODE,
-                               ROBUST_MODE_OPTIONS[robust_base_index(state_.robust_mode_index)]);
+            if (dy >= 0) {
+                attron(A_DIM);
+                mvaddstr(dy, c1, "MODEM");
+                attroff(A_DIM);
+            }
             row++;
+
             dy = visible_y(row);
-            if (dy >= 0) draw_selector_field(dy, c1, c2, "Frame", FIELD_ROBUST_MTU,
-                               ROBUST_MTU_OPTIONS[robust_mtu_index(state_.robust_mode_index)]);
+            if (dy >= 0) draw_field(dy, c1, c2, "Callsign", FIELD_CALLSIGN, state_.callsign, true);
             row++;
-        }
 
-        row++;
-
-        dy = visible_y(row);
-        if (dy >= 0) {
-            attron(A_DIM);
-            mvaddstr(dy, c1, "CSMA");
-            attroff(A_DIM);
-        }
-        row++;
-        
-        dy = visible_y(row);
-        if (dy >= 0) draw_toggle_field(dy, c1, c2, "Enabled", FIELD_CSMA, state_.csma_enabled);
-        row++;
-
-        dy = visible_y(row);
-        if (dy >= 0) {
-            static const char* MODE_NAMES[3] = {"THRESHOLD", "SYNC", "RANKED"};
-            draw_selector_field(dy, c1, c2, "Mode", FIELD_CSMA_MODE, MODE_NAMES[csma_mode()]);
-        }
-        row++;
-
-        dy = visible_y(row);
-        if (dy >= 0) {
-            bool sel_h = (current_field_ == FIELD_CSMA_HELP);
-            if (sel_h) attron(A_BOLD); else attron(A_DIM);
-            mvprintw(dy, c1 + 2, "%s[?] Which mode", sel_h ? "> " : "  ");
-            if (sel_h) attroff(A_BOLD); else attroff(A_DIM);
-        }
-        row++;
-
-        if (csma_mode() == 0) {
             dy = visible_y(row);
             if (dy >= 0) {
-                char thresh_buf[32];
-                snprintf(thresh_buf, sizeof(thresh_buf), "%.0f dB", state_.carrier_threshold_db);
-                draw_selector_field(dy, c1, c2, "Threshold", FIELD_THRESHOLD, thresh_buf);
-                float lvl = state_.carrier_level_db.load();
-                if (lvl > state_.carrier_threshold_db) {
-                    attron(COLOR_PAIR(4) | A_BOLD);
+                bool sel_t = (current_field_ == FIELD_CONFIG_TOKEN);
+                if (sel_t) attron(A_BOLD); else attron(A_DIM);
+                mvprintw(dy, c1, "%s[#] Config Token (copy or paste)", sel_t ? "> " : "  ");
+                if (sel_t) attroff(A_BOLD); else attroff(A_DIM);
+            }
+            row++;
+
+            dy = visible_y(row);
+            if (dy >= 0) draw_modem_tabs(dy, c1, c2, divider);
+            row++;
+
+            if (state_.modem_type_index == 0) {
+                // OFDM fields
+                dy = visible_y(row);
+                if (dy >= 0) draw_selector_field(dy, c1, c2, "Modulation", FIELD_MODULATION,
+                                   MODULATION_OPTIONS[state_.modulation_index]);
+                row++;
+
+                dy = visible_y(row);
+                if (dy >= 0) draw_selector_field(dy, c1, c2, "Code Rate", FIELD_CODERATE,
+                                   CODE_RATE_OPTIONS[state_.code_rate_index]);
+                row++;
+
+                dy = visible_y(row);
+                if (dy >= 0) draw_selector_field(dy, c1, c2, "Frame Size", FIELD_FRAMESIZE,
+                                   state_.frame_size_auto ? "AUTO"
+                                 : state_.frame_size == 0 ? "SHORT" : state_.frame_size == 2 ? "LONG"
+                                 : state_.frame_size == 3 ? "MICRO" : "NORMAL");
+                row++;
+                if (state_.frame_size_auto) {
+                    dy = visible_y(row);
+                    if (dy >= 0) draw_toggle_field(dy, c1, c2, "  Allow LONG", FIELD_AUTO_LONG,
+                                                   state_.auto_long);
+                    row++;
+                }
+
+                dy = visible_y(row);
+                if (dy >= 0) draw_toggle_field(dy, c1, c2, "Postamble", FIELD_POSTAMBLE, state_.postamble);
+                row++;
+            } else if (state_.modem_type_index == 1) {
+                // MFSK field
+                dy = visible_y(row);
+                if (dy >= 0) draw_selector_field(dy, c1, c2, "MFSK Mode", FIELD_MFSK_MODE,
+                                   MFSK_MODE_OPTIONS[state_.mfsk_mode_index]);
+                row++;
+            } else {
+                dy = visible_y(row);
+                if (dy >= 0) draw_selector_field(dy, c1, c2, "RDM Mode", FIELD_ROBUST_MODE,
+                                   ROBUST_MODE_OPTIONS[robust_base_index(state_.robust_mode_index)]);
+                row++;
+                dy = visible_y(row);
+                if (dy >= 0) draw_selector_field(dy, c1, c2, "Frame", FIELD_ROBUST_MTU,
+                                   ROBUST_MTU_OPTIONS[robust_mtu_index(state_.robust_mode_index)]);
+                row++;
+            }
+
+            row++;
+
+            dy = visible_y(row);
+            if (dy >= 0) {
+                attron(A_DIM);
+                mvaddstr(dy, c1, "CSMA");
+                attroff(A_DIM);
+            }
+            row++;
+
+            dy = visible_y(row);
+            if (dy >= 0) draw_toggle_field(dy, c1, c2, "Enabled", FIELD_CSMA, state_.csma_enabled);
+            row++;
+
+            dy = visible_y(row);
+            if (dy >= 0) {
+                static const char* MODE_NAMES[3] = {"THRESHOLD", "SYNC", "RANKED"};
+                draw_selector_field(dy, c1, c2, "Mode", FIELD_CSMA_MODE, MODE_NAMES[csma_mode()]);
+            }
+            row++;
+
+            dy = visible_y(row);
+            if (dy >= 0) {
+                bool sel_h = (current_field_ == FIELD_CSMA_HELP);
+                if (sel_h) attron(A_BOLD); else attron(A_DIM);
+                mvprintw(dy, c1 + 2, "%s%s Which mode", sel_h ? "> " : "  ", ico_info());
+                if (sel_h) attroff(A_BOLD); else attroff(A_DIM);
+            }
+            row++;
+
+            if (csma_mode() == 0) {
+                dy = visible_y(row);
+                if (dy >= 0) {
+                    char thresh_buf[32];
+                    snprintf(thresh_buf, sizeof(thresh_buf), "%.0f dB", state_.carrier_threshold_db);
+                    draw_selector_field(dy, c1, c2, "Threshold", FIELD_THRESHOLD, thresh_buf);
+                    float lvl = state_.carrier_level_db.load();
+                    if (lvl > state_.carrier_threshold_db) {
+                        attron(COLOR_PAIR(4) | A_BOLD);
+                    } else {
+                        attron(A_DIM);
+                    }
+                    mvprintw(dy, c2 + 9, "%.0f", lvl);
+                    attroff(COLOR_PAIR(4) | A_BOLD);
+                    attroff(A_DIM);
+                }
+                row++;
+
+                dy = visible_y(row);
+                if (dy >= 0) {
+                    mvaddstr(dy, c1, "Level");
+                    move(dy, c2);
+                    float lvl = state_.carrier_level_db.load();
+                    draw_level_meter(lvl, state_.carrier_threshold_db, 14);
+                }
+                row++;
+            }
+
+            if (csma_mode() != 2) {
+            dy = visible_y(row);
+            if (dy >= 0) draw_selector_field(dy, c1, c2, "Band", FIELD_CSMA_BAND,
+                                             CSMA_BAND_NAMES[state_.csma_band & 1]);
+            row++;
+
+            dy = visible_y(row);
+            if (dy >= 0) {
+                int pidx = csma_preset_match();
+                draw_selector_field(dy, c1, c2, "Preset", FIELD_CSMA_PRESET,
+                                    pidx >= 0 ? CSMA_PRESETS[state_.csma_band & 1][pidx].name
+                                              : "CUSTOM");
+            }
+            row++;
+            }
+
+            dy = visible_y(row);
+            if (dy >= 0) {
+                bool sel_adv = (current_field_ == FIELD_CSMA_ADV);
+                if (sel_adv) attron(A_BOLD); else attron(A_DIM);
+                mvprintw(dy, c1, "%s%s Advanced", sel_adv ? "> " : "  ",
+                         gl(state_.csma_advanced_open ? G_FOLD_OPEN : G_FOLD_CLOSED));
+                if (sel_adv) attroff(A_BOLD); else attroff(A_DIM);
+            }
+            row++;
+
+            if (state_.csma_advanced_open) {
+                int m = csma_mode();
+                if (m != 2) {
+                dy = visible_y(row);
+                if (dy >= 0) {
+                    char quiet_buf[32];
+                    if (state_.csma_quiet_ms > 0)
+                        snprintf(quiet_buf, sizeof(quiet_buf), "%d ms", state_.csma_quiet_ms);
+                    else
+                        snprintf(quiet_buf, sizeof(quiet_buf), "AUTO");
+                    draw_selector_field(dy, c1 + 2, c2, "Quiet", FIELD_CSMA_QUIET, quiet_buf);
+                }
+                row++;
+                }
+
+                if (m == 0) {
+                    dy = visible_y(row);
+                    if (dy >= 0) {
+                        char cw_buf[32];
+                        snprintf(cw_buf, sizeof(cw_buf), "%d x %dms", state_.csma_cw, state_.slot_time_ms);
+                        draw_selector_field(dy, c1 + 2, c2, "Window", FIELD_CSMA_CW, cw_buf);
+                    }
+                    row++;
+                }
+
+                if (m != 2) {
+                dy = visible_y(row);
+                if (dy >= 0) draw_toggle_field(dy, c1 + 2, c2, "Lead Tone", FIELD_LEAD_TONE, state_.tx_lead_tone);
+                row++;
+
+                dy = visible_y(row);
+                if (dy >= 0) {
+                    char dith_buf[32];
+                    if (state_.csma_responder_dither > 0)
+                        snprintf(dith_buf, sizeof(dith_buf), "%d ms", state_.csma_responder_dither);
+                    else
+                        snprintf(dith_buf, sizeof(dith_buf), "OFF");
+                    draw_selector_field(dy, c1 + 2, c2, "Reply Offset", FIELD_RESP_DITHER, dith_buf);
+                }
+                row++;
+                }
+
+                dy = visible_y(row);
+                if (dy >= 0) {
+                    char burst_buf[32];
+                    if (state_.csma_burst > 1 && state_.ptt_type_index == 2)
+                        snprintf(burst_buf, sizeof(burst_buf), "%d pkts (1 with VOX)", state_.csma_burst);
+                    else if (state_.csma_burst > 1)
+                        snprintf(burst_buf, sizeof(burst_buf), "%d pkts", state_.csma_burst);
+                    else
+                        snprintf(burst_buf, sizeof(burst_buf), "OFF");
+                    draw_selector_field(dy, c1 + 2, c2, "Burst", FIELD_CSMA_BURST, burst_buf);
+                }
+                row++;
+
+                if (m == 1) {
+                    dy = visible_y(row);
+                    if (dy >= 0) {
+                        draw_toggle_field(dy, c1 + 2, c2, "Fast Floor", FIELD_FAST_FLOOR,
+                                          state_.csma_fast_floor);
+                    }
+                    row++;
+                }
+                if (m == 2) {
+                    dy = visible_y(row);
+                    if (dy >= 0) {
+                        char bi_buf[16];
+                        snprintf(bi_buf, sizeof(bi_buf), "%d s", state_.beacon_interval_s);
+                        draw_selector_field(dy, c1 + 2, c2, "Presence Ivl", FIELD_BEACON_INT, bi_buf);
+                    }
+                    row++;
+                }
+            }
+
+            dy = visible_y(row);
+            if (dy >= 0) {
+                bool sel_info = (current_field_ == FIELD_CSMA_INFO);
+                if (sel_info) attron(A_BOLD); else attron(A_DIM);
+                mvprintw(dy, c1, "%s%s Info", sel_info ? "> " : "  ", ico_info());
+                if (sel_info) attroff(A_BOLD); else attroff(A_DIM);
+            }
+            row += 2;
+
+            // Fragmentation section
+            dy = visible_y(row);
+            if (dy >= 0) {
+                attron(A_DIM);
+                mvaddstr(dy, c1, "FRAGMENTATION");
+                mvaddstr(dy, c1 + 14, "(restart)");
+                attroff(A_DIM);
+            }
+            row++;
+
+            dy = visible_y(row);
+            if (dy >= 0) draw_toggle_field(dy, c1, c2, "Enabled", FIELD_FRAGMENTATION, state_.fragmentation_enabled);
+            row += 2;
+
+            if (!state_.csma_enabled) {
+                dy = visible_y(row);
+                if (dy >= 0) {
+                    attron(A_DIM);
+                    mvaddstr(dy, c1, "TX BLANKING");
+                    attroff(A_DIM);
+                }
+                row++;
+
+                dy = visible_y(row);
+                if (dy >= 0) draw_toggle_field(dy, c1, c2, "Enabled", FIELD_TX_BLANKING, state_.tx_blanking_enabled);
+                row += 2;
+            }
+
+            dy = visible_y(row);
+            if (dy >= 0) {
+                attron(A_DIM);
+                mvaddstr(dy, c1, "RX DECODERS");
+                attroff(A_DIM);
+            }
+            row++;
+
+            dy = visible_y(row);
+            if (dy >= 0) {
+                draw_toggle_field(dy, c1, c2, "OFDM", FIELD_RX_OFDM, state_.ofdm_rx_enabled);
+                if (!state_.ofdm_rx_enabled && state_.modem_type_index == 0)
+                    draw_rx_forced(dy, c2);
+            }
+            row++;
+
+            dy = visible_y(row);
+            if (dy >= 0) {
+                draw_toggle_field(dy, c1, c2, "ROBUST", FIELD_RX_ROBUST, state_.robust_rx_enabled);
+                if (!state_.robust_rx_enabled && state_.modem_type_index == 2)
+                    draw_rx_forced(dy, c2);
+            }
+            row++;
+
+            dy = visible_y(row);
+            if (dy >= 0) {
+                draw_toggle_field(dy, c1, c2, "MFSK", FIELD_RX_MFSK, state_.mfsk_rx_enabled);
+                if (!state_.mfsk_rx_enabled && state_.modem_type_index == 1)
+                    draw_rx_forced(dy, c2);
+            }
+            row += 2;
+
+            dy = visible_y(row);
+            if (dy >= 0) {
+                attron(A_DIM);
+                mvaddstr(dy, c1, "TX OUTPUT");
+                attroff(A_DIM);
+            }
+            row++;
+
+            dy = visible_y(row);
+            if (dy >= 0) {
+                if (!rig_ui()) {
+                    char lvl_buf[24];
+                    snprintf(lvl_buf, sizeof(lvl_buf), "%d%%",
+                             (int)lround(state_.tx_drive.load() * 100));
+                    draw_selector_field(dy, c1, c2, "TX Level", FIELD_TX_LEVEL, lvl_buf);
                 } else {
                     attron(A_DIM);
+                    mvaddstr(dy, c1, "TX Level");
+                    mvaddstr(dy, c2, "RIG tab");
+                    attroff(A_DIM);
                 }
-                mvprintw(dy, c2 + 9, "%.0f", lvl);
-                attroff(COLOR_PAIR(4) | A_BOLD);
-                attroff(A_DIM);
             }
-            row++;
-
-            dy = visible_y(row);
-            if (dy >= 0) {
-                mvaddstr(dy, c1, "Level");
-                move(dy, c2);
-                float lvl = state_.carrier_level_db.load();
-                draw_level_meter(lvl, state_.carrier_threshold_db, 14);
-            }
-            row++;
-        }
-
-        if (csma_mode() != 2) {
-        dy = visible_y(row);
-        if (dy >= 0) draw_selector_field(dy, c1, c2, "Band", FIELD_CSMA_BAND,
-                                         CSMA_BAND_NAMES[state_.csma_band & 1]);
-        row++;
-
-        dy = visible_y(row);
-        if (dy >= 0) {
-            int pidx = csma_preset_match();
-            draw_selector_field(dy, c1, c2, "Preset", FIELD_CSMA_PRESET,
-                                pidx >= 0 ? CSMA_PRESETS[state_.csma_band & 1][pidx].name
-                                          : "CUSTOM");
-        }
-        row++;
-        }
-
-        dy = visible_y(row);
-        if (dy >= 0) {
-            bool sel_adv = (current_field_ == FIELD_CSMA_ADV);
-            if (sel_adv) attron(A_BOLD); else attron(A_DIM);
-            mvprintw(dy, c1, "%s[%c] Advanced", sel_adv ? "> " : "  ",
-                     state_.csma_advanced_open ? '-' : '+');
-            if (sel_adv) attroff(A_BOLD); else attroff(A_DIM);
-        }
-        row++;
-
-        if (state_.csma_advanced_open) {
-            int m = csma_mode();
-            if (m != 2) {
-            dy = visible_y(row);
-            if (dy >= 0) {
-                char quiet_buf[32];
-                if (state_.csma_quiet_ms > 0)
-                    snprintf(quiet_buf, sizeof(quiet_buf), "%d ms", state_.csma_quiet_ms);
-                else
-                    snprintf(quiet_buf, sizeof(quiet_buf), "AUTO");
-                draw_selector_field(dy, c1 + 2, c2, "Quiet", FIELD_CSMA_QUIET, quiet_buf);
-            }
-            row++;
-            }
-
-            if (m == 0) {
-                dy = visible_y(row);
-                if (dy >= 0) {
-                    char cw_buf[32];
-                    snprintf(cw_buf, sizeof(cw_buf), "%d x %dms", state_.csma_cw, state_.slot_time_ms);
-                    draw_selector_field(dy, c1 + 2, c2, "Window", FIELD_CSMA_CW, cw_buf);
-                }
-                row++;
-            }
-
-            if (m != 2) {
-            dy = visible_y(row);
-            if (dy >= 0) draw_toggle_field(dy, c1 + 2, c2, "Lead Tone", FIELD_LEAD_TONE, state_.tx_lead_tone);
-            row++;
-
-            dy = visible_y(row);
-            if (dy >= 0) {
-                char dith_buf[32];
-                if (state_.csma_responder_dither > 0)
-                    snprintf(dith_buf, sizeof(dith_buf), "%d ms", state_.csma_responder_dither);
-                else
-                    snprintf(dith_buf, sizeof(dith_buf), "OFF");
-                draw_selector_field(dy, c1 + 2, c2, "Reply Offset", FIELD_RESP_DITHER, dith_buf);
-            }
-            row++;
-            }
-
-            dy = visible_y(row);
-            if (dy >= 0) {
-                char burst_buf[32];
-                if (state_.csma_burst > 1)
-                    snprintf(burst_buf, sizeof(burst_buf), "%d pkts", state_.csma_burst);
-                else
-                    snprintf(burst_buf, sizeof(burst_buf), "OFF");
-                draw_selector_field(dy, c1 + 2, c2, "Burst", FIELD_CSMA_BURST, burst_buf);
-            }
-            row++;
-
-            if (m == 1) {
-                dy = visible_y(row);
-                if (dy >= 0) {
-                    draw_toggle_field(dy, c1 + 2, c2, "Fast Floor", FIELD_FAST_FLOOR,
-                                      state_.csma_fast_floor);
-                }
-                row++;
-            }
-            if (m == 2) {
-                dy = visible_y(row);
-                if (dy >= 0) {
-                    char bi_buf[16];
-                    snprintf(bi_buf, sizeof(bi_buf), "%d s", state_.beacon_interval_s);
-                    draw_selector_field(dy, c1 + 2, c2, "Presence Ivl", FIELD_BEACON_INT, bi_buf);
-                }
-                row++;
-            }
-        }
-
-        dy = visible_y(row);
-        if (dy >= 0) {
-            bool sel_info = (current_field_ == FIELD_CSMA_INFO);
-            if (sel_info) attron(A_BOLD); else attron(A_DIM);
-            mvprintw(dy, c1, "%s[?] Info", sel_info ? "> " : "  ");
-            if (sel_info) attroff(A_BOLD); else attroff(A_DIM);
-        }
-        row += 2;
-        
-        // Fragmentation section
-        dy = visible_y(row);
-        if (dy >= 0) {
-            attron(A_DIM);
-            mvaddstr(dy, c1, "FRAGMENTATION");
-            mvaddstr(dy, c1 + 14, "(restart)");
-            attroff(A_DIM);
-        }
-        row++;
-        
-        dy = visible_y(row);
-        if (dy >= 0) draw_toggle_field(dy, c1, c2, "Enabled", FIELD_FRAGMENTATION, state_.fragmentation_enabled);
-        row += 2;
-        
-        if (!state_.csma_enabled) {
-            dy = visible_y(row);
-            if (dy >= 0) {
-                attron(A_DIM);
-                mvaddstr(dy, c1, "TX BLANKING");
-                attroff(A_DIM);
-            }
-            row++;
-
-            dy = visible_y(row);
-            if (dy >= 0) draw_toggle_field(dy, c1, c2, "Enabled", FIELD_TX_BLANKING, state_.tx_blanking_enabled);
             row += 2;
-        }
 
-        dy = visible_y(row);
-        if (dy >= 0) {
-            attron(A_DIM);
-            mvaddstr(dy, c1, "RX DECODERS");
-            attroff(A_DIM);
-        }
-        row++;
+            // Audio / ptt
 
-        dy = visible_y(row);
-        if (dy >= 0) {
-            draw_toggle_field(dy, c1, c2, "OFDM", FIELD_RX_OFDM, state_.ofdm_rx_enabled);
-            if (!state_.ofdm_rx_enabled && state_.modem_type_index == 0)
-                draw_rx_forced(dy, c2);
-        }
-        row++;
-
-        dy = visible_y(row);
-        if (dy >= 0) {
-            draw_toggle_field(dy, c1, c2, "ROBUST", FIELD_RX_ROBUST, state_.robust_rx_enabled);
-            if (!state_.robust_rx_enabled && state_.modem_type_index == 2)
-                draw_rx_forced(dy, c2);
-        }
-        row++;
-
-        dy = visible_y(row);
-        if (dy >= 0) {
-            draw_toggle_field(dy, c1, c2, "MFSK", FIELD_RX_MFSK, state_.mfsk_rx_enabled);
-            if (!state_.mfsk_rx_enabled && state_.modem_type_index == 1)
-                draw_rx_forced(dy, c2);
-        }
-        row += 2;
-
-        dy = visible_y(row);
-        if (dy >= 0) {
-            attron(A_DIM);
-            mvaddstr(dy, c1, "TX OUTPUT");
-            mvaddstr(dy, c1 + 10, "(applies live)");
-            attroff(A_DIM);
-        }
-        row++;
-
-        dy = visible_y(row);
-        if (dy >= 0) {
-            if (!rig_ui()) {
-                char lvl_buf[24];
-                snprintf(lvl_buf, sizeof(lvl_buf), "%d%%",
-                         (int)lround(state_.tx_drive.load() * 100));
-                draw_selector_field(dy, c1, c2, "TX Level", FIELD_TX_LEVEL, lvl_buf);
-            } else {
+            dy = visible_y(row);
+            if (dy >= 0) {
                 attron(A_DIM);
-                mvaddstr(dy, c1, "TX Level");
-                mvaddstr(dy, c2, "RIG tab");
+                mvaddstr(dy, c1, "AUDIO/PTT");
+                mvaddstr(dy, c1 + 10, "(restart)");
                 attroff(A_DIM);
             }
-        }
-        row += 2;
-
-        // Audio / ptt
-
-        dy = visible_y(row);
-        if (dy >= 0) {
-            attron(A_DIM);
-            mvaddstr(dy, c1, "AUDIO/PTT");
-            mvaddstr(dy, c1 + 10, "(restart)");
-            attroff(A_DIM);
-        }
-        row++;
-        
-        // Audio input device
-        dy = visible_y(row);
-        if (dy >= 0) {
-            std::string dev_display = state_.audio_input_device;
-            if (dev_display.length() > 12) {
-                dev_display = dev_display.substr(0, 11) + "~";
-            }
-            draw_field(dy, c1, c2, "Input", FIELD_AUDIO_INPUT, dev_display, true);
-            if (!state_.audio_connected.load() && current_field_ != FIELD_AUDIO_INPUT) {
-                attron(COLOR_PAIR(2) | A_BOLD);
-                mvaddstr(dy, c1, "Input");
-                attroff(COLOR_PAIR(2) | A_BOLD);
-            }
-        }
-        row++;
-        
-        // Audio output device
-        dy = visible_y(row);
-        if (dy >= 0) {
-            std::string dev_display = state_.audio_output_device;
-            if (dev_display.length() > 12) {
-                dev_display = dev_display.substr(0, 11) + "~";
-            }
-            draw_field(dy, c1, c2, "Output", FIELD_AUDIO_OUTPUT, dev_display, true);
-            if (!state_.audio_connected.load() && current_field_ != FIELD_AUDIO_OUTPUT) {
-                attron(COLOR_PAIR(2) | A_BOLD);
-                mvaddstr(dy, c1, "Output");
-                attroff(COLOR_PAIR(2) | A_BOLD);
-            }
-        }
-        row++;
-
-        dy = visible_y(row);
-        if (dy >= 0) {
-            draw_field(dy, c1, c2, "PTT", FIELD_PTT_TYPE,
-                       PTT_TYPE_OPTIONS[state_.ptt_type_index], true);
-            bool ptt_err = state_.ptt_failed.load() ||
-                           ((state_.ptt_type_index == 1 || state_.ptt_type_index == 5) &&
-                            !state_.rigctl_connected.load());
-            if (ptt_err) {
-                if (current_field_ != FIELD_PTT_TYPE) {
-                    attron(COLOR_PAIR(2) | A_BOLD);
-                    mvaddstr(dy, c1, "PTT");
-                    attroff(COLOR_PAIR(2) | A_BOLD);
-                }
-                attron(COLOR_PAIR(2) | A_BOLD);
-                mvaddstr(dy, c2 + 18, "!key failed");
-                attroff(COLOR_PAIR(2) | A_BOLD);
-            }
-        }
-        row++;
-
-        if (state_.ptt_type_index == 2) {  // VOX
-            dy = visible_y(row);
-            if (dy >= 0) {
-                char vox_freq_buf[32];
-                snprintf(vox_freq_buf, sizeof(vox_freq_buf), "%d Hz", state_.vox_tone_freq);
-                draw_selector_field(dy, c1, c2, "VOX Tone", FIELD_VOX_FREQ, vox_freq_buf);
-            }
-            row++;
-            
-            dy = visible_y(row);
-            if (dy >= 0) {
-                char vox_lead_buf[32];
-                snprintf(vox_lead_buf, sizeof(vox_lead_buf), "%d ms", state_.vox_lead_ms);
-                draw_selector_field(dy, c1, c2, "VOX Lead", FIELD_VOX_LEAD, vox_lead_buf);
-            }
             row++;
 
+            // Audio input device
             dy = visible_y(row);
             if (dy >= 0) {
-                char vox_tail_buf[32];
-                snprintf(vox_tail_buf, sizeof(vox_tail_buf), "%d ms", state_.vox_tail_ms);
-                draw_selector_field(dy, c1, c2, "VOX Tail", FIELD_VOX_TAIL, vox_tail_buf);
-            }
-            row++;
-        }
-        
-        if (state_.ptt_type_index == 3) {  // COM
-            dy = visible_y(row);
-            if (dy >= 0) {
-                std::string port_display = state_.com_port;
-                if (port_display.length() > 14) {
-                    port_display = port_display.substr(0, 13) + "~";
-                }
-                draw_field(dy, c1, c2, "COM Port", FIELD_COM_PORT, port_display, true);
-            }
-            row++;
-            
-            dy = visible_y(row);
-            if (dy >= 0) draw_selector_field(dy, c1, c2, "PTT Line", FIELD_COM_LINE,
-                               PTT_LINE_OPTIONS[state_.com_ptt_line]);
-            row++;
-            
-            dy = visible_y(row);
-            if (dy >= 0) {
-                std::string invert_str;
-                if (!state_.com_invert_dtr && !state_.com_invert_rts) {
-                    invert_str = "NORMAL";
-                } else if (state_.com_invert_dtr && !state_.com_invert_rts) {
-                    invert_str = "INV DTR";
-                } else if (!state_.com_invert_dtr && state_.com_invert_rts) {
-                    invert_str = "INV RTS";
-                } else {
-                    invert_str = "INV BOTH";
-                }
-                draw_selector_field(dy, c1, c2, "Invert", FIELD_COM_INVERT, invert_str);
-            }
-            row++;
-        }
-#ifdef WITH_GPIO_PTT
-        if (state_.ptt_type_index == 6) {
-            dy = visible_y(row);
-            if (dy >= 0) {
-                std::string chip = state_.gpio_chip;
-                if (chip.length() > 14) chip = chip.substr(0, 13) + "~";
-                draw_field(dy, c1, c2, "GPIO Chip", FIELD_GPIO_CHIP, chip, true);
-            }
-            row++;
-            dy = visible_y(row);
-            if (dy >= 0) draw_field(dy, c1, c2, "GPIO Line", FIELD_GPIO_LINE, std::to_string(state_.gpio_line), true);
-            row++;
-            dy = visible_y(row);
-            if (dy >= 0) draw_selector_field(dy, c1, c2, "Polarity", FIELD_GPIO_INVERT,
-                                             state_.gpio_active_low ? "ACTIVE LOW" : "ACTIVE HIGH");
-            row++;
-        }
-#endif
-#ifdef WITH_CM108
-        if (state_.ptt_type_index == 4) {  // CM108
-            dy = visible_y(row);
-            if (dy >= 0) {
-                char cm108_gpio_buf[32];
-                snprintf(cm108_gpio_buf, sizeof(cm108_gpio_buf), "%d", state_.cm108_gpio);
-                draw_field(dy, c1, c2, "GPIO Pin", FIELD_CM108_GPIO, cm108_gpio_buf, true);
-            }
-            row++;
-
-            dy = visible_y(row);
-            if (dy >= 0) {
-                std::string dev_display = state_.cm108_device.empty() ? "Auto" : state_.cm108_device;
+                std::string dev_display = state_.audio_input_device;
                 if (dev_display.length() > 12) {
                     dev_display = dev_display.substr(0, 11) + "~";
                 }
-                draw_field(dy, c1, c2, "Device", FIELD_CM108_DEVICE, dev_display, true);
+                draw_field(dy, c1, c2, "Input", FIELD_AUDIO_INPUT, dev_display, true);
+                if (!state_.audio_connected.load()) {
+                    attron(COLOR_PAIR(2) | A_BOLD);
+                    if (current_field_ != FIELD_AUDIO_INPUT) mvaddstr(dy, c1, "Input");
+                    mvprintw(dy, c2 + 18, "%s audio failed", ico_warn());
+                    attroff(COLOR_PAIR(2) | A_BOLD);
+                }
             }
             row++;
-        }
-#endif
-        dy = visible_y(row);
-        if (dy >= 0) {
-            char txd_buf[24];
-            snprintf(txd_buf, sizeof(txd_buf), "%d ms", state_.tx_delay_ms);
-            draw_selector_field(dy, c1, c2, "TX Delay", FIELD_TX_DELAY, txd_buf);
-        }
-        row++;
-        auto draw_rig_fields = [&]() {
+
+            // Audio output device
             dy = visible_y(row);
             if (dy >= 0) {
-                std::string m = state_.hamlib_model > 0 ? hamlib_model_label(state_.hamlib_model) : "select";
-                if (m.length() > 22) m = m.substr(0, 21) + "~";
-                draw_field(dy, c1, c2, "Rig", FIELD_HAMLIB_MODEL, m, true);
+                std::string dev_display = state_.audio_output_device;
+                if (dev_display.length() > 12) {
+                    dev_display = dev_display.substr(0, 11) + "~";
+                }
+                draw_field(dy, c1, c2, "Output", FIELD_AUDIO_OUTPUT, dev_display, true);
+                if (!state_.audio_connected.load()) {
+                    attron(COLOR_PAIR(2) | A_BOLD);
+                    if (current_field_ != FIELD_AUDIO_OUTPUT) mvaddstr(dy, c1, "Output");
+                    mvprintw(dy, c2 + 18, "%s audio failed", ico_warn());
+                    attroff(COLOR_PAIR(2) | A_BOLD);
+                }
             }
             row++;
+
             dy = visible_y(row);
             if (dy >= 0) {
-                std::string d = state_.hamlib_device.empty() ? "none" : state_.hamlib_device;
-                if (d.length() > 22) d = d.substr(0, 21) + "~";
-                draw_field(dy, c1, c2, "Rig Device", FIELD_HAMLIB_DEVICE, d, true);
+                draw_field(dy, c1, c2, "PTT", FIELD_PTT_TYPE,
+                           PTT_TYPE_OPTIONS[state_.ptt_type_index], true);
+                bool ptt_err = state_.ptt_failed.load() ||
+                               ((state_.ptt_type_index == 1 || state_.ptt_type_index == 5) &&
+                                !state_.rigctl_connected.load());
+                if (ptt_err) {
+                    if (current_field_ != FIELD_PTT_TYPE) {
+                        attron(COLOR_PAIR(2) | A_BOLD);
+                        mvaddstr(dy, c1, "PTT");
+                        attroff(COLOR_PAIR(2) | A_BOLD);
+                    }
+                    attron(COLOR_PAIR(2) | A_BOLD);
+                    mvprintw(dy, c2 + 18, "%s key failed", ico_warn());
+                    attroff(COLOR_PAIR(2) | A_BOLD);
+                }
             }
             row++;
+
+            if (state_.ptt_type_index == 2) {  // VOX
+                dy = visible_y(row);
+                if (dy >= 0) {
+                    char vox_freq_buf[32];
+                    snprintf(vox_freq_buf, sizeof(vox_freq_buf), "%d Hz", state_.vox_tone_freq);
+                    draw_selector_field(dy, c1, c2, "VOX Tone", FIELD_VOX_FREQ, vox_freq_buf);
+                }
+                row++;
+
+                dy = visible_y(row);
+                if (dy >= 0) {
+                    char vox_lead_buf[32];
+                    snprintf(vox_lead_buf, sizeof(vox_lead_buf), "%d ms", state_.vox_lead_ms);
+                    draw_selector_field(dy, c1, c2, "VOX Lead", FIELD_VOX_LEAD, vox_lead_buf);
+                }
+                row++;
+
+                dy = visible_y(row);
+                if (dy >= 0) {
+                    char vox_tail_buf[32];
+                    snprintf(vox_tail_buf, sizeof(vox_tail_buf), "%d ms", state_.vox_tail_ms);
+                    draw_selector_field(dy, c1, c2, "VOX Tail", FIELD_VOX_TAIL, vox_tail_buf);
+                }
+                row++;
+            }
+
+            if (state_.ptt_type_index == 3) {  // COM
+                dy = visible_y(row);
+                if (dy >= 0) {
+                    std::string port_display = state_.com_port;
+                    if (port_display.length() > 14) {
+                        port_display = port_display.substr(0, 13) + "~";
+                    }
+                    draw_field(dy, c1, c2, "COM Port", FIELD_COM_PORT, port_display, true);
+                }
+                row++;
+
+                dy = visible_y(row);
+                if (dy >= 0) draw_selector_field(dy, c1, c2, "PTT Line", FIELD_COM_LINE,
+                                   PTT_LINE_OPTIONS[state_.com_ptt_line]);
+                row++;
+
+                dy = visible_y(row);
+                if (dy >= 0) {
+                    std::string invert_str;
+                    if (!state_.com_invert_dtr && !state_.com_invert_rts) {
+                        invert_str = "NORMAL";
+                    } else if (state_.com_invert_dtr && !state_.com_invert_rts) {
+                        invert_str = "INV DTR";
+                    } else if (!state_.com_invert_dtr && state_.com_invert_rts) {
+                        invert_str = "INV RTS";
+                    } else {
+                        invert_str = "INV BOTH";
+                    }
+                    draw_selector_field(dy, c1, c2, "Invert", FIELD_COM_INVERT, invert_str);
+                }
+                row++;
+            }
+    #ifdef WITH_GPIO_PTT
+            if (state_.ptt_type_index == 6) {
+                dy = visible_y(row);
+                if (dy >= 0) {
+                    std::string chip = state_.gpio_chip;
+                    if (chip.length() > 14) chip = chip.substr(0, 13) + "~";
+                    draw_field(dy, c1, c2, "GPIO Chip", FIELD_GPIO_CHIP, chip, true);
+                }
+                row++;
+                dy = visible_y(row);
+                if (dy >= 0) draw_field(dy, c1, c2, "GPIO Line", FIELD_GPIO_LINE, std::to_string(state_.gpio_line), true);
+                row++;
+                dy = visible_y(row);
+                if (dy >= 0) draw_selector_field(dy, c1, c2, "Polarity", FIELD_GPIO_INVERT,
+                                                 state_.gpio_active_low ? "ACTIVE LOW" : "ACTIVE HIGH");
+                row++;
+            }
+    #endif
+    #ifdef WITH_CM108
+            if (state_.ptt_type_index == 4) {  // CM108
+                dy = visible_y(row);
+                if (dy >= 0) {
+                    char cm108_gpio_buf[32];
+                    snprintf(cm108_gpio_buf, sizeof(cm108_gpio_buf), "%d", state_.cm108_gpio);
+                    draw_field(dy, c1, c2, "GPIO Pin", FIELD_CM108_GPIO, cm108_gpio_buf, true);
+                }
+                row++;
+
+                dy = visible_y(row);
+                if (dy >= 0) {
+                    std::string dev_display = state_.cm108_device.empty() ? "Auto" : state_.cm108_device;
+                    if (dev_display.length() > 12) {
+                        dev_display = dev_display.substr(0, 11) + "~";
+                    }
+                    draw_field(dy, c1, c2, "Device", FIELD_CM108_DEVICE, dev_display, true);
+                }
+                row++;
+            }
+    #endif
             dy = visible_y(row);
-            if (dy >= 0) draw_selector_field(dy, c1, c2, "Rig Baud", FIELD_HAMLIB_BAUD,
-                                             state_.hamlib_baud > 0 ? std::to_string(state_.hamlib_baud) : std::string("default"));
+            if (dy >= 0) {
+                char txd_buf[24];
+                snprintf(txd_buf, sizeof(txd_buf), "%d ms", state_.tx_delay_ms);
+                draw_selector_field(dy, c1, c2, "TX Delay", FIELD_TX_DELAY, txd_buf);
+            }
             row++;
-        };
-        if (state_.ptt_type_index == 5) {
-            draw_rig_fields();
-        }
-        if (hamlib_info_field()) {
+            auto draw_rig_fields = [&]() {
+                dy = visible_y(row);
+                if (dy >= 0) {
+                    std::string m = state_.hamlib_model > 0 ? hamlib_model_label(state_.hamlib_model) : "select";
+                    if (m.length() > 22) m = m.substr(0, 21) + "~";
+                    draw_field(dy, c1, c2, "Rig", FIELD_HAMLIB_MODEL, m, true);
+                }
+                row++;
+                dy = visible_y(row);
+                if (dy >= 0) {
+                    std::string d = state_.hamlib_device.empty() ? "none" : state_.hamlib_device;
+                    if (d.length() > 22) d = d.substr(0, 21) + "~";
+                    draw_field(dy, c1, c2, "Rig Device", FIELD_HAMLIB_DEVICE, d, true);
+                }
+                row++;
+                dy = visible_y(row);
+                if (dy >= 0) draw_selector_field(dy, c1, c2, "Rig Baud", FIELD_HAMLIB_BAUD,
+                                                 state_.hamlib_baud > 0 ? std::to_string(state_.hamlib_baud) : std::string("default"));
+                row++;
+            };
+            if (state_.ptt_type_index == 5) {
+                draw_rig_fields();
+            }
             row++;
             dy = visible_y(row);
             if (dy >= 0) {
                 attron(A_DIM);
                 mvaddstr(dy, c1, "MISC");
-                mvaddstr(dy, c1 + 5, "(restart)");
+                if (hamlib_info_field()) mvaddstr(dy, c1 + 5, "(restart)");
                 attroff(A_DIM);
             }
             row++;
-            dy = visible_y(row);
-            if (dy >= 0) draw_selector_field(dy, c1, c2, "Rig Info", FIELD_HAMLIB_INFO,
-                                             state_.hamlib_info ? "HAMLIB" : "OFF");
-            row++;
-            if (state_.hamlib_info) {
-                draw_rig_fields();
-            }
-        }
-        row++;
-        
-        // Network section
-        dy = visible_y(row);
-        if (dy >= 0) {
-            attron(A_DIM);
-            mvaddstr(dy, c1, "NETWORK");
-            mvaddstr(dy, c1 + 8, "(restart)");
-            attroff(A_DIM);
-        }
-        row++;
-        
-        dy = visible_y(row);
-        if (dy >= 0) {
-            char port_buf[32];
-            snprintf(port_buf, sizeof(port_buf), "%d", state_.port);
-            draw_field(dy, c1, c2, "KISS Port", FIELD_NET_PORT, port_buf, true);
-        }
-        row++;
-
-        dy = visible_y(row);
-        if (dy >= 0) {
-            char cport_buf[32];
-            snprintf(cport_buf, sizeof(cport_buf), "%d", state_.control_port);
-            draw_field(dy, c1, c2, "Control Port", FIELD_CONTROL_PORT, cport_buf, true);
-        }
-        row++;
-
-        dy = visible_y(row);
-        if (dy >= 0) {
-            bool lan = state_.bind_address == "0.0.0.0" &&
-                       state_.control_bind_address == "0.0.0.0";
-            draw_field(dy, c1, c2, "LAN Mode", FIELD_LAN_MODE, lan ? "ON" : "OFF", true);
-        }
-        row += 2;
-        
-        //  Preset section
-        dy = visible_y(row);
-        if (dy >= 0) {
-            attron(A_DIM);
-            mvaddstr(dy, c1, "PRESET");
-            attroff(A_DIM);
-        }
-        row++;
-        
-        dy = visible_y(row);
-        if (dy >= 0) {
-            bool sel = (current_field_ == FIELD_PRESET);
-            if (sel) {
-                attron(A_BOLD);
-                mvaddch(dy, c1 - 2, '>');
-                mvaddstr(dy, c1, "Load");
-                attroff(A_BOLD);
-            } else {
-                attron(A_DIM);
-                mvaddstr(dy, c1, "Load");
-                attroff(A_DIM);
-            }
-            
-            move(dy, c2);
-            if (state_.presets.empty()) {
-                attron(A_DIM);
-                addstr("(none)");
-                attroff(A_DIM);
-            } else {
-                if (sel) attron(COLOR_PAIR(4) | A_BOLD);
-                addstr("< ");
-                if (state_.selected_preset >= 0 && state_.selected_preset < (int)state_.presets.size()) {
-                    printw("%-10s", state_.presets[state_.selected_preset].name.c_str());
+            if (hamlib_info_field()) {
+                dy = visible_y(row);
+                if (dy >= 0) draw_selector_field(dy, c1, c2, "Rig Info", FIELD_HAMLIB_INFO,
+                                                 state_.hamlib_info ? "HAMLIB" : "OFF");
+                row++;
+                if (state_.hamlib_info) {
+                    draw_rig_fields();
                 }
-                addstr(" >");
-                if (sel) attroff(COLOR_PAIR(4) | A_BOLD);
             }
-            
-            int hint_y = visible_y(row + 1);
-            if (sel && hint_y >= 0) {
+            dy = visible_y(row);
+            if (dy >= 0) draw_field(dy, c1, c2, "Restart", FIELD_RESTART_MODEM,
+                                    state_.attach_target.empty() ? "[enter] restart modem73"
+                                                                 : "[enter] restart attached modem73",
+                                    true);
+            row++;
+            row++;
+
+            //  Preset section
+            dy = visible_y(row);
+            if (dy >= 0) {
                 attron(A_DIM);
-                mvaddstr(hint_y, c1, "Enter=load s=save x=del");
+                mvaddstr(dy, c1, "PRESET");
                 attroff(A_DIM);
+            }
+            row++;
+
+            dy = visible_y(row);
+            if (dy >= 0) {
+                bool sel = (current_field_ == FIELD_PRESET);
+                if (sel) {
+                    attron(A_BOLD);
+                    mvaddch(dy, c1 - 2, '>');
+                    mvaddstr(dy, c1, "Load");
+                    attroff(A_BOLD);
+                } else {
+                    attron(A_DIM);
+                    mvaddstr(dy, c1, "Load");
+                    attroff(A_DIM);
+                }
+
+                move(dy, c2);
+                if (state_.presets.empty()) {
+                    attron(A_DIM);
+                    addstr("(none)");
+                    attroff(A_DIM);
+                } else {
+                    if (sel) attron(COLOR_PAIR(4) | A_BOLD);
+                    addstr("< ");
+                    if (state_.selected_preset >= 0 && state_.selected_preset < (int)state_.presets.size()) {
+                        printw("%-10s", state_.presets[state_.selected_preset].name.c_str());
+                    }
+                    addstr(" >");
+                    if (sel) attroff(COLOR_PAIR(4) | A_BOLD);
+                }
+
+                int hint_y = visible_y(row + 1);
+                if (sel && hint_y >= 0) {
+                    attron(A_DIM);
+                    mvaddstr(hint_y, c1, "Enter=load s=save x=del");
+                    attroff(A_DIM);
+                }
             }
         }
         int total_rows = row + 1;
@@ -3828,13 +4368,47 @@ private:
             int track = visible_rows - thumb;
             int pos = (int)(((long)std::min(scroll, max_scroll) * track + max_scroll / 2) / max_scroll);
             for (int r = 0; r < thumb; r++) {
-                mvaddch(start_y + pos + r, divider, ACS_BLOCK);
+                put_block(list_y + pos + r, divider);
             }
         }
-        
-        // Info / stas
-        y = start_y;
-        
+
+        if (config_tab_ == 0) draw_pane_modem(list_y, c3, cols, start_y + h);
+        else if (config_tab_ == 1) draw_pane_network(list_y, c3, cols, start_y + h);
+        else draw_pane_style(list_y, c3, cols, start_y + h);
+    }
+
+    void draw_sub_tabs(int y, int x0, const char* const* names, int n, int selected,
+                       int* xs, int* ws) {
+        int x = x0 - 1;
+        for (int t = 0; t < n; t++) {
+            xs[t] = x;
+            char label[24];
+            snprintf(label, sizeof(label), "%d %s", t + 1, names[t]);
+            ws[t] = (int)strlen(label) + 2;
+            if (t == selected) {
+                attron(COLOR_PAIR(4) | A_BOLD | A_REVERSE);
+                mvprintw(y, x, " %s ", label);
+                attroff(COLOR_PAIR(4) | A_BOLD | A_REVERSE);
+            } else {
+                attron(A_DIM);
+                mvprintw(y, x, " %s ", label);
+                attroff(A_DIM);
+            }
+            x += ws[t] + 1;
+        }
+    }
+
+    void draw_config_tabs(int y, int x0) {
+        static const char* names[] = {"MODEM", "NETWORK", "STYLE"};
+        draw_sub_tabs(y, x0, names, 3, config_tab_, config_tab_x_, config_tab_w_);
+    }
+
+    void draw_scope_tabs(int y, int x0) {
+        static const char* names[] = {"WATERFALL", "CONSTELLATION"};
+        draw_sub_tabs(y, x0, names, 2, scope_tab_, scope_tab_x_, scope_tab_w_);
+    }
+
+    void draw_pane_modem(int y, int c3, int cols, int bottom) {
         attron(COLOR_PAIR(4) | A_BOLD);
         mvaddstr(y, c3, "MODEM INFO");
         attroff(COLOR_PAIR(4) | A_BOLD);
@@ -3909,7 +4483,7 @@ private:
             attroff(COLOR_PAIR(1) | A_BOLD);
         } else {
             attron(COLOR_PAIR(2) | A_BOLD);
-            addstr(" DISCONNECTED");
+            printw(" %s DISCONNECTED", ico_warn());
             attroff(COLOR_PAIR(2) | A_BOLD);
         }
         y++;
@@ -3972,21 +4546,6 @@ private:
         
 
 
-        attron(COLOR_PAIR(4) | A_BOLD);
-        mvaddstr(y, c3, "NETWORK");
-        attroff(COLOR_PAIR(4) | A_BOLD);
-        y++;
-        
-        mvprintw(y, c3, "Port: %d", state_.port);
-        printw("  ");
-        attron(COLOR_PAIR(4));
-        printw("%dc", state_.client_count.load());
-        attroff(COLOR_PAIR(4));
-        y += 2;
-        
-
-
-
         if (state_.selected_preset >= 0 && state_.selected_preset < (int)state_.presets.size()) {
             const auto& p = state_.presets[state_.selected_preset];
             attron(COLOR_PAIR(4) | A_BOLD);
@@ -3997,21 +4556,11 @@ private:
             attroff(A_DIM);
             y++;
             
-            if (p.modem_type_index == 1) {
-                mvprintw(y, c3, "%s", MFSK_MODE_OPTIONS[p.mfsk_mode_index].c_str());
-            } else if (p.modem_type_index == 2) {
-                mvprintw(y, c3, "%s", ROBUST_MODE_OPTIONS[p.robust_mode_index].c_str());
-            } else {
-                mvprintw(y, c3, "%s %s %s",
-                         MODULATION_OPTIONS[p.modulation_index].c_str(),
-                         CODE_RATE_OPTIONS[p.code_rate_index].c_str(),
-                         p.frame_size == 0 ? "S" : p.frame_size == 2 ? "L"
-                       : p.frame_size == 3 ? "U" : "N");
-            }
+            mvprintw(y, c3, "%s", TNCUIState::preset_mode_label(p).c_str());
             y++;
             
             mvaddstr(y, c3, "PTT ");
-            addstr(PTT_TYPE_OPTIONS[p.ptt_type_index].c_str());
+            addstr(TNCUIState::option_at(PTT_TYPE_OPTIONS, p.ptt_type_index).c_str());
             if (p.ptt_type_index == 2) {
                 printw(" %dHz", p.vox_tone_freq);
             }
@@ -4042,8 +4591,137 @@ private:
                 }
             }
         }
+
+
+        y += 2;
+        draw_pane_note(y, c3, cols, bottom);
     }
-    
+
+    void draw_pane_note(int y, int c3, int cols, int bottom) {
+        std::vector<std::string> lines;
+        std::string note = std::string(gl(G_INFO)) +
+            " This pane shows information. Change settings on the left. "
+            "Move up and down with the arrow keys or the mouse wheel.";
+        wrap_text(note.c_str(), std::max(16, cols - c3 - 3), lines);
+        attron(A_DIM);
+        for (const auto& l : lines) {
+            if (y >= bottom) break;
+            mvaddstr(y, c3, l.c_str());
+            y++;
+        }
+        attroff(A_DIM);
+    }
+
+    void draw_pane_network(int y, int c3, int cols, int bottom) {
+        int c4 = c3 + 14;
+        attron(COLOR_PAIR(4) | A_BOLD);
+        mvaddstr(y, c3, "NETWORK");
+        attroff(COLOR_PAIR(4) | A_BOLD);
+        y++;
+        mvaddstr(y, c3, "KISS");
+        mvprintw(y, c4, "%d", state_.port);
+        attron(COLOR_PAIR(4));
+        {
+            int n = state_.client_count.load();
+            printw("  %d client%s", n, n == 1 ? "" : "s");
+        }
+        attroff(COLOR_PAIR(4));
+        y++;
+        mvaddstr(y, c3, "Control");
+        if (state_.control_port > 0)
+            mvprintw(y, c4, "%d", state_.control_port);
+        else
+            mvaddstr(y, c4, "off");
+        y++;
+        attron(A_DIM);
+        mvaddstr(y, c3, "Bind");
+        mvprintw(y, c4, "%s", state_.bind_address.c_str());
+        y++;
+        mvaddstr(y, c3, "Control bind");
+        mvprintw(y, c4, "%s", state_.control_bind_address.c_str());
+        attroff(A_DIM);
+        y += 2;
+        attron(COLOR_PAIR(4) | A_BOLD);
+        mvaddstr(y, c3, "NETWORK AUDIO");
+        attroff(COLOR_PAIR(4) | A_BOLD);
+        y++;
+        if (!state_.net_audio_configured.load()) {
+            attron(A_DIM);
+            mvaddstr(y, c3, "off");
+            attroff(A_DIM);
+            y++;
+        } else {
+            mvaddstr(y, c3, "Peer");
+            mvprintw(y, c4, "%s", state_.net_audio_peer_copy().c_str());
+            y++;
+            mvaddstr(y, c3, "Link");
+            if (!state_.net_audio_connected.load()) {
+                attron(COLOR_PAIR(2) | A_BOLD);
+                mvprintw(y, c4, "%s DISCONNECTED", ico_warn());
+                attroff(COLOR_PAIR(2) | A_BOLD);
+            } else if (state_.net_audio_stalled.load()) {
+                attron(COLOR_PAIR(3) | A_BOLD);
+                mvprintw(y, c4, "%s connected, no capture data", ico_warn());
+                attroff(COLOR_PAIR(3) | A_BOLD);
+            } else {
+                attron(COLOR_PAIR(1) | A_BOLD);
+                mvaddstr(y, c4, "connected");
+                attroff(COLOR_PAIR(1) | A_BOLD);
+            }
+            y++;
+            attron(A_DIM);
+            mvaddstr(y, c3, "Audio");
+            mvprintw(y, c4, "%.1fs in  %.1fs out",
+                     state_.net_audio_rx.load() / 48000.0, state_.net_audio_tx.load() / 48000.0);
+            attroff(A_DIM);
+            y++;
+        }
+        y++;
+        draw_pane_note(y, c3, cols, bottom);
+    }
+
+    void draw_pane_style(int y, int c3, int cols, int bottom) {
+        attron(COLOR_PAIR(4) | A_BOLD);
+        mvaddstr(y, c3, "PREVIEW");
+        attroff(COLOR_PAIR(4) | A_BOLD);
+        y++;
+        mvprintw(y, c3, "%s info  %s warning  %s ok  %s fail",
+                 gl(G_INFO), gl(G_WARN), gl(G_CHECK), gl(G_CROSS));
+        y++;
+        mvprintw(y, c3, "%s closed  %s open  %s selected  %s item",
+                 gl(G_FOLD_CLOSED), gl(G_FOLD_OPEN), gl(G_SELECTED), gl(G_BULLET));
+        y += 2;
+        attron(COLOR_PAIR(4) | A_BOLD);
+        mvaddstr(y, c3, "COLORS");
+        attroff(COLOR_PAIR(4) | A_BOLD);
+        y++;
+        move(y, c3);
+        attron(COLOR_PAIR(4) | A_BOLD);
+        addstr(" accent ");
+        attroff(COLOR_PAIR(4) | A_BOLD);
+        attron(COLOR_PAIR(6) | A_BOLD);
+        addstr(" special ");
+        attroff(COLOR_PAIR(6) | A_BOLD);
+        attron(COLOR_PAIR(1) | A_BOLD);
+        addstr(" rx ");
+        attroff(COLOR_PAIR(1) | A_BOLD);
+        attron(COLOR_PAIR(2) | A_BOLD);
+        addstr(" tx ");
+        attroff(COLOR_PAIR(2) | A_BOLD);
+        attron(COLOR_PAIR(3) | A_BOLD);
+        addstr(" warn ");
+        attroff(COLOR_PAIR(3) | A_BOLD);
+        y += 2;
+        if (bottom - y >= 12) {
+            attron(COLOR_PAIR(4) | A_BOLD);
+            mvaddstr(y, c3, "ACTIVITY");
+            attroff(COLOR_PAIR(4) | A_BOLD);
+            draw_signal_graph(y + 1, c3, cols - c3 - 4, 6);
+            y += 8;
+        }
+        draw_pane_note(y, c3, cols, bottom);
+    }
+
     void draw_field(int y, int c1, int c2, const char* label, int field,
                     const std::string& value, bool editable) {
         draw_field_ex(y, c1, c2, label, field == current_field_, value, editable);
@@ -4267,7 +4945,8 @@ private:
 
             int pair = 0;
             bool bold = false;
-            if (line.size() > 12 && line.compare(10, 3, "(!)") == 0) { pair = 3; bold = true; }
+            bool warn = line.size() > 12 && line.compare(10, 3, "(!)") == 0;
+            if (warn) { pair = 3; bold = true; }
             else if (line.find("TX:") != std::string::npos) { pair = 2; bold = true; }
             else if (line.find("RX:") != std::string::npos) { pair = 1; bold = true; }
             else if (line.find("CSMA") != std::string::npos) pair = 3;
@@ -4279,11 +4958,11 @@ private:
             if (pair) attron(COLOR_PAIR(pair));
             if (bold) attron(A_BOLD);
             
-            if ((int)line.length() > text_width) {
-                mvprintw(y + i, 2, "%.*s...", text_width - 3, line.c_str());
-            } else {
-                mvprintw(y + i, 2, "%s", line.c_str());
-            }
+            std::string shown = (int)line.length() > text_width
+                ? line.substr(0, text_width - 3) + "..." : line;
+            if (warn && unicode_icons() && shown.size() >= 13)
+                shown = shown.substr(0, 10) + ico_warn() + shown.substr(13);
+            mvaddstr(y + i, 2, shown.c_str());
             
             if (bold) attroff(A_BOLD);
             if (pair) attroff(COLOR_PAIR(pair));
@@ -4299,10 +4978,10 @@ private:
             
             for (int i = 0; i < sb_height; i++) {
                 if (i >= thumb_pos && i < thumb_pos + thumb_size) {
-                    mvaddch(y + i, cols - 2, ACS_BLOCK);
+                    put_block(y + i, cols - 2);
                 } else {
                     attron(A_DIM);
-                    mvaddch(y + i, cols - 2, ACS_VLINE);
+                    put_vline(y + i, cols - 2, 1);
                     attroff(A_DIM);
                 }
             }
@@ -4316,17 +4995,17 @@ private:
         
         // Draw border using ACS characters
         attron(A_DIM);
-        mvaddch(y, x, ACS_ULCORNER);
-        mvaddch(y, x + width + 1, ACS_URCORNER);
-        mvaddch(y + height + 1, x, ACS_LLCORNER);
-        mvaddch(y + height + 1, x + width + 1, ACS_LRCORNER);
+        put_corner(y, x, C_UL);
+        put_corner(y, x + width + 1, C_UR);
+        put_corner(y + height + 1, x, C_LL);
+        put_corner(y + height + 1, x + width + 1, C_LR);
         for (int i = 1; i <= width; ++i) {
-            mvaddch(y, x + i, ACS_HLINE);
-            mvaddch(y + height + 1, x + i, ACS_HLINE);
+            put_hline(y, x + i, 1);
+            put_hline(y + height + 1, x + i, 1);
         }
         for (int i = 1; i <= height; ++i) {
-            mvaddch(y + i, x, ACS_VLINE);
-            mvaddch(y + i, x + width + 1, ACS_VLINE);
+            put_vline(y + i, x, 1);
+            put_vline(y + i, x + width + 1, 1);
         }
         
         // Axis labels
@@ -4563,7 +5242,7 @@ private:
         // frequency axis
 
         attron(A_DIM);
-        mvhline(y, x, ACS_HLINE, w);
+        put_hline(y, x, w);
         for (int f = 0; f <= 3000; f += 500) {
             int cx = x + (int)((int64_t)f * (w - 1) / 3000);
             if (f % 1000) {
@@ -4628,49 +5307,47 @@ private:
 
     void draw_scope(int y, int h, int cols) {
         int c1 = 3;
-        int bottom = y + h;  // first row past the scope area
-
-        attron(COLOR_PAIR(4) | A_BOLD);
-        mvaddstr(y, c1, "[ CONSTELLATION ]");
-        attroff(COLOR_PAIR(4) | A_BOLD);
+        int bottom = y + h;
+        draw_scope_tabs(y, c1);
         y += 2;
-        
-        // Reserve space for signal info (4 lines at bottom) and margins
-        int available_h = h - 10;  // Extra for axis labels
-        int available_w = cols - 28;  // Space for key on right + axis labels
-        
-        // Terminal chars are ~2:1 aspect ratio (taller than wide)
-        // For visually square display: width should be ~2x height
-        int const_height = available_h;
-        if (const_height > 10) const_height = 10;  // leftover rows go to the waterfall
-        int const_width = const_height * 2;  // 2:1 aspect ratio compensation
-        
-        // Clamp to available width
+        if (scope_tab_ == 0) {
+            int wf_h = bottom - (y + 1);
+            if (wf_h < 3) {
+                state_.scope_active = state_.scope_remote_refs.load() > 0;
+                return;
+            }
+            update_waterfall();
+            draw_waterfall(y, c1, wf_h, cols - c1 - 3);
+            return;
+        }
+
+        int info_y = bottom - 3;
+        int avail = info_y - y - 4;
+        int const_height = avail >= 10 ? avail - 1 : avail;
+        if (const_height > 60) const_height = 60;
+        int const_width = const_height * 2;
+        int key_w = 16;
+        int available_w = cols - 4 - 2 - 4 - 4 - key_w - 2;
         if (const_width > available_w) {
             const_width = available_w;
             const_height = const_width / 2;
         }
-        
-        // Minimum sizes
-        if (const_height < 9) const_height = 9;
-        if (const_width < 17) const_width = 17;
-        
-        if (const_height >= 9) {
-            // Offset to leave room for left axis label
-            int x_offset = 6;
-            draw_constellation(y + 1, x_offset, const_height, const_width);  // +1 for top axis label
-            y += const_height + 5;  // Extra for axis labels
+        if (const_height >= 9 && const_width >= 17) {
+            int group_w = const_width + 2 + 4 + 4 + 4 + key_w;
+            int x_offset = std::max(6, (cols - group_w) / 2 + 4);
+            draw_constellation(y + 1, x_offset, const_height, const_width);
         } else {
-            y += 2;
+            attron(A_DIM);
+            mvaddstr(y + 1, c1, "(terminal too small for the constellation)");
+            attroff(A_DIM);
         }
-        
-        // Show signal info below constellation
+
+        y = info_y;
         attron(A_DIM);
         mvaddstr(y, c1, "SIGNAL INFO");
         attroff(A_DIM);
         y++;
-        
-        // Last SNR
+
         mvaddstr(y, c1, "Last SNR:");
         float snr = state_.last_rx_snr.load();
         if (snr > 10.0f) {
@@ -4681,8 +5358,7 @@ private:
         mvprintw(y, c1 + 12, "%6.1f dB", snr);
         attroff(COLOR_PAIR(1) | A_BOLD);
         attroff(COLOR_PAIR(3) | A_BOLD);
-        
-        // Modulation
+
         const char* mod_name = "";
         switch (state_.constellation_mod_bits) {
             case 1: mod_name = "BPSK"; break;
@@ -4697,8 +5373,7 @@ private:
         mvaddstr(y, c1 + 28, "Modulation:");
         mvaddstr(y, c1 + 42, mod_name[0] ? mod_name : "---");
         y++;
-        
-        // Carrier level
+
         mvaddstr(y, c1, "Carrier:");
         float lvl = state_.carrier_level_db.load();
         bool busy = lvl > state_.carrier_threshold_db;
@@ -4707,8 +5382,7 @@ private:
         }
         mvprintw(y, c1 + 12, "%6.1f dB", lvl);
         attroff(COLOR_PAIR(4) | A_BOLD);
-        
-        // RX/TX counts
+
         mvaddstr(y, c1 + 28, "RX:");
         attron(COLOR_PAIR(1));
         printw(" %d", state_.rx_frame_count.load());
@@ -4717,15 +5391,6 @@ private:
         attron(COLOR_PAIR(2));
         printw(" %d", state_.tx_frame_count.load());
         attroff(COLOR_PAIR(2));
-
-        y += 2;
-        int wf_h = bottom - (y + 1);  // history rows under the axis line
-        if (wf_h < 3) {
-            state_.scope_active = false;  // too small; skip audio capture too
-            return;
-        }
-        update_waterfall();
-        draw_waterfall(y, c1, wf_h, cols - c1 - 3);
     }
     
     void draw_utils(int y, int h, int cols) {
@@ -4846,8 +5511,8 @@ private:
             bool sel = (utils_selection_ == slot);
             if (slot == UTILS_TOP_ACTIONS) {
                 if (sel) attron(A_BOLD); else attron(A_DIM);
-                mvprintw(dy, c1, "%s[%c] TESTING", sel ? "> " : "  ",
-                         state_.utils_testing_open ? '-' : '+');
+                mvprintw(dy, c1, "%s%s TESTING", sel ? "> " : "  ",
+                         gl(state_.utils_testing_open ? G_FOLD_OPEN : G_FOLD_CLOSED));
                 if (sel) attroff(A_BOLD); else attroff(A_DIM);
                 if (!state_.utils_testing_open) {
                     attron(A_DIM);
@@ -5467,19 +6132,21 @@ private:
                 state_.add_log("ALC tune: starting...");
                 std::thread([s = &state_] {
                     float r = s->on_alc_tune();
+                    s->alc_tune_running = false;
                     if (!g_running.load())
                         return;
-                    if (r > 0) {
-                        s->tx_drive = r;
-                        s->save_settings();
-                        char b[48];
-                        snprintf(b, sizeof(b), "ALC tune: drive set to %d%%",
-                                 (int)lround(r * 100));
-                        s->add_log(b);
-                    } else {
-                        s->add_log("ALC tune: failed");
-                    }
-                    s->alc_tune_running = false;
+                    s->post_ui_task([r](TNCUIState& st) {
+                        if (r > 0) {
+                            st.tx_drive = r;
+                            st.save_settings();
+                            char b[48];
+                            snprintf(b, sizeof(b), "ALC tune: drive set to %d%%",
+                                     (int)lround(r * 100));
+                            st.add_log(b);
+                        } else {
+                            st.add_log("ALC tune: failed");
+                        }
+                    });
                 }).detach();
             }
         } else if (rig_field_ == RIG_FIELD_TUNER) {
@@ -5828,8 +6495,8 @@ private:
         if (swr_warn > 0.0f) {
             ry += 2;
             attron(COLOR_PAIR(2) | A_BOLD);
-            mvprintw(ry, c3, "(!) HIGH SWR %.1f on last TX - check antenna",
-                     swr_warn);
+            mvprintw(ry, c3, "%s HIGH SWR %.1f on last TX - check antenna",
+                     ico_warn(), swr_warn);
             attroff(COLOR_PAIR(2) | A_BOLD);
             if (state_.rig_tuner_supported.load() == 1 &&
                 state_.rig_tuner_on.load() == 0) {
@@ -5881,14 +6548,14 @@ private:
         attron(COLOR_PAIR(4));
         for (int y = y0; y < y0 + h && y < rows; y++)
             mvhline(y, x0, ' ', w);
-        mvhline(y0, x0, ACS_HLINE, w);
-        mvhline(y0 + h - 1, x0, ACS_HLINE, w);
-        mvvline(y0, x0, ACS_VLINE, h);
-        mvvline(y0, x0 + w - 1, ACS_VLINE, h);
-        mvaddch(y0, x0, ACS_ULCORNER);
-        mvaddch(y0, x0 + w - 1, ACS_URCORNER);
-        mvaddch(y0 + h - 1, x0, ACS_LLCORNER);
-        mvaddch(y0 + h - 1, x0 + w - 1, ACS_LRCORNER);
+        put_hline(y0, x0, w);
+        put_hline(y0 + h - 1, x0, w);
+        put_vline(y0, x0, h);
+        put_vline(y0, x0 + w - 1, h);
+        put_corner(y0, x0, C_UL);
+        put_corner(y0, x0 + w - 1, C_UR);
+        put_corner(y0 + h - 1, x0, C_LL);
+        put_corner(y0 + h - 1, x0 + w - 1, C_LR);
         attron(A_BOLD);
         mvaddstr(y0, x0 + 3, " CSMA ");
         attroff(A_BOLD);
@@ -5927,14 +6594,14 @@ private:
         attron(COLOR_PAIR(4));
         for (int y = y0; y < y0 + h && y < rows; y++)
             mvhline(y, x0, ' ', w);
-        mvhline(y0, x0, ACS_HLINE, w);
-        mvhline(y0 + h - 1, x0, ACS_HLINE, w);
-        mvvline(y0, x0, ACS_VLINE, h);
-        mvvline(y0, x0 + w - 1, ACS_VLINE, h);
-        mvaddch(y0, x0, ACS_ULCORNER);
-        mvaddch(y0, x0 + w - 1, ACS_URCORNER);
-        mvaddch(y0 + h - 1, x0, ACS_LLCORNER);
-        mvaddch(y0 + h - 1, x0 + w - 1, ACS_LRCORNER);
+        put_hline(y0, x0, w);
+        put_hline(y0 + h - 1, x0, w);
+        put_vline(y0, x0, h);
+        put_vline(y0, x0 + w - 1, h);
+        put_corner(y0, x0, C_UL);
+        put_corner(y0, x0 + w - 1, C_UR);
+        put_corner(y0 + h - 1, x0, C_LL);
+        put_corner(y0 + h - 1, x0 + w - 1, C_LR);
         attron(A_BOLD);
         mvaddstr(y0, x0 + 3, " WHICH MODE ");
         attroff(A_BOLD);
@@ -6034,6 +6701,7 @@ private:
             {"KISS port", "TCP port, 8001 by default, where applications send and receive packets."},
             {"Control port", "TCP port, 8073 by default, for the JSON control API: read SNR and channel state, change modes, or pass commands through to rigctl."},
             {"LAN mode", "Listen on every network interface instead of only localhost, so other machines on your LAN can use the modem."},
+            {"Net audio", "Use a sound card on another machine over TCP instead of a local one. Enter host:port; the other end must be listening. PTT still keys from this machine."},
             {"Config token", "A short code that packs up your modem settings. Share it so another station can paste it in and match your setup."},
             {"Presets", "Saved sets of settings. In the config tab, s saves the current one and x deletes it."},
         };
@@ -6104,14 +6772,14 @@ private:
         attron(COLOR_PAIR(4));
         for (int y = y0; y < y0 + h && y < rows; y++)
             mvhline(y, x0, ' ', w);
-        mvhline(y0, x0, ACS_HLINE, w);
-        mvhline(y0 + h - 1, x0, ACS_HLINE, w);
-        mvvline(y0, x0, ACS_VLINE, h);
-        mvvline(y0, x0 + w - 1, ACS_VLINE, h);
-        mvaddch(y0, x0, ACS_ULCORNER);
-        mvaddch(y0, x0 + w - 1, ACS_URCORNER);
-        mvaddch(y0 + h - 1, x0, ACS_LLCORNER);
-        mvaddch(y0 + h - 1, x0 + w - 1, ACS_LRCORNER);
+        put_hline(y0, x0, w);
+        put_hline(y0 + h - 1, x0, w);
+        put_vline(y0, x0, h);
+        put_vline(y0, x0 + w - 1, h);
+        put_corner(y0, x0, C_UL);
+        put_corner(y0, x0 + w - 1, C_UR);
+        put_corner(y0 + h - 1, x0, C_LL);
+        put_corner(y0 + h - 1, x0 + w - 1, C_LR);
         attron(A_BOLD);
         mvaddstr(y0, x0 + 3, " GUIDE ");
         attroff(A_BOLD);
@@ -6147,14 +6815,14 @@ private:
             mvhline(y, start_x, ' ', help_w);
         }
         
-        mvhline(start_y, start_x, ACS_HLINE, help_w);
-        mvhline(start_y + help_h - 1, start_x, ACS_HLINE, help_w);
-        mvvline(start_y, start_x, ACS_VLINE, help_h);
-        mvvline(start_y, start_x + help_w - 1, ACS_VLINE, help_h);
-        mvaddch(start_y, start_x, ACS_ULCORNER);
-        mvaddch(start_y, start_x + help_w - 1, ACS_URCORNER);
-        mvaddch(start_y + help_h - 1, start_x, ACS_LLCORNER);
-        mvaddch(start_y + help_h - 1, start_x + help_w - 1, ACS_LRCORNER);
+        put_hline(start_y, start_x, help_w);
+        put_hline(start_y + help_h - 1, start_x, help_w);
+        put_vline(start_y, start_x, help_h);
+        put_vline(start_y, start_x + help_w - 1, help_h);
+        put_corner(start_y, start_x, C_UL);
+        put_corner(start_y, start_x + help_w - 1, C_UR);
+        put_corner(start_y + help_h - 1, start_x, C_LL);
+        put_corner(start_y + help_h - 1, start_x + help_w - 1, C_LR);
         
         attron(A_BOLD);
         mvaddstr(start_y, start_x + 3, " MODEM73 HELP ");
@@ -6221,8 +6889,18 @@ private:
     static constexpr int LEVEL_SAMPLE_MS = 100;
     int64_t last_level_ms_ = 0;
     int current_field_ = 0;
+    bool locale_utf8_ = false;
+    static constexpr int CONFIG_LIST_TOP = 2;
+    int config_tab_ = 0;
+    int config_tab_x_[3] = {};
+    int config_tab_w_[3] = {};
+    int scope_tab_ = 0;
+    int scope_tab_x_[2] = {};
+    int scope_tab_w_[2] = {};
+    int last_modem_field_ = 0;
     int rx_off_dialog_field_ = -1;
     bool lan_dialog_ = false;
+    bool restart_dialog_ = false;
 
     bool* rx_dialog_flag() {
         switch (rx_off_dialog_field_) {
@@ -6287,7 +6965,7 @@ private:
         }
         draw_box(y, x, h, w);
         attron(COLOR_PAIR(3) | A_BOLD);
-        mvaddstr(y + 1, x + 2, "(!) ENABLE LAN MODE?");
+        mvprintw(y + 1, x + 2, "%s ENABLE LAN MODE?", ico_warn());
         attroff(COLOR_PAIR(3) | A_BOLD);
         mvaddstr(y + 3, x + 2, "KISS and control ports will listen on 0.0.0.0,");
         mvaddstr(y + 4, x + 2, "reachable by any device on your network:");
@@ -6300,6 +6978,27 @@ private:
         attroff(COLOR_PAIR(4) | A_BOLD);
         attron(A_BOLD);
         mvaddstr(y + h - 2, x + 2, "[Y] Enable        [N] Cancel");
+        attroff(A_BOLD);
+    }
+
+    void draw_restart_dialog() {
+        int rows, cols;
+        getmaxyx(stdscr, rows, cols);
+        int w = 56, h = 5;
+        int y = (rows - h) / 2, x = (cols - w) / 2;
+        if (y < 0 || x < 0) return;
+        for (int i = 0; i < h; i++) {
+            move(y + i, x);
+            for (int j = 0; j < w; j++) addch(' ');
+        }
+        draw_box(y, x, h, w);
+        bool attached = !state_.attach_target.empty();
+        attron(COLOR_PAIR(3) | A_BOLD);
+        mvprintw(y + 1, x + 2, "%s %s", ico_warn(),
+                 attached ? "RESTART THE ATTACHED MODEM73?" : "RESTART MODEM73?");
+        attroff(COLOR_PAIR(3) | A_BOLD);
+        attron(A_BOLD);
+        mvaddstr(y + h - 2, x + 2, "[Y] Restart        [N] Cancel");
         attroff(A_BOLD);
     }
 
@@ -6317,7 +7016,7 @@ private:
         draw_box(y, x, h, w);
         std::string name = rx_dialog_name();
         attron(COLOR_PAIR(3) | A_BOLD);
-        mvaddstr(y + 1, x + 2, ("(!) DISABLE " + name + " RX DECODING?").c_str());
+        mvprintw(y + 1, x + 2, "%s DISABLE %s RX DECODING?", ico_warn(), name.c_str());
         attroff(COLOR_PAIR(3) | A_BOLD);
         mvaddstr(y + 3, x + 2, "This saves CPU performance, but disables ALL");
         mvaddstr(y + 4, x + 2, ("reception of " + name + " frames until re-enabled.").c_str());
@@ -6343,7 +7042,7 @@ private:
     }
     static constexpr int WF_FFT = 256;
     static constexpr int WF_BINS = WF_FFT / 2;  
-    static constexpr int WF_MAX_ROWS = 64;
+    static constexpr int WF_MAX_ROWS = 256;
     static constexpr int WF_ROW_MS = 100;
     static constexpr int WF_PAIR_BASE = 20;
     int wf_pairs_ = 0;

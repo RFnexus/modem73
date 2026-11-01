@@ -59,6 +59,7 @@
 #endif
 
 inline std::atomic<bool> g_running{true};
+inline std::atomic<bool> g_restart_requested{false};
 inline std::string g_fatal_error;
 inline TNCConfig g_config;
 inline bool g_verbose = false;
@@ -68,6 +69,7 @@ inline bool g_use_ui = true;
 #else
 inline bool g_use_ui = false;
 #endif
+inline bool g_ascii_ui = false;
 
 #ifdef WITH_UI
 inline TNCUIState* g_ui_state = nullptr;
@@ -187,6 +189,14 @@ static const char* ofdm_frame_size_name(int m) {
     return Common::is_micro_mode(m) ? "micro" : (m & 128) ? "long" : (m & 1) ? "normal" : "short";
 }
 
+static int effective_frame_size(const TNCConfig& c) {
+    if (!c.frame_size_auto) return c.frame_size;
+    if (c.auto_long && c.code_rate.find("x2") == std::string::npos &&
+        ModemConfig::encode_mode(c.modulation.c_str(), c.code_rate.c_str(), 2) >= 0)
+        return 2;
+    return 1;
+}
+
 static std::string ofdm_mode_name(int m) {
     std::string s = ofdm_modulation_name(m);
     s += " ";
@@ -255,7 +265,7 @@ public:
         modem_config_.oper_mode = ModemConfig::encode_mode(
             config.modulation.c_str(),
             config.code_rate.c_str(),
-            config.frame_size
+            effective_frame_size(config)
         );
 
         if (modem_config_.call_sign < 0) {
@@ -286,11 +296,14 @@ public:
                                              config_.sample_rate,
                                              config_.audio_backend);
         audio_->set_log_sink([](const std::string& msg) { ui_log(msg); });
+        bool net_dev = NetAudioLink::is_net_device(config_.audio_input_device) ||
+                       NetAudioLink::is_net_device(config_.audio_output_device);
         if (!audio_->open_capture()) {
-            throw std::runtime_error("Failed to open audio capture");
-        }
-        if (!audio_->open_playback()) {
-            throw std::runtime_error("Failed to open audio output");
+            if (!net_dev) throw std::runtime_error("Failed to open audio capture");
+            ui_log("(!) Network audio peer not reachable, will keep trying");
+        } else if (!audio_->open_playback()) {
+            if (!net_dev) throw std::runtime_error("Failed to open audio output");
+            ui_log("(!) Network audio peer not reachable, will keep trying");
         }
         audio_->set_tx_gain(config_.tx_drive);
         
@@ -594,7 +607,8 @@ private:
                     if (g_verbose) {
                         std::cerr << packet_visualize(frag.data(), frag.size(), true, true) << std::endl;
                     }
-                    tx_queue_.push(TxPacket(std::move(frag)));
+                    int frag_mode = auto_mode_for(frag.size());
+                    tx_queue_.push(TxPacket(std::move(frag), frag_mode));
                 }
 #ifdef WITH_UI
                 if (g_ui_state) {
@@ -611,7 +625,7 @@ private:
                 if (g_verbose) {
                     std::cerr << packet_visualize(frame_data.data(), frame_data.size(), true, config_.fragmentation_enabled) << std::endl;
                 }
-                tx_queue_.push(TxPacket(frame_data));
+                tx_queue_.push(TxPacket(frame_data, auto_mode_for(frame_data.size())));
 #ifdef WITH_UI
                 if (g_ui_state) {
                     g_ui_state->tx_queue_size = tx_queue_.size();
@@ -740,6 +754,7 @@ private:
                             csma_burst = 4;
                         }
                     }
+                    if (config_.ptt_type == PTTType::VOX) csma_burst = 1;
                 }
                 if (csma_enabled) {
                     // Wait for TX lockout to clear
@@ -1782,6 +1797,7 @@ private:
                     }
                     if (tone_dcd_->consume_id_failure()) {
                         pending_unattrib_ms_ = -1;
+                        last_winner_unknown_ms_.store(tnow);
                         if (g_debug)
                             ui_log("TONE: signature ID unreadable, "
                                    "population unchanged");
@@ -1837,6 +1853,7 @@ private:
                             pending_unattrib_ms_ = -1;
                         } else if (tnow - pending_unattrib_ms_ > 1200) {
                             pending_unattrib_ms_ = -1;
+                            last_winner_unknown_ms_.store(tnow);
                             if (tnow - unattrib_seen_ms_ <= 30000) {
                                 last_unattrib_ms_.store(tnow);
                                 if (g_debug)
@@ -2168,6 +2185,7 @@ private:
     int64_t pending_unattrib_ms_ = -1;
     int64_t unattrib_seen_ms_ = -1000000;
     std::atomic<int64_t> last_unattrib_ms_{-1000000};
+    std::atomic<int64_t> last_winner_unknown_ms_{-1000000};
 
     int n_contenders(bool keep_on_stray = false) {
         int64_t now = steady_now_ms();
@@ -2205,6 +2223,11 @@ private:
         }
         if (heard_ids_.empty())
             return -1;
+        int64_t unknown = last_winner_unknown_ms_.load();
+        if (unknown > last_id_ms_ && now - unknown < 60000) {
+            *n_out = 0;
+            return -1;
+        }
         uint16_t self = station_id_.load();
         std::vector<uint16_t> ids;
         ids.push_back(self);
@@ -2446,25 +2469,30 @@ public:
         // Update OFDM modulation settings
         bool mode_changed = (config_.modulation != new_config.modulation ||
                             config_.code_rate != new_config.code_rate ||
-                            config_.frame_size != new_config.frame_size);
+                            config_.frame_size != new_config.frame_size ||
+                            config_.frame_size_auto != new_config.frame_size_auto ||
+                            config_.auto_long != new_config.auto_long);
 
         if (mode_changed) {
             int new_mode = ModemConfig::encode_mode(
                 new_config.modulation.c_str(),
                 new_config.code_rate.c_str(),
-                new_config.frame_size
+                effective_frame_size(new_config)
             );
 
             if (new_mode >= 0) {
                 config_.modulation = new_config.modulation;
                 config_.code_rate = new_config.code_rate;
                 config_.frame_size = new_config.frame_size;
+                config_.frame_size_auto = new_config.frame_size_auto;
+                config_.auto_long = new_config.auto_long;
                 modem_config_.oper_mode = new_mode;
                 if (config_.modem_type == 0) {
                     payload_size_ = encoder_->get_payload_size(modem_config_.oper_mode);
                 }
                 ui_log("OFDM mode changed to " + config_.modulation + " " + config_.code_rate +
-                       " " + ModemConfig::frame_size_name(config_.frame_size) +
+                       " " + ModemConfig::frame_size_name(effective_frame_size(config_)) +
+                       (config_.frame_size_auto ? " (auto)" : "") +
                        " (" + std::to_string(encoder_->get_payload_size(modem_config_.oper_mode)) + " bytes)");
             } else {
                 rejected.push_back("modulation/code_rate/frame_size");
@@ -2610,6 +2638,11 @@ public:
         if (audio_) return audio_->is_healthy();
         return false;
     }
+
+    MiniAudio::NetStatus net_audio_status() const {
+        if (audio_) return audio_->net_status();
+        return {};
+    }
     
     bool reconnect_audio() {
         if (!audio_) return false;
@@ -2638,16 +2671,30 @@ public:
             ui_log("TX: Fragmenting " + std::to_string(data.size()) + " bytes into " +
                    std::to_string(fragments.size()) + " fragments");
             for (auto& frag : fragments) {
-                tx_queue_.push(TxPacket(std::move(frag), oper_mode));
+                int frag_mode = oper_mode >= 0 ? oper_mode : auto_mode_for(frag.size());
+                tx_queue_.push(TxPacket(std::move(frag), frag_mode));
             }
         } else {
-            tx_queue_.push(TxPacket(data, oper_mode));
+            tx_queue_.push(TxPacket(data, oper_mode >= 0 ? oper_mode : auto_mode_for(data.size())));
         }
 #ifdef WITH_UI
         if (g_ui_state) {
             g_ui_state->tx_queue_size = tx_queue_.size();
         }
 #endif
+    }
+
+    int auto_mode_for(size_t len) const {
+        if (!config_.frame_size_auto || config_.modem_type != 0) return -1;
+        static const int tiers[] = {3, 0, 1, 2};
+        for (int fs : tiers) {
+            if (fs == 2 && effective_frame_size(config_) != 2) continue;
+            int m = compute_oper_mode(fs);
+            if (m < 0) continue;
+            int cap = Encoder48k::get_payload_size(m);
+            if (cap >= 2 && len <= (size_t)(cap - 2)) return m;
+        }
+        return -1;
     }
 
     // Compute oper_mode for a given frame_size setting using current modulation/code_rate

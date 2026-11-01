@@ -6,6 +6,7 @@
 #define MA_NO_ENGINE
 #define MA_NO_NODE_GRAPH
 #include "deps/miniaudio.h"
+#include "net_audio.hh"
 
 #include <vector>
 #include <string>
@@ -73,18 +74,33 @@ public:
     }
 
     void set_capture_device(const std::string& device) {
-        std::lock_guard<std::mutex> guard(lifecycle_mutex_);
+        std::lock_guard<std::mutex> guard(names_mutex_);
         capture_device_id_ = device;
     }
 
     void set_playback_device(const std::string& device) {
-        std::lock_guard<std::mutex> guard(lifecycle_mutex_);
+        std::lock_guard<std::mutex> guard(names_mutex_);
         playback_device_id_ = device;
     }
 
     void set_backend(const std::string& backend) {
-        std::lock_guard<std::mutex> guard(lifecycle_mutex_);
+        std::lock_guard<std::mutex> guard(names_mutex_);
         backend_pref_ = backend;
+    }
+
+    std::string capture_name_copy() {
+        std::lock_guard<std::mutex> guard(names_mutex_);
+        return capture_device_id_;
+    }
+
+    std::string playback_name_copy() {
+        std::lock_guard<std::mutex> guard(names_mutex_);
+        return playback_device_id_;
+    }
+
+    std::string pref_copy() {
+        std::lock_guard<std::mutex> guard(names_mutex_);
+        return backend_pref_;
     }
 
     bool open_playback(bool strict = false) {
@@ -196,6 +212,8 @@ public:
         if (!capture_open_.load(std::memory_order_acquire) ||
             !playback_open_.load(std::memory_order_acquire))
             return false;
+        if (net_in_use_.load(std::memory_order_acquire) && !net_.alive())
+            return false;
         if (capture_lost_.load(std::memory_order_acquire) ||
             playback_lost_.load(std::memory_order_acquire) ||
             rerouted_.load(std::memory_order_acquire))
@@ -211,9 +229,33 @@ public:
         return true;
     }
 
+    struct NetStatus {
+        bool configured = false;
+        bool connected = false;
+        bool stalled = false;
+        std::string peer;
+        uint64_t rx_frames = 0;
+        uint64_t tx_frames = 0;
+    };
+
+    NetStatus net_status() {
+        NetStatus s;
+        std::string cap = capture_name_copy();
+        std::string play = playback_name_copy();
+        if (NetAudioLink::is_net_device(cap)) s.peer = cap.substr(strlen(NetAudioLink::PREFIX));
+        else if (NetAudioLink::is_net_device(play)) s.peer = play.substr(strlen(NetAudioLink::PREFIX));
+        s.configured = !s.peer.empty();
+        s.connected = net_in_use_.load(std::memory_order_acquire) && net_.alive();
+        s.stalled = s.connected && net_.stalled();
+        s.rx_frames = net_.rx_frames();
+        s.tx_frames = net_.tx_frames();
+        return s;
+    }
+
     std::string health_detail() const {
         if (!capture_open_.load()) return "capture closed";
         if (!playback_open_.load()) return "playback closed";
+        if (net_in_use_.load() && !net_.alive()) return "network audio disconnected";
         if (capture_lost_.load()) return "capture device stopped";
         if (playback_lost_.load()) return "playback device stopped";
         if (rerouted_.load()) return "stream moved to another device";
@@ -418,7 +460,7 @@ private:
         if (context_) return true;
 
         ma_context* ctx = new ma_context;
-        if (init_context(ctx, backend_pref_, false) != MA_SUCCESS) {
+        if (init_context(ctx, pref_copy(), false) != MA_SUCCESS) {
             delete ctx;
             log_msg("(!) Failed to initialize audio context");
             return false;
@@ -495,7 +537,7 @@ private:
         if (context_->backend != ma_backend_alsa) return false;
 
         ma_context verbose;
-        if (init_context(&verbose, backend_pref_, true) == MA_SUCCESS) {
+        if (init_context(&verbose, pref_copy(), true) == MA_SUCCESS) {
             bool found = false;
             if (ma_context_get_devices(&verbose, &playback_devices, &playback_count,
                                        &capture_devices, &capture_count) == MA_SUCCESS) {
@@ -538,7 +580,9 @@ private:
 
     bool open_playback_locked(bool strict) {
         if (playback_open_.load(std::memory_order_acquire)) return true;
+        if (NetAudioLink::is_net_device(playback_name_copy())) return open_net_locked(true);
         if (!ensure_context()) return false;
+        std::string want = playback_name_copy();
 
         ma_device_config config = ma_device_config_init(ma_device_type_playback);
         config.playback.format = ma_format_f32;
@@ -552,15 +596,15 @@ private:
 
         bool verbatim = false;
         bool resolved = false;
-        if (playback_device_id_ != "default" && !playback_device_id_.empty()) {
-            resolved = find_device_id(false, playback_device_id_, &stored_playback_id_, &verbatim);
+        if (want != "default" && !want.empty()) {
+            resolved = find_device_id(false, want, &stored_playback_id_, &verbatim);
             if (resolved) {
                 config.playback.pDeviceID = &stored_playback_id_;
             } else if (strict) {
-                log_msg("(!) Playback device '" + playback_device_id_ + "' not found");
+                log_msg("(!) Playback device '" + want + "' not found");
                 return false;
             } else {
-                log_msg("(!) Playback device '" + playback_device_id_ +
+                log_msg("(!) Playback device '" + want +
                         "' not found, using system default");
             }
         }
@@ -569,11 +613,11 @@ private:
         if (ma_device_init(context_, &config, dev) != MA_SUCCESS) {
             if (!(resolved && verbatim && !strict)) {
                 delete dev;
-                log_msg("(!) Failed to open playback device '" + playback_device_id_ + "'" +
+                log_msg("(!) Failed to open playback device '" + want + "'" +
                         open_hint(config.playback.pDeviceID));
                 return false;
             }
-            log_msg("(!) Playback device '" + playback_device_id_ +
+            log_msg("(!) Playback device '" + want +
                     "' could not be opened" + open_hint(config.playback.pDeviceID) +
                     ", using system default");
             config.playback.pDeviceID = nullptr;
@@ -601,7 +645,9 @@ private:
 
     bool open_capture_locked(bool strict) {
         if (capture_open_.load(std::memory_order_acquire)) return true;
+        if (NetAudioLink::is_net_device(capture_name_copy())) return open_net_locked(false);
         if (!ensure_context()) return false;
+        std::string want = capture_name_copy();
 
         ma_device_config config = ma_device_config_init(ma_device_type_capture);
         config.capture.format = ma_format_f32;
@@ -619,15 +665,15 @@ private:
 
         bool verbatim = false;
         bool resolved = false;
-        if (capture_device_id_ != "default" && !capture_device_id_.empty()) {
-            resolved = find_device_id(true, capture_device_id_, &stored_capture_id_, &verbatim);
+        if (want != "default" && !want.empty()) {
+            resolved = find_device_id(true, want, &stored_capture_id_, &verbatim);
             if (resolved) {
                 config.capture.pDeviceID = &stored_capture_id_;
             } else if (strict) {
-                log_msg("(!) Capture device '" + capture_device_id_ + "' not found");
+                log_msg("(!) Capture device '" + want + "' not found");
                 return false;
             } else {
-                log_msg("(!) Capture device '" + capture_device_id_ +
+                log_msg("(!) Capture device '" + want +
                         "' not found, using system default");
             }
         }
@@ -636,11 +682,11 @@ private:
         if (ma_device_init(context_, &config, dev) != MA_SUCCESS) {
             if (!(resolved && verbatim && !strict)) {
                 delete dev;
-                log_msg("(!) Failed to open capture device '" + capture_device_id_ + "'" +
+                log_msg("(!) Failed to open capture device '" + want + "'" +
                         open_hint(config.capture.pDeviceID));
                 return false;
             }
-            log_msg("(!) Capture device '" + capture_device_id_ +
+            log_msg("(!) Capture device '" + want +
                     "' could not be opened" + open_hint(config.capture.pDeviceID) +
                     ", using system default");
             config.capture.pDeviceID = nullptr;
@@ -669,9 +715,49 @@ private:
         return true;
     }
 
+    bool open_net_locked(bool playback) {
+        std::string cap = capture_name_copy();
+        std::string pb = playback_name_copy();
+        if (cap != pb) {
+            log_msg("(!) Network audio needs the same tcp: address for input and output");
+            return false;
+        }
+        if (!net_.alive()) {
+            std::string err = net_.open(cap, sample_rate_,
+                [this](const float* s, int n) { push_capture(s, n); },
+                [this](float* o, int n) { return pull_playback(o, n); },
+                [this](const std::string& m) { log_msg(m); });
+            if (!err.empty()) {
+                log_msg("(!) Network audio: " + err);
+                return false;
+            }
+            net_in_use_.store(true, std::memory_order_release);
+            log_msg("Network audio: connected to " + net_.describe() +
+                    " (s16le mono " + std::to_string(sample_rate_) + " Hz)");
+        }
+        int64_t now = steady_ms();
+        if (playback) {
+            playback_lost_.store(false);
+            last_playback_ms_.store(now, std::memory_order_relaxed);
+            playback_open_.store(true, std::memory_order_release);
+        } else {
+            capture_lost_.store(false);
+            last_block_ms_.store(now, std::memory_order_relaxed);
+            capture_open_.store(true, std::memory_order_release);
+        }
+        return true;
+    }
+
+    void close_net_locked() {
+        if (!net_in_use_.exchange(false, std::memory_order_acq_rel)) return;
+        net_.close();
+        log_msg("Network audio: disconnected from " + net_.describe());
+    }
+
     void close_playback_locked() {
         bool was_open = playback_open_.exchange(false, std::memory_order_acq_rel);
         ma_device* dev = playback_device_.exchange(nullptr, std::memory_order_acq_rel);
+        close_net_locked();
         std::unique_lock<std::shared_mutex> lock(playback_rw_);
         if (dev) {
             if (!uninit_device_bounded(dev)) {
@@ -688,6 +774,7 @@ private:
     void close_capture_locked() {
         bool was_open = capture_open_.exchange(false, std::memory_order_acq_rel);
         ma_device* dev = capture_device_.exchange(nullptr, std::memory_order_acq_rel);
+        close_net_locked();
         std::unique_lock<std::shared_mutex> lock(capture_rw_);
         if (dev) {
             if (!uninit_device_bounded(dev)) {
@@ -724,6 +811,60 @@ private:
         }
     }
 
+    int pull_playback(float* out, int frame_count) {
+        size_t read_pos = playback_read_pos_.load();
+        size_t write_pos = playback_write_pos_.load();
+        size_t available = (write_pos - read_pos + RING_BUFFER_SIZE) % RING_BUFFER_SIZE;
+
+        int to_read = std::min((int)available, frame_count);
+
+        for (int i = 0; i < to_read; i++) {
+            out[i] = playback_buffer_[(read_pos + i) % RING_BUFFER_SIZE];
+        }
+        for (int i = to_read; i < frame_count; i++) {
+            out[i] = 0.0f;
+        }
+
+        if (frame_count > 0) {
+            playback_read_pos_ = (read_pos + to_read) % RING_BUFFER_SIZE;
+            last_playback_ms_.store(steady_ms(), std::memory_order_relaxed);
+            return to_read;
+        }
+        return (int)available;
+    }
+
+    void push_capture(const float* in, int frame_count) {
+        size_t read_pos = capture_read_pos_.load();
+        size_t write_pos = capture_write_pos_.load();
+        size_t used = (write_pos - read_pos + CAPTURE_RING_SIZE) % CAPTURE_RING_SIZE;
+        size_t available = CAPTURE_RING_SIZE - 1 - used;
+
+        int to_write = std::min((int)available, frame_count);
+
+        for (int i = 0; i < to_write; i++) {
+            capture_buffer_[(write_pos + i) % CAPTURE_RING_SIZE] = in[i];
+        }
+
+        capture_write_pos_ = (write_pos + to_write) % CAPTURE_RING_SIZE;
+
+        float sum_sq = 0.0f;
+        for (int i = 0; i < frame_count; i++) {
+            sum_sq += in[i] * in[i];
+        }
+        capture_energy_.store(capture_energy_.load() + sum_sq);
+        capture_samples_.store(capture_samples_.load() + frame_count);
+
+        if (frame_count > 0) {
+            uint64_t seq = block_seq_.load(std::memory_order_relaxed);
+            block_msq_[seq % LEVEL_RING].store(sum_sq / frame_count,
+                                               std::memory_order_relaxed);
+            block_frames_[seq % LEVEL_RING].store(frame_count,
+                                                  std::memory_order_relaxed);
+            block_seq_.store(seq + 1, std::memory_order_release);
+            last_block_ms_.store(steady_ms(), std::memory_order_relaxed);
+        }
+    }
+
     static void playback_callback(ma_device* device, void* output, const void* input, ma_uint32 frame_count) {
         (void)input;
         MiniAudio* self = static_cast<MiniAudio*>(device->pUserData);
@@ -733,22 +874,7 @@ private:
             for (ma_uint32 i = 0; i < frame_count; i++) out[i] = 0.0f;
             return;
         }
-
-        size_t read_pos = self->playback_read_pos_.load();
-        size_t write_pos = self->playback_write_pos_.load();
-        size_t available = (write_pos - read_pos + RING_BUFFER_SIZE) % RING_BUFFER_SIZE;
-
-        ma_uint32 to_read = std::min((ma_uint32)available, frame_count);
-
-        for (ma_uint32 i = 0; i < to_read; i++) {
-            out[i] = self->playback_buffer_[(read_pos + i) % RING_BUFFER_SIZE];
-        }
-        for (ma_uint32 i = to_read; i < frame_count; i++) {
-            out[i] = 0.0f;
-        }
-
-        self->playback_read_pos_ = (read_pos + to_read) % RING_BUFFER_SIZE;
-        self->last_playback_ms_.store(steady_ms(), std::memory_order_relaxed);
+        self->pull_playback(out, (int)frame_count);
     }
 
     static void capture_callback(ma_device* device, void* output, const void* input, ma_uint32 frame_count) {
@@ -757,36 +883,7 @@ private:
         const float* in = static_cast<const float*>(input);
 
         if (device != self->capture_device_.load(std::memory_order_acquire)) return;
-
-        size_t read_pos = self->capture_read_pos_.load();
-        size_t write_pos = self->capture_write_pos_.load();
-        size_t used = (write_pos - read_pos + CAPTURE_RING_SIZE) % CAPTURE_RING_SIZE;
-        size_t available = CAPTURE_RING_SIZE - 1 - used;
-
-        ma_uint32 to_write = std::min((ma_uint32)available, frame_count);
-
-        for (ma_uint32 i = 0; i < to_write; i++) {
-            self->capture_buffer_[(write_pos + i) % CAPTURE_RING_SIZE] = in[i];
-        }
-
-        self->capture_write_pos_ = (write_pos + to_write) % CAPTURE_RING_SIZE;
-
-        float sum_sq = 0.0f;
-        for (ma_uint32 i = 0; i < frame_count; i++) {
-            sum_sq += in[i] * in[i];
-        }
-        self->capture_energy_.store(self->capture_energy_.load() + sum_sq);
-        self->capture_samples_.store(self->capture_samples_.load() + frame_count);
-
-        if (frame_count > 0) {
-            uint64_t seq = self->block_seq_.load(std::memory_order_relaxed);
-            self->block_msq_[seq % LEVEL_RING].store(sum_sq / frame_count,
-                                                     std::memory_order_relaxed);
-            self->block_frames_[seq % LEVEL_RING].store(frame_count,
-                                                        std::memory_order_relaxed);
-            self->block_seq_.store(seq + 1, std::memory_order_release);
-            self->last_block_ms_.store(steady_ms(), std::memory_order_relaxed);
-        }
+        self->push_capture(in, (int)frame_count);
     }
 
     static int64_t steady_ms() {
@@ -817,6 +914,9 @@ private:
     std::atomic<bool> rerouted_{false};
 
     std::mutex lifecycle_mutex_;
+    std::mutex names_mutex_;
+    NetAudioLink net_;
+    std::atomic<bool> net_in_use_{false};
     std::shared_mutex capture_rw_;
     std::shared_mutex playback_rw_;
 
