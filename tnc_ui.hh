@@ -1574,6 +1574,7 @@ private:
         }
         if (field == FIELD_PROBE_REPLY) return row;
         row++;
+        row++;
         if (field == FIELD_RESTART_MODEM) return row;
         row++;
         row++;
@@ -4307,8 +4308,13 @@ private:
             row++;
             if (hamlib_info_field()) {
                 dy = visible_y(row);
-                if (dy >= 0) draw_selector_field(dy, c1, c2, "Rig Info (restart)", FIELD_HAMLIB_INFO,
-                                                 state_.hamlib_info ? "HAMLIB" : "OFF");
+                if (dy >= 0) {
+                    draw_selector_field(dy, c1, c2, "Rig Info", FIELD_HAMLIB_INFO,
+                                        state_.hamlib_info ? "HAMLIB" : "OFF");
+                    attron(A_DIM);
+                    mvaddstr(dy, c2 + 11, "(restart)");
+                    attroff(A_DIM);
+                }
                 row++;
                 if (state_.hamlib_info) {
                     draw_rig_fields();
@@ -4317,6 +4323,7 @@ private:
             dy = visible_y(row);
             if (dy >= 0) draw_selector_field(dy, c1, c2, "Probe Reply", FIELD_PROBE_REPLY,
                                              state_.probe_reply ? "ON" : "OFF");
+            row++;
             row++;
             dy = visible_y(row);
             if (dy >= 0) draw_field(dy, c1, c2, "Restart", FIELD_RESTART_MODEM,
@@ -5565,13 +5572,15 @@ private:
             }
             if (i == 2) {
                 std::string lp = state_.last_probe_copy();
-                std::string hint = lp.empty() ? "  ask them what mode to use" : "  last: " + lp;
-                int cy, cx;
-                getyx(stdscr, cy, cx);
-                (void)cy;
-                attron(A_DIM);
-                addnstr(hint.c_str(), std::max(0, c2 - 1 - cx));
-                attroff(A_DIM);
+                if (!lp.empty()) {
+                    std::string hint = "  last: " + lp;
+                    int cy, cx;
+                    getyx(stdscr, cy, cx);
+                    (void)cy;
+                    attron(A_DIM);
+                    addnstr(hint.c_str(), std::max(0, c2 - 1 - cx));
+                    attroff(A_DIM);
+                }
             }
             if (i == 9) {
                 if (auto_alt_enabled_) {
