@@ -192,6 +192,7 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
         }
         else if (!strcmp(key, "frame_size_auto") && take("frame_size_auto")) config.frame_size_auto = atoi(value) != 0;
         else if (!strcmp(key, "auto_long") && take("auto_long")) config.auto_long = atoi(value) != 0;
+        else if (!strcmp(key, "probe_reply") && take(key)) config.probe_reply = atoi(value) != 0;
         else if (!strcmp(key, "center_freq") && take(key)) config.center_freq = 1500;
         else if (!strcmp(key, "rx_filter_enabled") && take(key)) config.rx_filter_enabled = atoi(value) != 0;
         else if (!strcmp(key, "postamble") && take(key)) config.postamble = atoi(value) != 0;
@@ -374,6 +375,8 @@ void print_help(const char* prog) {
               << "      --frame-auto-long   As --frame-auto, also using long frames\n"
               << "      --postamble         Send a postamble after each OFDM frame\n"
               << "      --no-postamble      Do not send a postamble (default)\n"
+              << "      --probe-reply       Answer probes with the SNR heard (keys the radio)\n"
+              << "      --no-probe-reply    Do not answer probes (default)\n"
               << "      --mfsk-mode MODE    MFSK-8, MFSK-16, MFSK-32 or MFSK-32R\n"
               << "                          (implies --modem mfsk)\n"
               << "      --robust-enhanced-retry     Extra ROBUST RX retries (EXPERIMENTAL, more CPU)\n"
@@ -629,6 +632,12 @@ int main(int argc, char** argv) {
         } else if (arg == "--no-postamble") {
             config.postamble = false;
             cli_set.insert("postamble");
+        } else if (arg == "--probe-reply") {
+            config.probe_reply = true;
+            cli_set.insert("probe_reply");
+        } else if (arg == "--no-probe-reply") {
+            config.probe_reply = false;
+            cli_set.insert("probe_reply");
         } else if (arg == "--short") {
             config.frame_size = 0;
             config.frame_size_auto = false;
@@ -987,6 +996,8 @@ int main(int argc, char** argv) {
                     config.frame_size_auto = ui_state.frame_size_auto;
                 if (!cli_set.count("auto_long"))
                     config.auto_long = ui_state.auto_long;
+                if (!cli_set.count("probe_reply"))
+                    config.probe_reply = ui_state.probe_reply;
                 if (!cli_set.count("postamble"))
                     config.postamble = ui_state.postamble;
                 if (!cli_set.count("csma_enabled"))
@@ -1137,6 +1148,7 @@ int main(int argc, char** argv) {
                 ui_state.frame_size = config.frame_size;
                 ui_state.frame_size_auto = config.frame_size_auto;
                 ui_state.auto_long = config.auto_long;
+                ui_state.probe_reply = config.probe_reply;
                 ui_state.postamble = config.postamble;
                 ui_state.fragmentation_enabled = config.fragmentation_enabled;
                 ui_state.tx_blanking_enabled = config.tx_blanking_enabled;
@@ -1212,6 +1224,7 @@ int main(int argc, char** argv) {
     ui_state.frame_size = config.frame_size;
     ui_state.frame_size_auto = config.frame_size_auto;
     ui_state.auto_long = config.auto_long;
+    ui_state.probe_reply = config.probe_reply;
     ui_state.postamble = config.postamble;
     ui_state.csma_enabled = config.csma_enabled;
     ui_state.csma_sync_only = config.csma_sync_only;
@@ -1419,6 +1432,7 @@ int main(int argc, char** argv) {
             new_config.frame_size = state.frame_size;
             new_config.frame_size_auto = state.frame_size_auto;
             new_config.auto_long = state.auto_long;
+            new_config.probe_reply = state.probe_reply;
             new_config.postamble = state.postamble;
             new_config.csma_enabled = state.csma_enabled;
             new_config.csma_sync_only = state.csma_sync_only;
@@ -1507,6 +1521,7 @@ int main(int argc, char** argv) {
                     auto ns = tnc.net_audio_status();
                     cJSON_AddBoolToObject(j, "net_audio", ns.configured);
                     cJSON_AddStringToObject(j, "net_audio_peer", ns.peer.c_str());
+                    cJSON_AddStringToObject(j, "last_probe", tnc.last_probe().c_str());
                     cJSON_AddBoolToObject(j, "net_audio_connected", ns.connected);
                     cJSON_AddBoolToObject(j, "net_audio_stalled", ns.stalled);
                     cJSON_AddNumberToObject(j, "net_audio_rx_frames", (double)ns.rx_frames);
@@ -1544,6 +1559,7 @@ int main(int argc, char** argv) {
                 cJSON_AddNumberToObject(j, "frame_size", cfg.frame_size);
                 cJSON_AddBoolToObject(j, "frame_size_auto", cfg.frame_size_auto);
                 cJSON_AddBoolToObject(j, "auto_long", cfg.auto_long);
+                cJSON_AddBoolToObject(j, "probe_reply", cfg.probe_reply);
                 cJSON_AddBoolToObject(j, "postamble", cfg.postamble);
                 cJSON_AddNumberToObject(j, "center_freq", cfg.center_freq);
                 cJSON_AddNumberToObject(j, "payload_size", tnc.get_payload_size());
@@ -1615,6 +1631,8 @@ int main(int argc, char** argv) {
                     new_config.frame_size_auto = false;
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "auto_long")) && cJSON_IsBool(item))
                     new_config.auto_long = cJSON_IsTrue(item);
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "probe_reply")) && cJSON_IsBool(item))
+                    new_config.probe_reply = cJSON_IsTrue(item);
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "center_freq")) && cJSON_IsNumber(item))
                     new_config.center_freq = 1500;
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "postamble")) && cJSON_IsBool(item))
@@ -1685,6 +1703,7 @@ int main(int argc, char** argv) {
                         s.frame_size = new_config.frame_size;
                         s.frame_size_auto = new_config.frame_size_auto;
                         s.auto_long = new_config.auto_long;
+                        s.probe_reply = new_config.probe_reply;
                         s.postamble = new_config.postamble;
                         s.csma_enabled = new_config.csma_enabled;
                         s.csma_sync_only = new_config.csma_sync_only;
@@ -1725,6 +1744,10 @@ int main(int argc, char** argv) {
 
             ctrl_iface.send_beacon = [&tnc]() -> bool {
                 return tnc.queue_beacon();
+            };
+
+            ctrl_iface.send_probe = [&tnc]() -> bool {
+                return tnc.queue_probe();
             };
 
             ctrl_iface.reconnect_audio = [&tnc]() -> bool {
@@ -1782,6 +1805,7 @@ int main(int argc, char** argv) {
                     auto ns = tnc.net_audio_status();
                     cJSON_AddBoolToObject(j, "net_audio", ns.configured);
                     cJSON_AddStringToObject(j, "net_audio_peer", ns.peer.c_str());
+                    cJSON_AddStringToObject(j, "last_probe", tnc.last_probe().c_str());
                     cJSON_AddBoolToObject(j, "net_audio_connected", ns.connected);
                     cJSON_AddBoolToObject(j, "net_audio_stalled", ns.stalled);
                     cJSON_AddNumberToObject(j, "net_audio_rx_frames", (double)ns.rx_frames);
@@ -2077,6 +2101,9 @@ int main(int argc, char** argv) {
             // Set up send data callback for UTILS tab
             ui_state.on_send_data = [&tnc](const std::vector<uint8_t>& data) {
                 tnc.queue_data(data);
+            };
+            ui_state.on_send_probe = [&tnc]() -> bool {
+                return tnc.queue_probe();
             };
             
             // Set up audio reconnect callback

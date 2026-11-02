@@ -101,6 +101,7 @@ struct TNCConfig {
     int frame_size = 1;         // 0=short, 1=normal, 2=long, 3=micro
     bool frame_size_auto = false;
     bool auto_long = false;
+    bool probe_reply = false;
     bool postamble = false;
     bool rx_filter_enabled = true;  // RX bandpass in front of the OFDM decoder
     

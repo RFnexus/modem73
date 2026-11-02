@@ -36,6 +36,7 @@
 
 // Local includes
 #include "kiss_tnc.hh"
+#include "probe.hh"
 #include "csma.hh"
 #include "tone_dcd.hh"
 #include "miniaudio_audio.hh"
@@ -1149,12 +1150,7 @@ private:
         // Add length prefix framing
         bool data_oversize = false;
         {
-            size_t cap = payload_size_;
-            if (config_.modem_type == 0 && oper_mode_override >= 0)
-                cap = encoder_->get_payload_size(oper_mode_override);
-            else if (config_.modem_type == 2 && oper_mode_override >= 0 &&
-                     oper_mode_override < ROBUST_MODE_COUNT)
-                cap = robust_encoder_->get_payload_size((RobustMode)oper_mode_override);
+            size_t cap = mode_capacity(config_.modem_type, oper_mode_override);
             if (cap < 2 || data.size() > cap - 2) {
                 ui_log("(!) TX: " + std::to_string(data.size()) + " byte frame exceeds " +
                        std::to_string(cap >= 2 ? cap - 2 : 0) + " byte capacity of current mode, dropped");
@@ -1434,12 +1430,41 @@ private:
             info.steady_ms = steady_now_ms();
             info.time = std::chrono::duration<double>(
                 std::chrono::system_clock::now().time_since_epoch()).count();
-            if (info.callsign_source != "phy" && payload.size() > 4 && !memcmp(payload.data(), "M73:", 4)) {
+            size_t p = 0;
+            bool m73 = payload.size() > 4 && !memcmp(payload.data(), "M73:", 4);
+            if (m73) {
                 auto sep = std::find(payload.begin() + 4, payload.end(), (uint8_t)':');
-                if (sep != payload.end() && sep > payload.begin() + 4 && sep - payload.begin() <= 16 &&
-                    std::all_of(payload.begin() + 4, sep, [](uint8_t c) { return c > 32 && c < 127; })) {
-                    info.callsign.assign(payload.begin() + 4, sep);
-                    info.callsign_source = "payload";
+                p = sep - payload.begin();
+                m73 = sep != payload.end() && p > 4 && p <= 16;
+            }
+            if (m73 && info.callsign_source != "phy" &&
+                std::all_of(payload.begin() + 4, payload.begin() + p, [](uint8_t c) { return c > 32 && c < 127; })) {
+                info.callsign.assign(payload.begin() + 4, payload.begin() + p);
+                info.callsign_source = "payload";
+            }
+            std::string probe_theirs;
+            if (m73) {
+                const char* family;
+                {
+                    std::lock_guard<std::mutex> lock(config_mutex_);
+                    family = config_.modem_type == 0 ? "ofdm" : config_.modem_type == 2 ? "robust" : "mfsk";
+                }
+                if (payload.size() >= p + 6 && !memcmp(payload.data() + p, ":PROBE", 6) &&
+                    (payload.size() == p + 6 || payload[p + 6] == ':')) {
+                    info.probe = true;
+                    info.probe_mode = probe_suggest_mode(family, snr);
+                    if (payload.size() > p + 7 && payload[p + 6] == ':')
+                        probe_theirs.assign(payload.begin() + p + 7, payload.end());
+                } else if (payload.size() > p + 5 && payload.size() <= p + 13 &&
+                           !memcmp(payload.data() + p, ":SNR:", 5)) {
+                    std::string num(payload.begin() + p + 5, payload.end());
+                    char* end = nullptr;
+                    float v = strtof(num.c_str(), &end);
+                    if (end == num.c_str() + num.size() && std::isfinite(v)) {
+                        info.probe_reply = true;
+                        info.reported_snr = v;
+                        info.probe_mode = probe_suggest_mode(family, v);
+                    }
                 }
             }
             {
@@ -1455,24 +1480,88 @@ private:
                 g_ui_state->add_packet(false, payload.size(), snr, ber_pct, info.mode, info.callsign);
 #endif
 
-            if (payload.size() > 4 && !memcmp(payload.data(), "M73:", 4)) {
-                auto sep = std::find(payload.begin() + 4, payload.end(), (uint8_t)':');
-                if (sep != payload.end() && sep - payload.begin() <= 16) {
-                    std::string from(payload.begin() + 4, sep);
-                    std::string text(sep + 1, payload.end());
-                    if (text.size() <= 200) {
-                        for (auto& c : from)
-                            if (!isprint((unsigned char)c)) c = '?';
-                        for (auto& c : text)
-                            if ((unsigned char)c < 32) c = ' ';
-                        std::cerr << "MSG from " << from << ": " << text << std::endl;
+            if (info.probe) {
+                std::string from = info.callsign.empty() ? "?" : info.callsign;
+                for (auto& ch : probe_theirs)
+                    if ((unsigned char)ch < 32 || (unsigned char)ch > 126) ch = '?';
+                if (probe_theirs.size() > 24) probe_theirs.resize(24);
+                char b[96];
+                snprintf(b, sizeof(b), "PROBE %.1f dB, use %s", snr, info.probe_mode.c_str());
+                std::string text = b;
+                std::string detail = text + (probe_theirs.empty() ? "" : " (they run " + probe_theirs + ")");
+                std::cerr << "PROBE from " << from << ": " << detail << std::endl;
+                snprintf(b, sizeof(b), "%s %.1f dB -> %s", from.c_str(), snr, info.probe_mode.c_str());
+                {
+                    std::lock_guard<std::mutex> lock(probe_mutex_);
+                    last_probe_ = b;
+                }
 #ifdef WITH_UI
-                        if (g_ui_state) {
-                            g_ui_state->add_message(from, text, false);
-                            g_ui_state->add_log("MSG from " + from);
-                        }
+                if (g_ui_state) {
+                    g_ui_state->add_message(from, text, false);
+                    g_ui_state->add_log("PROBE from " + from + ": " + detail);
+                    g_ui_state->set_last_probe(b);
+                }
 #endif
+                bool reply = false;
+                {
+                    std::lock_guard<std::mutex> lock(config_mutex_);
+                    reply = config_.probe_reply && !info.callsign.empty() &&
+                            !std::equal(from.begin(), from.end(), config_.callsign.begin(), config_.callsign.end(),
+                                        [](char a, char b) { return toupper((unsigned char)a) == toupper((unsigned char)b); });
+                }
+                if (reply) {
+                    bool sent = queue_probe_reply(snr);
+                    std::cerr << (sent ? "PROBE reply to " : "PROBE reply too long for mode, not sent to ")
+                              << from << std::endl;
+#ifdef WITH_UI
+                    if (g_ui_state)
+                        g_ui_state->add_log(sent ? "Probe reply -> " + from : "(!) Probe reply too long for mode");
+#endif
+                }
+                if (rx_frame_callback)
+                    rx_frame_callback(info);
+                return;
+            }
+
+            if (info.probe_reply) {
+                std::string from = info.callsign.empty() ? "?" : info.callsign;
+                char b[96];
+                snprintf(b, sizeof(b), "%.1f dB, use %s", info.reported_snr, info.probe_mode.c_str());
+                std::string text = b;
+                std::cerr << "PROBE REPLY from " << from << ": they hear " << text << std::endl;
+                snprintf(b, sizeof(b), "%s hears %.1f dB -> %s", from.c_str(), info.reported_snr,
+                         info.probe_mode.c_str());
+                {
+                    std::lock_guard<std::mutex> lock(probe_mutex_);
+                    last_probe_ = b;
+                }
+#ifdef WITH_UI
+                if (g_ui_state) {
+                    g_ui_state->add_message(from, "REPLY " + text, false);
+                    g_ui_state->add_log("PROBE REPLY from " + from + ": they hear " + text);
+                    g_ui_state->set_last_probe(b);
+                }
+#endif
+                if (rx_frame_callback)
+                    rx_frame_callback(info);
+                return;
+            }
+
+            if (m73) {
+                std::string from(payload.begin() + 4, payload.begin() + p);
+                std::string text(payload.begin() + p + 1, payload.end());
+                if (text.size() <= 200) {
+                    for (auto& c : from)
+                        if (!isprint((unsigned char)c)) c = '?';
+                    for (auto& c : text)
+                        if ((unsigned char)c < 32) c = ' ';
+                    std::cerr << "MSG from " << from << ": " << text << std::endl;
+#ifdef WITH_UI
+                    if (g_ui_state) {
+                        g_ui_state->add_message(from, text, false);
+                        g_ui_state->add_log("MSG from " + from);
                     }
+#endif
                 }
             }
 
@@ -2186,6 +2275,8 @@ private:
     static constexpr size_t RX_HISTORY_MAX = 256;
     std::mutex rx_history_mutex_;
     std::deque<RxFrameInfo> rx_history_;
+    std::mutex probe_mutex_;
+    std::string last_probe_;
     uint64_t rx_seq_ = 0;
     int64_t last_id_ms_ = -1000000;
     int64_t last_dcd_ms_ = -1000000;
@@ -2393,6 +2484,7 @@ public:
             config_.csma_responder_dither = new_config.csma_responder_dither;
             config_.csma_burst = new_config.csma_burst;
             config_.tx_lead_tone = new_config.tx_lead_tone;
+            config_.probe_reply = new_config.probe_reply;
             config_.tx_blanking_enabled = new_config.tx_blanking_enabled || new_config.csma_enabled;
             config_.fragmentation_enabled = new_config.fragmentation_enabled;
             config_.tx_delay_ms = new_config.tx_delay_ms;
@@ -2599,6 +2691,55 @@ public:
         return true;
     }
 
+    size_t mode_capacity(int modem_type, int mode) const {
+        if (modem_type == 0 && mode >= 0) return encoder_->get_payload_size(mode);
+        if (modem_type == 2 && mode >= 0 && mode < ROBUST_MODE_COUNT)
+            return robust_encoder_->get_payload_size((RobustMode)mode);
+        return payload_size_;
+    }
+
+    bool queue_signal(const std::string& body, const std::string& extra) {
+        TNCConfig c;
+        {
+            std::lock_guard<std::mutex> lock(config_mutex_);
+            c = config_;
+        }
+        int mode = -1;
+        if (c.modem_type == 0) mode = ModemConfig::encode_mode("BPSK", "1/2", 0);
+        else if (c.modem_type == 2 && !RobustParams::is_micro((RobustMode)c.robust_mode))
+            mode = (int)RobustParams::with_framing((RobustMode)c.robust_mode, true);
+        int cap = (int)mode_capacity(c.modem_type, mode);
+        std::string payload = "M73:" + c.callsign + ":" + body;
+        if (!extra.empty() && (int)payload.size() + 1 + (int)extra.size() <= cap - 2) payload += ":" + extra;
+        if ((int)payload.size() > cap - 2) return false;
+        tx_queue_.push(TxPacket(std::vector<uint8_t>(payload.begin(), payload.end()), mode));
+        return true;
+    }
+
+    bool queue_probe() {
+        std::string label;
+        {
+            std::lock_guard<std::mutex> lock(config_mutex_);
+            if (config_.modem_type == 0) label = ofdm_mode_name(modem_config_.oper_mode);
+            else if (config_.modem_type == 2) label = ROBUST_MODE_NAMES[config_.robust_mode];
+            else label = MFSK_MODE_NAMES[config_.mfsk_mode];
+        }
+        return queue_signal("PROBE", label);
+    }
+
+    std::string last_probe() {
+        std::lock_guard<std::mutex> lock(probe_mutex_);
+        return last_probe_;
+    }
+
+    bool queue_probe_reply(float snr) {
+        char b[16];
+        snprintf(b, sizeof(b), "SNR:%.1f", snr);
+        if (queue_signal(b, "")) return true;
+        snprintf(b, sizeof(b), "SNR:%.0f", snr);
+        return queue_signal(b, "");
+    }
+
     int channel_occupancy() const { return occupancy_pct_.load(); }
 
     bool is_receiving() const {
@@ -2666,15 +2807,7 @@ public:
 
     // Queue data with an optional per-packet oper_mode override (-1 = default)
     void queue_data_ex(const std::vector<uint8_t>& data, int oper_mode) {
-        size_t effective_payload;
-        if (oper_mode >= 0) {
-            if (config_.modem_type == 2 && oper_mode < ROBUST_MODE_COUNT)
-                effective_payload = robust_encoder_->get_payload_size((RobustMode)oper_mode) - 2;
-            else
-                effective_payload = encoder_->get_payload_size(oper_mode) - 2;
-        } else {
-            effective_payload = payload_size_ - 2;
-        }
+        size_t effective_payload = mode_capacity(config_.modem_type, oper_mode) - 2;
 
         if (config_.fragmentation_enabled && fragmenter_.needs_fragmentation(data.size(), effective_payload)) {
             auto fragments = fragmenter_.fragment(data, effective_payload);

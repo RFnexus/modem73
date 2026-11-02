@@ -22,4 +22,8 @@ struct RxFrameInfo {
     int mfsk_mode = -1;
     std::string callsign;
     std::string callsign_source = "none";
+    bool probe = false;
+    std::string probe_mode;
+    bool probe_reply = false;
+    float reported_snr = 0.0f;
 };

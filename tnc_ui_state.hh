@@ -147,6 +147,7 @@ struct TNCUIState {
     int frame_size = 1;        // 0=short, 1=normal, 2=long, 3=micro qpsk 1/2 only curent
     bool frame_size_auto = false;
     bool auto_long = false;
+    bool probe_reply = false;
 
     // TODO
     bool micro_allowed() const {
@@ -228,6 +229,19 @@ struct TNCUIState {
     std::string net_audio_peer_copy() {
         std::lock_guard<std::mutex> lock(net_audio_mutex);
         return net_audio_peer;
+    }
+
+    std::mutex probe_mutex;
+    std::string last_probe;
+
+    void set_last_probe(const std::string& p) {
+        std::lock_guard<std::mutex> lock(probe_mutex);
+        last_probe = p;
+    }
+
+    std::string last_probe_copy() {
+        std::lock_guard<std::mutex> lock(probe_mutex);
+        return last_probe;
     }
 
     std::function<std::string(const std::string&)> on_rigctl_command;
@@ -541,6 +555,7 @@ struct TNCUIState {
     
 
     std::function<void(const std::vector<uint8_t>&)> on_send_data;
+    std::function<bool()> on_send_probe;
     
     TNCUIState() {
         for (int i = 0; i < LEVEL_HISTORY_SIZE; i++) {
@@ -816,6 +831,7 @@ struct TNCUIState {
         add("frame_size=%d\n", frame_size);
         add("frame_size_auto=%d\n", frame_size_auto ? 1 : 0);
         add("auto_long=%d\n", auto_long ? 1 : 0);
+        add("probe_reply=%d\n", probe_reply ? 1 : 0);
         add("center_freq=%d\n", center_freq);
         add("postamble=%d\n", postamble ? 1 : 0);
         add("robust_mode=%d\n", robust_mode_index);
@@ -1001,6 +1017,7 @@ struct TNCUIState {
         else if (strcmp(key, "short_frame") == 0) frame_size = atoi(value) != 0 ? 0 : 1;
         else if (strcmp(key, "frame_size_auto") == 0) frame_size_auto = atoi(value) != 0;
         else if (strcmp(key, "auto_long") == 0) auto_long = atoi(value) != 0;
+        else if (strcmp(key, "probe_reply") == 0) probe_reply = atoi(value) != 0;
         else if (strcmp(key, "frame_size") == 0) {
             int v = atoi(value);
             if (v >= 0 && v <= 3) frame_size = v;

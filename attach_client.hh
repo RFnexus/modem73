@@ -342,6 +342,7 @@ private:
         state_.net_audio_rx = (uint64_t)num(j, "net_audio_rx_frames", 0);
         state_.net_audio_tx = (uint64_t)num(j, "net_audio_tx_frames", 0);
         state_.set_net_audio_peer(str(j, "net_audio_peer"));
+        state_.set_last_probe(str(j, "last_probe"));
         state_.ptt_failed = flag(j, "ptt_failed", false);
     }
 
@@ -511,6 +512,14 @@ private:
             cJSON* r = request(req);
             if (!ok(r)) state_.add_log("(!) attach: send failed");
             if (r) cJSON_Delete(r);
+        };
+        state_.on_send_probe = [this]() -> bool {
+            cJSON* req = cJSON_CreateObject();
+            cJSON_AddStringToObject(req, "cmd", "send_probe");
+            cJSON* r = request(req);
+            bool good = ok(r);
+            if (r) cJSON_Delete(r);
+            return good;
         };
         state_.on_rigctl_command = [this](const std::string& cmd) -> std::string {
             cJSON* req = cJSON_CreateObject();

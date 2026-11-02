@@ -314,6 +314,7 @@ private:
         FIELD_HAMLIB_MODEL,
         FIELD_HAMLIB_DEVICE,
         FIELD_HAMLIB_BAUD,
+        FIELD_PROBE_REPLY,
         FIELD_RESTART_MODEM,
         FIELD_PRESET,
         FIELD_NET_PORT,
@@ -1571,6 +1572,8 @@ private:
                 row++;
             }
         }
+        if (field == FIELD_PROBE_REPLY) return row;
+        row++;
         if (field == FIELD_RESTART_MODEM) return row;
         row++;
         row++;
@@ -1759,6 +1762,9 @@ private:
             case FIELD_AUDIO_OUTPUT:
                 break;
             case FIELD_PTT_TYPE:
+                break;
+            case FIELD_PROBE_REPLY:
+                state_.probe_reply = !state_.probe_reply;
                 break;
             case FIELD_HAMLIB_INFO:
                 state_.hamlib_info = !state_.hamlib_info;
@@ -4296,19 +4302,22 @@ private:
             if (dy >= 0) {
                 attron(A_DIM);
                 mvaddstr(dy, c1, "MISC");
-                if (hamlib_info_field()) mvaddstr(dy, c1 + 5, "(restart)");
                 attroff(A_DIM);
             }
             row++;
             if (hamlib_info_field()) {
                 dy = visible_y(row);
-                if (dy >= 0) draw_selector_field(dy, c1, c2, "Rig Info", FIELD_HAMLIB_INFO,
+                if (dy >= 0) draw_selector_field(dy, c1, c2, "Rig Info (restart)", FIELD_HAMLIB_INFO,
                                                  state_.hamlib_info ? "HAMLIB" : "OFF");
                 row++;
                 if (state_.hamlib_info) {
                     draw_rig_fields();
                 }
             }
+            dy = visible_y(row);
+            if (dy >= 0) draw_selector_field(dy, c1, c2, "Probe Reply", FIELD_PROBE_REPLY,
+                                             state_.probe_reply ? "ON" : "OFF");
+            row++;
             dy = visible_y(row);
             if (dy >= 0) draw_field(dy, c1, c2, "Restart", FIELD_RESTART_MODEM,
                                     state_.attach_target.empty() ? "[enter] restart modem73"
@@ -5499,7 +5508,7 @@ private:
         const char* actions[] = {
             "Send Test Pattern",
             "Send Random Data",
-            "Send Ping",
+            "Send Probe",
             "Clear Stats",
             "Auto Threshold",
             "Compose Message",
@@ -5553,6 +5562,16 @@ private:
                     printw("  <TX");
                     attroff(COLOR_PAIR(4) | A_BOLD);
                 }
+            }
+            if (i == 2) {
+                std::string lp = state_.last_probe_copy();
+                std::string hint = lp.empty() ? "  ask them what mode to use" : "  last: " + lp;
+                int cy, cx;
+                getyx(stdscr, cy, cx);
+                (void)cy;
+                attron(A_DIM);
+                addnstr(hint.c_str(), std::max(0, c2 - 1 - cx));
+                attroff(A_DIM);
             }
             if (i == 9) {
                 if (auto_alt_enabled_) {
@@ -5805,11 +5824,11 @@ private:
                 break;
             }
             case 2: {
-                if (state_.on_send_data) {
-                    std::string ping = "PING:" + state_.callsign;
-                    std::vector<uint8_t> data(ping.begin(), ping.end());
-                    state_.on_send_data(data);
-                    state_.add_log("Sent ping");
+                if (state_.on_send_probe) {
+                    if (state_.on_send_probe())
+                        state_.add_log("Sent probe, the other station sees a suggested mode");
+                    else
+                        state_.add_log("(!) Probe not sent");
                 }
                 break;
             }
@@ -6702,6 +6721,7 @@ private:
             {"TX level", "Sound card output drive, 5 to 100 percent. Set it so the radio's ALC barely moves. Too hot distorts the signal and other stations decode less, not more."},
             {"PTT", "How modem73 keys the radio. NONE: no keying, speaker into mic. RIGCTL: through rigctld over TCP. VOX: a tone before the data trips the radio's VOX. COM: DTR or RTS on a serial port, which is what the AIOC uses. CM108: the GPIO pin on a CM108 USB sound card. HAMLIB: direct Hamlib control without rigctld."},
             {"VOX tone / lead / tail", "For VOX PTT: the tone frequency, how long it plays before the data so the radio keys up, and how long after so the radio does not drop early."},
+            {"Probe reply", "Answer a probe from another station with the SNR you heard, so they see what mode to use toward you. This keys the radio on its own, so it is off by default."},
             {nullptr, "NETWORK"},
             {"Callsign", "Goes in every frame header so other stations can see who transmitted. Also drives the CSMA dither."},
             {"KISS port", "TCP port, 8001 by default, where applications send and receive packets."},
