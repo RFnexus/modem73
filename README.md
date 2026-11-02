@@ -9,8 +9,9 @@
 
 
 MODEM73 is an open source software modem that works with any HF, VHF, or UHF radio capable of 2400 Hz of bandwidth. All you need is a sound card and audio cable for your radio.  
-
-![Screenshot](https://i.ibb.co/4ZhhvcQs/Peek-2026-01-01-10-41.gif)
+<p align="center">
+<img width="800" height="508" alt="preview_gif" src="https://github.com/user-attachments/assets/53fb54b7-3203-48e4-b8f6-1c9186c645e0" />
+</p>
 <table align="center">
   <tr>
     <td align="center"><img height="200" alt="modem73 on a UV-K6 with AIOC" src="https://github.com/user-attachments/assets/7180ab80-4386-4ee1-8029-42ca5300ef13" /></td>
@@ -146,8 +147,9 @@ By default, MODEM73 will listen on port 8001
 
 All of the modes provided by the OFDM modem require a bandwidth of 2400 Hz and work over both FM and SSB. 
 
-There are currently five PTT options:
+There are currently six PTT options:
 - NONE (speaker/mic over the air)
+- Hamlib (For Hamlib supported rigs)
 - Rigctl
 - VOX
 - Serial

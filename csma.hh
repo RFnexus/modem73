@@ -146,10 +146,15 @@ public:
     }
 
     void set_rank(int rank, int n) {
+        bool was_ranked = rank_slot_ > 0;
         cfg_.rank = rank;
         cfg_.rank_n = n;
         if (rank < 0) {
             rank_slot_ = 0;
+            if (was_ranked) {
+                contention_ms_ = draw_contention();
+                contention_drawn_ = contention_ms_;
+            }
             return;
         }
         rank_slot_ = RANKED_SLOT_MS;

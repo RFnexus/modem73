@@ -8,6 +8,7 @@
 #include <vector>
 #include <deque>
 #include <mutex>
+#include <condition_variable>
 #include <atomic>
 #include <thread>
 #include <chrono>
@@ -138,11 +139,15 @@ struct TNCUIState {
     int mfsk_mode_index = 1;   // 0=MFSK-8, 1=MFSK-16, 2=MFSK-32, 3=MFSK-32R
     int robust_mode_index = 0;
     bool utils_testing_open = false;
+    bool ascii_ui = false;
     PerfLogger* perf_logger = nullptr;
     int alt_mode_mask = 0;
     int modulation_index = 1;  // default QPSK N 1/2
     int code_rate_index = 0;
     int frame_size = 1;        // 0=short, 1=normal, 2=long, 3=micro qpsk 1/2 only curent
+    bool frame_size_auto = false;
+    bool auto_long = false;
+    bool probe_reply = false;
 
     // TODO
     bool micro_allowed() const {
@@ -201,6 +206,43 @@ struct TNCUIState {
     std::atomic<bool> rigctl_connected{false};
     std::atomic<bool> ptt_failed{false};
     std::atomic<bool> audio_connected{true};  // Track audio device health
+    std::string audio_input_prev;
+    std::string audio_output_prev;
+
+    std::string net_audio_address() const {
+        return audio_input_device.rfind("tcp:", 0) == 0 ? audio_input_device : std::string();
+    }
+
+    std::atomic<bool> net_audio_configured{false};
+    std::atomic<bool> net_audio_connected{false};
+    std::atomic<bool> net_audio_stalled{false};
+    std::atomic<uint64_t> net_audio_rx{0};
+    std::atomic<uint64_t> net_audio_tx{0};
+    std::mutex net_audio_mutex;
+    std::string net_audio_peer;
+
+    void set_net_audio_peer(const std::string& p) {
+        std::lock_guard<std::mutex> lock(net_audio_mutex);
+        net_audio_peer = p;
+    }
+
+    std::string net_audio_peer_copy() {
+        std::lock_guard<std::mutex> lock(net_audio_mutex);
+        return net_audio_peer;
+    }
+
+    std::mutex probe_mutex;
+    std::string last_probe;
+
+    void set_last_probe(const std::string& p) {
+        std::lock_guard<std::mutex> lock(probe_mutex);
+        last_probe = p;
+    }
+
+    std::string last_probe_copy() {
+        std::lock_guard<std::mutex> lock(probe_mutex);
+        return last_probe;
+    }
 
     std::function<std::string(const std::string&)> on_rigctl_command;
     std::function<float()> on_alc_tune;
@@ -230,6 +272,10 @@ struct TNCUIState {
     std::atomic<int> csma_rank{-1};
     std::atomic<int> csma_rank_n{0};
     std::atomic<int> csma_window_ms{0};
+    std::atomic<int> scope_remote_refs{0};
+    std::atomic<float> remote_audio_level_db{-100.0f};
+    std::atomic<bool> attach_connected{false};
+    std::string attach_target;
     std::mutex rig_mode_mutex;
     std::string rig_mode;
     
@@ -271,6 +317,10 @@ struct TNCUIState {
 
     std::string config_file;
     std::string presets_file;
+    std::string appearance_file;
+    int icon_mode = 0;
+    int theme = 0;
+    int graph_style = 1;
     
     // Presets 
     struct Preset {
@@ -303,6 +353,26 @@ struct TNCUIState {
     };
     static constexpr int MAX_PRESETS = 10;
     static constexpr int MAX_FREQ_PRESETS = 12;
+
+    static std::string option_at(const std::vector<std::string>& opts, int i) {
+        return (i >= 0 && i < (int)opts.size()) ? opts[i] : std::string("?");
+    }
+
+    static std::string preset_mode_label(const Preset& p) {
+        if (p.modem_type_index == 1)
+            return option_at(MFSK_MODE_OPTIONS, p.mfsk_mode_index);
+        if (p.modem_type_index == 2) {
+            int m = p.robust_mode_index;
+            if (m < 0 || m >= ROBUST_MODE_COUNT) return "?";
+            const char* mtu = m == 12 ? "30B"
+                : RobustParams::is_short((RobustMode)m) ? "170B" : "510B";
+            return option_at(ROBUST_MODE_OPTIONS, robust_base_index(m)) + " " + mtu;
+        }
+        const char* fs = p.frame_size == 0 ? "S" : p.frame_size == 2 ? "L"
+                       : p.frame_size == 3 ? "U" : "N";
+        return option_at(MODULATION_OPTIONS, p.modulation_index) + " " +
+               option_at(CODE_RATE_OPTIONS, p.code_rate_index) + " " + fs;
+    }
 
     struct FreqPreset {
         long long hz;
@@ -356,6 +426,7 @@ struct TNCUIState {
     std::array<std::complex<float>, CONSTELLATION_SIZE> constellation_points;
     std::array<int, CONSTELLATION_GRID * CONSTELLATION_GRID> constellation_density;
     int constellation_mod_bits = 2;  // Current modulation bits
+    int constellation_count = 0;
     std::atomic<bool> constellation_valid{false};
     std::atomic<int64_t> constellation_update_time{0};
     
@@ -369,6 +440,7 @@ struct TNCUIState {
             if (seed_off >= 0 && (i % BLOCK_LEN) == seed_off) continue;
             constellation_points[n++] = points[i];
         }
+        constellation_count = n;
         
         // Build density map
         constellation_density.fill(0);
@@ -434,6 +506,15 @@ struct TNCUIState {
         }
     }
 
+    void push_scope_decimated(const float* samples, int n) {
+        std::lock_guard<std::mutex> lock(wf_mutex);
+        for (int i = 0; i < n; i++) {
+            wf_ring[wf_wpos] = samples[i];
+            wf_wpos = (wf_wpos + 1) % WF_RING;
+            wf_written++;
+        }
+    }
+
     struct PacketInfo {
         bool is_tx;
         int size;
@@ -446,6 +527,7 @@ struct TNCUIState {
     static constexpr int MAX_RECENT_PACKETS = 8;
     std::mutex packets_mutex;
     std::deque<PacketInfo> recent_packets;
+    std::atomic<uint64_t> packet_total{0};
     
     // Chat test
     struct ChatMessage {
@@ -473,6 +555,7 @@ struct TNCUIState {
     
 
     std::function<void(const std::vector<uint8_t>&)> on_send_data;
+    std::function<bool()> on_send_probe;
     
     TNCUIState() {
         for (int i = 0; i < LEVEL_HISTORY_SIZE; i++) {
@@ -491,6 +574,8 @@ struct TNCUIState {
     void update_modem_info() {
         if (modem_type_index == 2) {
             RobustMode rmode = (RobustMode)robust_mode_index;
+            if (frame_size_auto && !RobustParams::is_micro(rmode))
+                rmode = RobustParams::with_framing(rmode, false);
             mtu_bytes = RobustParams::data_bytes(rmode) - 2;
             bitrate_bps = RobustParams::bitrate(rmode);
             airtime_seconds = RobustParams::frame_duration(rmode);
@@ -589,8 +674,11 @@ struct TNCUIState {
 
         if (mod < 0 || mod > 7) mod = 1;
         if (rate < 0 || rate > 6) rate = 0;
+        int fs = frame_size;
+        if (frame_size_auto)
+            fs = (auto_long && rate <= 4 && payload_long[mod][rate] > 0) ? 2 : 1;
 
-        if (frame_size == 3) {
+        if (fs == 3) {
             // QB QPSK quickburst
             bool valid = mod == 1 && rate == 0;
             airtime_seconds = 0.59f;
@@ -601,10 +689,10 @@ struct TNCUIState {
             static const int payload_rep_normal[8] = {256, 512, 1024, 1024, 2048, 0, 0, 0};
             static const int duration_rep_short[8]  = {2600, 1500, 3400, 1500, 3400, 2600, 4000, 3400};
             static const int duration_rep_normal[8] = {4800, 4800, 6400, 4800, 6400, 0, 0, 0};
-            int pl = frame_size == 0 ? payload_rep_short[mod]
-                   : frame_size == 1 ? payload_rep_normal[mod] : 0;
-            int du = frame_size == 0 ? duration_rep_short[mod]
-                   : frame_size == 1 ? duration_rep_normal[mod] : 0;
+            int pl = fs == 0 ? payload_rep_short[mod]
+                   : fs == 1 ? payload_rep_normal[mod] : 0;
+            int du = fs == 0 ? duration_rep_short[mod]
+                   : fs == 1 ? duration_rep_normal[mod] : 0;
             mtu_bytes = pl > 0 ? pl - 2 : 0;
             airtime_seconds = du / 1000.0f;
             bitrate_bps = du > 0 ? (int)(pl * 8000.0f / du) : 0;
@@ -613,18 +701,18 @@ struct TNCUIState {
             static const int payload_rep2_normal[8] = {128, 256, 512, 512, 1024, 0, 0, 0};
             static const int duration_rep2_short[8]  = {2733, 1640, 3553, 1640, 3553, 2733, 4100, 3553};
             static const int duration_rep2_normal[8] = {4920, 4920, 6560, 4920, 6560, 0, 0, 0};
-            int pl = frame_size == 0 ? payload_rep2_short[mod]
-                   : frame_size == 1 ? payload_rep2_normal[mod] : 0;
-            int du = frame_size == 0 ? duration_rep2_short[mod]
-                   : frame_size == 1 ? duration_rep2_normal[mod] : 0;
+            int pl = fs == 0 ? payload_rep2_short[mod]
+                   : fs == 1 ? payload_rep2_normal[mod] : 0;
+            int du = fs == 0 ? duration_rep2_short[mod]
+                   : fs == 1 ? duration_rep2_normal[mod] : 0;
             mtu_bytes = pl > 0 ? pl - 2 : 0;
             airtime_seconds = du / 1000.0f;
             bitrate_bps = du > 0 ? (int)(pl * 8000.0f / du) : 0;
-        } else if (frame_size == 0) {
+        } else if (fs == 0) {
             mtu_bytes = payload_short[mod][rate] - 2;
             bitrate_bps = bitrate_short[mod][rate];
             airtime_seconds = duration_short[mod] / 1000.0f;
-        } else if (frame_size == 2) {
+        } else if (fs == 2) {
             mtu_bytes = payload_long[mod][rate] > 0 ? payload_long[mod][rate] - 2 : 0;
             bitrate_bps = bitrate_long[mod][rate];
             airtime_seconds = duration_long[mod] / 1000.0f;
@@ -670,14 +758,18 @@ struct TNCUIState {
     }
     
     void add_packet(bool is_tx, int size, float snr = 0.0f, float ber = -1.0f,
-                    const std::string& mode = "", const std::string& callsign = "") {
+                    const std::string& mode = "", const std::string& callsign = "",
+                    int age_ms = 0) {
         {
             std::lock_guard<std::mutex> lock(packets_mutex);
             recent_packets.push_back({is_tx, size, snr, ber,
-                                      std::chrono::steady_clock::now(), mode, callsign});
+                                      std::chrono::steady_clock::now() -
+                                          std::chrono::milliseconds(age_ms),
+                                      mode, callsign});
             if (recent_packets.size() > MAX_RECENT_PACKETS) {
                 recent_packets.pop_front();
             }
+            packet_total++;
         }
 
 
@@ -722,6 +814,152 @@ struct TNCUIState {
     }
     
     // Save settings
+    std::string serialize_settings() const {
+        std::string out;
+        auto add = [&out](const char* fmt, auto... args) {
+            char b[512];
+            snprintf(b, sizeof(b), fmt, args...);
+            out += b;
+        };
+        out += "# MODEM73 Settings\n";
+        add("callsign=%s\n", callsign.c_str());
+        add("modem_type=%d\n", modem_type_index);
+        add("mfsk_mode=%d\n", mfsk_mode_index);
+        add("modulation=%d\n", modulation_index);
+        add("code_rate=%d\n", code_rate_index);
+        add("short_frame=%d\n", frame_size == 0 ? 1 : 0);
+        add("frame_size=%d\n", frame_size);
+        add("frame_size_auto=%d\n", frame_size_auto ? 1 : 0);
+        add("auto_long=%d\n", auto_long ? 1 : 0);
+        add("probe_reply=%d\n", probe_reply ? 1 : 0);
+        add("center_freq=%d\n", center_freq);
+        add("postamble=%d\n", postamble ? 1 : 0);
+        add("robust_mode=%d\n", robust_mode_index);
+        add("tx_drive=%.2f\n", tx_drive.load());
+        add("alt_mode_mask=%d\n", alt_mode_mask);
+        for (const auto& fp : freq_presets)
+            add("freq_preset=%lld|%s\n", fp.hz, fp.label.c_str());
+        add("csma_enabled=%d\n", csma_enabled ? 1 : 0);
+        add("csma_sync_only=%d\n", csma_sync_only ? 1 : 0);
+        add("csma_fast_floor=%d\n", csma_fast_floor ? 1 : 0);
+        add("csma_ranked=%d\n", csma_ranked ? 1 : 0);
+        add("beacon_interval_s=%d\n", beacon_interval_s);
+        add("carrier_threshold_db=%.1f\n", carrier_threshold_db);
+        add("slot_time_ms=%d\n", slot_time_ms);
+        add("csma_quiet_ms=%d\n", csma_quiet_ms);
+        add("csma_cw=%d\n", csma_cw);
+        add("p_persistence=%d\n", p_persistence);
+        add("tx_lead_tone=%d\n", tx_lead_tone ? 1 : 0);
+        add("csma_responder_dither=%d\n", csma_responder_dither);
+        add("csma_burst=%d\n", csma_burst);
+        add("csma_band=%d\n", csma_band);
+        add("fragmentation_enabled=%d\n", fragmentation_enabled ? 1 : 0);
+        add("tx_blanking_enabled=%d\n", tx_blanking_enabled ? 1 : 0);
+        add("ofdm_rx_enabled=%d\n", ofdm_rx_enabled ? 1 : 0);
+        add("robust_rx_enabled=%d\n", robust_rx_enabled ? 1 : 0);
+        add("mfsk_rx_enabled=%d\n", mfsk_rx_enabled ? 1 : 0);
+        out += "# Audio/PTT\n";
+        add("audio_input=%s\n", audio_input_device.c_str());
+        add("audio_output=%s\n", audio_output_device.c_str());
+        if (!audio_input_prev.empty()) add("audio_input_prev=%s\n", audio_input_prev.c_str());
+        if (!audio_output_prev.empty()) add("audio_output_prev=%s\n", audio_output_prev.c_str());
+        add("audio_backend=%s\n", audio_backend.c_str());
+        add("ptt_type=%d\n", ptt_type_index);
+        add("vox_tone_freq=%d\n", vox_tone_freq);
+        add("vox_lead_ms=%d\n", vox_lead_ms);
+        add("vox_tail_ms=%d\n", vox_tail_ms);
+        add("tx_delay_ms=%d\n", tx_delay_ms);
+        out += "# COM PTT\n";
+        add("com_port=%s\n", com_port.c_str());
+        add("hamlib_model=%d\n", hamlib_model);
+        add("hamlib_device=%s\n", hamlib_device.c_str());
+        add("hamlib_baud=%d\n", hamlib_baud);
+        add("hamlib_info=%d\n", hamlib_info ? 1 : 0);
+        add("com_ptt_line=%d\n", com_ptt_line);
+        add("com_invert_dtr=%d\n", com_invert_dtr ? 1 : 0);
+        add("com_invert_rts=%d\n", com_invert_rts ? 1 : 0);
+        add("gpio_chip=%s\n", gpio_chip.c_str());
+        add("gpio_line=%d\n", gpio_line);
+        add("gpio_active_low=%d\n", gpio_active_low ? 1 : 0);
+#ifdef WITH_CM108
+        out += "# CM108 PTT\n";
+        add("cm108_gpio=%d\n", cm108_gpio);
+        add("cm108_device=%s\n", cm108_device.c_str());
+#endif
+        out += "# Network\n";
+        add("port=%d\n", port);
+        add("control_port=%d\n", control_port);
+        add("bind_address=%s\n", bind_address.c_str());
+        add("control_bind_address=%s\n", control_bind_address.c_str());
+        out += "# Utils\n";
+        add("random_data_size=%d\n", random_data_size);
+        add("utils_testing=%d\n", utils_testing_open ? 1 : 0);
+        return out;
+    }
+
+    std::mutex ui_task_mutex;
+    std::condition_variable ui_task_cv;
+    std::vector<std::function<void(TNCUIState&)>> ui_tasks;
+    uint64_t ui_tasks_posted = 0;
+    uint64_t ui_tasks_done = 0;
+    std::atomic<bool> ui_owner_set{false};
+    std::thread::id ui_owner;
+    std::mutex settings_snapshot_mutex;
+    std::string settings_snapshot_text;
+    std::mutex audio_devices_mutex;
+
+    void claim_ui_thread() {
+        if (ui_owner_set.load()) return;
+        ui_owner = std::this_thread::get_id();
+        ui_owner_set = true;
+    }
+
+    bool on_ui_thread() const {
+        return !ui_owner_set.load() || std::this_thread::get_id() == ui_owner;
+    }
+
+    uint64_t post_ui_task(std::function<void(TNCUIState&)> fn) {
+        if (on_ui_thread()) {
+            fn(*this);
+            return 0;
+        }
+        std::lock_guard<std::mutex> lock(ui_task_mutex);
+        ui_tasks.push_back(std::move(fn));
+        return ++ui_tasks_posted;
+    }
+
+    bool wait_ui_task(uint64_t seq, int timeout_ms) {
+        std::unique_lock<std::mutex> lock(ui_task_mutex);
+        return ui_task_cv.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                                   [&] { return ui_tasks_done >= seq; });
+    }
+
+    void run_ui_tasks() {
+        std::vector<std::function<void(TNCUIState&)>> batch;
+        {
+            std::lock_guard<std::mutex> lock(ui_task_mutex);
+            if (ui_tasks.empty()) return;
+            batch.swap(ui_tasks);
+        }
+        for (auto& fn : batch) fn(*this);
+        {
+            std::lock_guard<std::mutex> lock(ui_task_mutex);
+            ui_tasks_done += batch.size();
+        }
+        ui_task_cv.notify_all();
+    }
+
+    void refresh_settings_snapshot() {
+        std::string text = serialize_settings();
+        std::lock_guard<std::mutex> lock(settings_snapshot_mutex);
+        settings_snapshot_text = std::move(text);
+    }
+
+    std::string settings_snapshot() {
+        std::lock_guard<std::mutex> lock(settings_snapshot_mutex);
+        return settings_snapshot_text;
+    }
+
     bool save_settings() {
         if (config_file.empty()) return false;
 
@@ -729,76 +967,10 @@ struct TNCUIState {
         FILE* f = fopen(tmp.c_str(), "w");
         if (!f) return false;
 
-        fprintf(f, "# MODEM73 Settings\n");
-        fprintf(f, "callsign=%s\n", callsign.c_str());
-        fprintf(f, "modem_type=%d\n", modem_type_index);
-        fprintf(f, "mfsk_mode=%d\n", mfsk_mode_index);
-        fprintf(f, "modulation=%d\n", modulation_index);
-        fprintf(f, "code_rate=%d\n", code_rate_index);
-        fprintf(f, "short_frame=%d\n", frame_size == 0 ? 1 : 0);
-        fprintf(f, "frame_size=%d\n", frame_size);
-        fprintf(f, "center_freq=%d\n", center_freq);
-        fprintf(f, "postamble=%d\n", postamble ? 1 : 0);
-        fprintf(f, "robust_mode=%d\n", robust_mode_index);
-        fprintf(f, "tx_drive=%.2f\n", tx_drive.load());
-        fprintf(f, "alt_mode_mask=%d\n", alt_mode_mask);
-        for (const auto& fp : freq_presets)
-            fprintf(f, "freq_preset=%lld|%s\n", fp.hz, fp.label.c_str());
-        fprintf(f, "csma_enabled=%d\n", csma_enabled ? 1 : 0);
-        fprintf(f, "csma_sync_only=%d\n", csma_sync_only ? 1 : 0);
-        fprintf(f, "csma_fast_floor=%d\n", csma_fast_floor ? 1 : 0);
-        fprintf(f, "csma_ranked=%d\n", csma_ranked ? 1 : 0);
-        fprintf(f, "beacon_interval_s=%d\n", beacon_interval_s);
-        fprintf(f, "carrier_threshold_db=%.1f\n", carrier_threshold_db);
-        fprintf(f, "slot_time_ms=%d\n", slot_time_ms);
-        fprintf(f, "csma_quiet_ms=%d\n", csma_quiet_ms);
-        fprintf(f, "csma_cw=%d\n", csma_cw);
-        fprintf(f, "p_persistence=%d\n", p_persistence);
-        fprintf(f, "tx_lead_tone=%d\n", tx_lead_tone ? 1 : 0);
-        fprintf(f, "csma_responder_dither=%d\n", csma_responder_dither);
-        fprintf(f, "csma_burst=%d\n", csma_burst);
-        fprintf(f, "csma_band=%d\n", csma_band);
-        fprintf(f, "fragmentation_enabled=%d\n", fragmentation_enabled ? 1 : 0);
-        fprintf(f, "tx_blanking_enabled=%d\n", tx_blanking_enabled ? 1 : 0);
-        fprintf(f, "ofdm_rx_enabled=%d\n", ofdm_rx_enabled ? 1 : 0);
-        fprintf(f, "robust_rx_enabled=%d\n", robust_rx_enabled ? 1 : 0);
-        fprintf(f, "mfsk_rx_enabled=%d\n", mfsk_rx_enabled ? 1 : 0);
-        fprintf(f, "# Audio/PTT\n");
-        fprintf(f, "audio_input=%s\n", audio_input_device.c_str());
-        fprintf(f, "audio_output=%s\n", audio_output_device.c_str());
-        fprintf(f, "audio_backend=%s\n", audio_backend.c_str());
-        fprintf(f, "ptt_type=%d\n", ptt_type_index);
-        fprintf(f, "vox_tone_freq=%d\n", vox_tone_freq);
-        fprintf(f, "vox_lead_ms=%d\n", vox_lead_ms);
-        fprintf(f, "vox_tail_ms=%d\n", vox_tail_ms);
-        fprintf(f, "tx_delay_ms=%d\n", tx_delay_ms);
-        fprintf(f, "# COM PTT\n");
-        fprintf(f, "com_port=%s\n", com_port.c_str());
-        fprintf(f, "hamlib_model=%d\n", hamlib_model);
-        fprintf(f, "hamlib_device=%s\n", hamlib_device.c_str());
-        fprintf(f, "hamlib_baud=%d\n", hamlib_baud);
-        fprintf(f, "hamlib_info=%d\n", hamlib_info ? 1 : 0);
-        fprintf(f, "com_ptt_line=%d\n", com_ptt_line);
-        fprintf(f, "com_invert_dtr=%d\n", com_invert_dtr ? 1 : 0);
-        fprintf(f, "com_invert_rts=%d\n", com_invert_rts ? 1 : 0);
-        fprintf(f, "gpio_chip=%s\n", gpio_chip.c_str());
-        fprintf(f, "gpio_line=%d\n", gpio_line);
-        fprintf(f, "gpio_active_low=%d\n", gpio_active_low ? 1 : 0);
-#ifdef WITH_CM108
-        fprintf(f, "# CM108 PTT\n");
-        fprintf(f, "cm108_gpio=%d\n", cm108_gpio);
-        fprintf(f, "cm108_device=%s\n", cm108_device.c_str());
-#endif
-        fprintf(f, "# Network\n");
-        fprintf(f, "port=%d\n", port);
-        fprintf(f, "control_port=%d\n", control_port);
-        fprintf(f, "bind_address=%s\n", bind_address.c_str());
-        fprintf(f, "control_bind_address=%s\n", control_bind_address.c_str());
-        fprintf(f, "# Utils\n");
-        fprintf(f, "random_data_size=%d\n", random_data_size);
-        fprintf(f, "utils_testing=%d\n", utils_testing_open ? 1 : 0);
-
-        if (fclose(f) != 0 || rename(tmp.c_str(), config_file.c_str()) != 0) {
+        std::string text = serialize_settings();
+        bool written = fwrite(text.data(), 1, text.size(), f) == text.size();
+        if (fclose(f) != 0 || !written ||
+            rename(tmp.c_str(), config_file.c_str()) != 0) {
             remove(tmp.c_str());
             return false;
         }
@@ -806,159 +978,206 @@ struct TNCUIState {
     }
     
     // Load settings 
-    bool load_settings() {
-        if (config_file.empty()) return false;
-        
-        FILE* f = fopen(config_file.c_str(), "r");
-        if (!f) return false;
-        
-        freq_presets.clear();
-
-        char line[512];
-        while (fgets(line, sizeof(line), f)) {
-            if (line[0] == '#') continue;
-
-            char key[64], value[384];
-            if (sscanf(line, "%63[^=]=%383[^\n]", key, value) == 2) {
-                if (strcmp(key, "freq_preset") == 0) {
-                    const char* bar = strchr(value, '|');
-                    if (bar && (int)freq_presets.size() < MAX_FREQ_PRESETS) {
-                        long long hz = atoll(std::string(value, bar - value).c_str());
-                        if (hz > 0 && bar[1])
-                            freq_presets.push_back({hz, std::string(bar + 1)});
-                    }
-                }
-                else if (strcmp(key, "callsign") == 0) callsign = value;
-                else if (strcmp(key, "modem_type") == 0) {
-                    int v = atoi(value);
-                    if (v >= 0 && v <= 2) modem_type_index = v;
-                }
-                else if (strcmp(key, "mfsk_mode") == 0) {
-                    int v = atoi(value);
-                    if (v >= 0 && v <= 3) mfsk_mode_index = v;
-                }
-                else if (strcmp(key, "robust_mode") == 0) {
-                    int v = atoi(value);
-                    if (v >= 0 && v < ROBUST_MODE_COUNT) robust_mode_index = v;
-                }
-                else if (strcmp(key, "tx_drive") == 0) {
-                    float v = strtof(value, nullptr);
-                    if (v >= 0.05f && v <= 1.0f) tx_drive = v;
-                }
-                else if (strcmp(key, "alt_mode_mask") == 0)
-                    alt_mode_mask = atoi(value) & ((1 << ALT_MODE_COUNT) - 1);
-                else if (strcmp(key, "modulation") == 0) {
-                    int v = atoi(value);
-                    if (v >= 0 && v <= 7) modulation_index = v;
-                }
-                else if (strcmp(key, "code_rate") == 0) {
-                    int v = atoi(value);
-                    if (v >= 0 && v <= 6) code_rate_index = v;
-                }
-                else if (strcmp(key, "short_frame") == 0) frame_size = atoi(value) != 0 ? 0 : 1;
-                else if (strcmp(key, "frame_size") == 0) {
-                    int v = atoi(value);
-                    if (v >= 0 && v <= 3) frame_size = v;
-                }
-                else if (strcmp(key, "center_freq") == 0) center_freq = 1500;
-                else if (strcmp(key, "postamble") == 0) postamble = atoi(value) != 0;
-                else if (strcmp(key, "csma_enabled") == 0) csma_enabled = atoi(value) != 0;
-                else if (strcmp(key, "csma_sync_only") == 0) csma_sync_only = atoi(value) != 0;
-                else if (strcmp(key, "csma_fast_floor") == 0) csma_fast_floor = atoi(value) != 0;
-                else if (strcmp(key, "csma_ranked") == 0) csma_ranked = atoi(value) != 0;
-                else if (strcmp(key, "beacon_interval_s") == 0) {
-                    int v = atoi(value);
-                    if (v >= 45 && v <= 90) beacon_interval_s = v;
-                }
-                else if (strcmp(key, "carrier_threshold_db") == 0) carrier_threshold_db = atof(value);
-                else if (strcmp(key, "slot_time_ms") == 0) slot_time_ms = atoi(value);
-                else if (strcmp(key, "csma_quiet_ms") == 0) csma_quiet_ms = atoi(value);
-                else if (strcmp(key, "csma_cw") == 0) csma_cw = atoi(value);
-                else if (strcmp(key, "p_persistence") == 0) p_persistence = atoi(value);
-                else if (strcmp(key, "tx_lead_tone") == 0) tx_lead_tone = atoi(value) != 0;
-                else if (strcmp(key, "csma_responder_dither") == 0) csma_responder_dither = atoi(value);
-                else if (strcmp(key, "csma_burst") == 0) csma_burst = atoi(value);
-                else if (strcmp(key, "csma_band") == 0) csma_band = atoi(value) != 0 ? 1 : 0;
-                else if (strcmp(key, "fragmentation_enabled") == 0) fragmentation_enabled = atoi(value) != 0;
-                else if (strcmp(key, "tx_blanking_enabled") == 0) tx_blanking_enabled = atoi(value) != 0;
-                else if (strcmp(key, "ofdm_rx_enabled") == 0) ofdm_rx_enabled = atoi(value) != 0;
-                else if (strcmp(key, "robust_rx_enabled") == 0) robust_rx_enabled = atoi(value) != 0;
-                else if (strcmp(key, "mfsk_rx_enabled") == 0) mfsk_rx_enabled = atoi(value) != 0;
-                else if (strcmp(key, "audio_input") == 0) audio_input_device = value;
-                else if (strcmp(key, "audio_output") == 0) audio_output_device = value;
-                else if (strcmp(key, "audio_backend") == 0) audio_backend = value;
-                else if (strcmp(key, "audio_device") == 0) {
-                    audio_input_device = value;
-                    audio_output_device = value;
-                }
-                else if (strcmp(key, "ptt_type") == 0) {
-                    int v = atoi(value);
-                    if (v >= 0 && v < (int)PTT_TYPE_OPTIONS.size()) ptt_type_index = ptt_type_available(v);
-                }
-                else if (strcmp(key, "vox_tone_freq") == 0) {
-                    int v = atoi(value);
-                    if (v >= 300 && v <= 3000) vox_tone_freq = v;
-                }
-                else if (strcmp(key, "tx_delay_ms") == 0) {
-                    int v = atoi(value);
-                    if (v >= 250 && v <= 2500) tx_delay_ms = v;
-                }
-                else if (strcmp(key, "vox_lead_ms") == 0) {
-                    int v = atoi(value);
-                    if (v >= 50 && v <= 2000) vox_lead_ms = v;
-                }
-                else if (strcmp(key, "vox_tail_ms") == 0) {
-                    int v = atoi(value);
-                    if (v >= 50 && v <= 2000) vox_tail_ms = v;
-                }
-                else if (strcmp(key, "com_port") == 0) com_port = value;
-                else if (strcmp(key, "hamlib_model") == 0) hamlib_model = atoi(value);
-                else if (strcmp(key, "hamlib_device") == 0) hamlib_device = value;
-                else if (strcmp(key, "hamlib_baud") == 0) hamlib_baud = atoi(value);
-                else if (strcmp(key, "hamlib_info") == 0) hamlib_info = atoi(value) != 0;
-                else if (strcmp(key, "com_ptt_line") == 0) {
-                    int v = atoi(value);
-                    if (v >= 0 && v < (int)PTT_LINE_OPTIONS.size()) com_ptt_line = v;
-                }
-                else if (strcmp(key, "com_invert_dtr") == 0) com_invert_dtr = atoi(value) != 0;
-                else if (strcmp(key, "com_invert_rts") == 0) com_invert_rts = atoi(value) != 0;
-                else if (strcmp(key, "gpio_chip") == 0) gpio_chip = value;
-                else if (strcmp(key, "gpio_line") == 0) {
-                    int v = atoi(value);
-                    if (v >= 0 && v < 512) gpio_line = v;
-                }
-                else if (strcmp(key, "gpio_active_low") == 0) gpio_active_low = atoi(value) != 0;
-#ifdef WITH_CM108
-                else if (strcmp(key, "cm108_gpio") == 0) {
-                    int v = atoi(value);
-                    if (v >= 1 && v <= 4) cm108_gpio = v;
-                }
-                else if (strcmp(key, "cm108_device") == 0) cm108_device = value;
-#endif
-                else if (strcmp(key, "port") == 0) {
-                    int v = atoi(value);
-                    if (v >= 1 && v <= 65535) port = v;
-                }
-                else if (strcmp(key, "control_port") == 0) {
-                    int v = atoi(value);
-                    if (v >= 1 && v <= 65535) control_port = v;
-                }
-                else if (strcmp(key, "bind_address") == 0) bind_address = value;
-                else if (strcmp(key, "control_bind_address") == 0) control_bind_address = value;
-                else if (strcmp(key, "random_data_size") == 0) {
-                    int v = atoi(value);
-                    if (v >= 0 && v <= 65535) random_data_size = v;
-                }
-                else if (strcmp(key, "utils_testing") == 0) utils_testing_open = atoi(value) != 0;
+    void apply_settings_line(const char* key, const char* value) {
+        if (strcmp(key, "freq_preset") == 0) {
+            const char* bar = strchr(value, '|');
+            if (bar && (int)freq_presets.size() < MAX_FREQ_PRESETS) {
+                long long hz = atoll(std::string(value, bar - value).c_str());
+                if (hz > 0 && bar[1])
+                    freq_presets.push_back({hz, std::string(bar + 1)});
             }
         }
-        
-        fclose(f);
+        else if (strcmp(key, "callsign") == 0) callsign = value;
+        else if (strcmp(key, "modem_type") == 0) {
+            int v = atoi(value);
+            if (v >= 0 && v <= 2) modem_type_index = v;
+        }
+        else if (strcmp(key, "mfsk_mode") == 0) {
+            int v = atoi(value);
+            if (v >= 0 && v <= 3) mfsk_mode_index = v;
+        }
+        else if (strcmp(key, "robust_mode") == 0) {
+            int v = atoi(value);
+            if (v >= 0 && v < ROBUST_MODE_COUNT) robust_mode_index = v;
+        }
+        else if (strcmp(key, "tx_drive") == 0) {
+            float v = strtof(value, nullptr);
+            if (v >= 0.05f && v <= 1.0f) tx_drive = v;
+        }
+        else if (strcmp(key, "alt_mode_mask") == 0)
+            alt_mode_mask = atoi(value) & ((1 << ALT_MODE_COUNT) - 1);
+        else if (strcmp(key, "modulation") == 0) {
+            int v = atoi(value);
+            if (v >= 0 && v <= 7) modulation_index = v;
+        }
+        else if (strcmp(key, "code_rate") == 0) {
+            int v = atoi(value);
+            if (v >= 0 && v <= 6) code_rate_index = v;
+        }
+        else if (strcmp(key, "short_frame") == 0) frame_size = atoi(value) != 0 ? 0 : 1;
+        else if (strcmp(key, "frame_size_auto") == 0) frame_size_auto = atoi(value) != 0;
+        else if (strcmp(key, "auto_long") == 0) auto_long = atoi(value) != 0;
+        else if (strcmp(key, "probe_reply") == 0) probe_reply = atoi(value) != 0;
+        else if (strcmp(key, "frame_size") == 0) {
+            int v = atoi(value);
+            if (v >= 0 && v <= 3) frame_size = v;
+        }
+        else if (strcmp(key, "center_freq") == 0) center_freq = 1500;
+        else if (strcmp(key, "postamble") == 0) postamble = atoi(value) != 0;
+        else if (strcmp(key, "csma_enabled") == 0) csma_enabled = atoi(value) != 0;
+        else if (strcmp(key, "csma_sync_only") == 0) csma_sync_only = atoi(value) != 0;
+        else if (strcmp(key, "csma_fast_floor") == 0) csma_fast_floor = atoi(value) != 0;
+        else if (strcmp(key, "csma_ranked") == 0) csma_ranked = atoi(value) != 0;
+        else if (strcmp(key, "beacon_interval_s") == 0) {
+            int v = atoi(value);
+            if (v >= 45 && v <= 90) beacon_interval_s = v;
+        }
+        else if (strcmp(key, "carrier_threshold_db") == 0) carrier_threshold_db = atof(value);
+        else if (strcmp(key, "slot_time_ms") == 0) slot_time_ms = atoi(value);
+        else if (strcmp(key, "csma_quiet_ms") == 0) csma_quiet_ms = atoi(value);
+        else if (strcmp(key, "csma_cw") == 0) csma_cw = atoi(value);
+        else if (strcmp(key, "p_persistence") == 0) p_persistence = atoi(value);
+        else if (strcmp(key, "tx_lead_tone") == 0) tx_lead_tone = atoi(value) != 0;
+        else if (strcmp(key, "csma_responder_dither") == 0) csma_responder_dither = atoi(value);
+        else if (strcmp(key, "csma_burst") == 0) csma_burst = atoi(value);
+        else if (strcmp(key, "csma_band") == 0) csma_band = atoi(value) != 0 ? 1 : 0;
+        else if (strcmp(key, "fragmentation_enabled") == 0) fragmentation_enabled = atoi(value) != 0;
+        else if (strcmp(key, "tx_blanking_enabled") == 0) tx_blanking_enabled = atoi(value) != 0;
+        else if (strcmp(key, "ofdm_rx_enabled") == 0) ofdm_rx_enabled = atoi(value) != 0;
+        else if (strcmp(key, "robust_rx_enabled") == 0) robust_rx_enabled = atoi(value) != 0;
+        else if (strcmp(key, "mfsk_rx_enabled") == 0) mfsk_rx_enabled = atoi(value) != 0;
+        else if (strcmp(key, "audio_input") == 0) audio_input_device = value;
+        else if (strcmp(key, "audio_output") == 0) audio_output_device = value;
+        else if (strcmp(key, "audio_input_prev") == 0) audio_input_prev = value;
+        else if (strcmp(key, "audio_output_prev") == 0) audio_output_prev = value;
+        else if (strcmp(key, "audio_backend") == 0) audio_backend = value;
+        else if (strcmp(key, "audio_device") == 0) {
+            audio_input_device = value;
+            audio_output_device = value;
+        }
+        else if (strcmp(key, "ptt_type") == 0) {
+            int v = atoi(value);
+            if (v >= 0 && v < (int)PTT_TYPE_OPTIONS.size())
+                ptt_type_index = attach_target.empty() ? ptt_type_available(v) : v;
+        }
+        else if (strcmp(key, "vox_tone_freq") == 0) {
+            int v = atoi(value);
+            if (v >= 300 && v <= 3000) vox_tone_freq = v;
+        }
+        else if (strcmp(key, "tx_delay_ms") == 0) {
+            int v = atoi(value);
+            if (v >= 250 && v <= 2500) tx_delay_ms = v;
+        }
+        else if (strcmp(key, "vox_lead_ms") == 0) {
+            int v = atoi(value);
+            if (v >= 50 && v <= 2000) vox_lead_ms = v;
+        }
+        else if (strcmp(key, "vox_tail_ms") == 0) {
+            int v = atoi(value);
+            if (v >= 50 && v <= 2000) vox_tail_ms = v;
+        }
+        else if (strcmp(key, "com_port") == 0) com_port = value;
+        else if (strcmp(key, "hamlib_model") == 0) hamlib_model = atoi(value);
+        else if (strcmp(key, "hamlib_device") == 0) hamlib_device = value;
+        else if (strcmp(key, "hamlib_baud") == 0) hamlib_baud = atoi(value);
+        else if (strcmp(key, "hamlib_info") == 0) hamlib_info = atoi(value) != 0;
+        else if (strcmp(key, "com_ptt_line") == 0) {
+            int v = atoi(value);
+            if (v >= 0 && v < (int)PTT_LINE_OPTIONS.size()) com_ptt_line = v;
+        }
+        else if (strcmp(key, "com_invert_dtr") == 0) com_invert_dtr = atoi(value) != 0;
+        else if (strcmp(key, "com_invert_rts") == 0) com_invert_rts = atoi(value) != 0;
+        else if (strcmp(key, "gpio_chip") == 0) gpio_chip = value;
+        else if (strcmp(key, "gpio_line") == 0) {
+            int v = atoi(value);
+            if (v >= 0 && v < 512) gpio_line = v;
+        }
+        else if (strcmp(key, "gpio_active_low") == 0) gpio_active_low = atoi(value) != 0;
+#ifdef WITH_CM108
+        else if (strcmp(key, "cm108_gpio") == 0) {
+            int v = atoi(value);
+            if (v >= 1 && v <= 4) cm108_gpio = v;
+        }
+        else if (strcmp(key, "cm108_device") == 0) cm108_device = value;
+#endif
+        else if (strcmp(key, "port") == 0) {
+            int v = atoi(value);
+            if (v >= 1 && v <= 65535) port = v;
+        }
+        else if (strcmp(key, "control_port") == 0) {
+            int v = atoi(value);
+            if (v >= 1 && v <= 65535) control_port = v;
+        }
+        else if (strcmp(key, "bind_address") == 0) bind_address = value;
+        else if (strcmp(key, "control_bind_address") == 0) control_bind_address = value;
+        else if (strcmp(key, "random_data_size") == 0) {
+            int v = atoi(value);
+            if (v >= 0 && v <= 65535) random_data_size = v;
+        }
+        else if (strcmp(key, "utils_testing") == 0) utils_testing_open = atoi(value) != 0;
+    }
+
+    bool parse_settings_text(const std::string& text) {
+        freq_presets.clear();
+        size_t pos = 0;
+        while (pos < text.size()) {
+            size_t e = text.find('\n', pos);
+            std::string line = text.substr(pos, e == std::string::npos
+                                           ? std::string::npos : e - pos);
+            pos = e == std::string::npos ? text.size() : e + 1;
+            if (line.empty() || line[0] == '#') continue;
+            char key[64], value[384];
+            if (sscanf(line.c_str(), "%63[^=]=%383[^\n]", key, value) == 2)
+                apply_settings_line(key, value);
+        }
         clamp_micro();
         update_modem_info();
         return true;
     }
 
+    bool load_settings() {
+        if (config_file.empty()) return false;
+        FILE* f = fopen(config_file.c_str(), "r");
+        if (!f) return false;
+        std::string text;
+        char line[512];
+        while (fgets(line, sizeof(line), f)) text += line;
+        fclose(f);
+        return parse_settings_text(text);
+    }
+
+
+    bool load_appearance() {
+        if (appearance_file.empty()) return false;
+        FILE* f = fopen(appearance_file.c_str(), "r");
+        if (!f) return false;
+        char line[128];
+        while (fgets(line, sizeof(line), f)) {
+            char key[32], value[64];
+            if (sscanf(line, "%31[^=]=%63[^\n]", key, value) != 2) continue;
+            if (strcmp(key, "icons") == 0)
+                icon_mode = strcmp(value, "text") == 0 ? 1 : strcmp(value, "unicode") == 0 ? 2 : 0;
+            else if (strcmp(key, "theme") == 0)
+                theme = strcmp(value, "purple") == 0 ? 1 : strcmp(value, "red") == 0 ? 2 : 0;
+            else if (strcmp(key, "graph") == 0)
+                graph_style = strcmp(value, "bars") == 0 ? 0 : strcmp(value, "solid") == 0 ? 2 : 1;
+        }
+        fclose(f);
+        return true;
+    }
+
+    bool save_appearance() {
+        if (appearance_file.empty()) return false;
+        FILE* f = fopen(appearance_file.c_str(), "w");
+        if (!f) return false;
+        static const char* icons[] = {"auto", "text", "unicode"};
+        static const char* themes[] = {"default", "purple", "red"};
+        fprintf(f, "icons=%s\n", icons[icon_mode < 0 || icon_mode > 2 ? 0 : icon_mode]);
+        fprintf(f, "theme=%s\n", themes[theme < 0 || theme > 2 ? 0 : theme]);
+        static const char* graphs[] = {"bars", "curve", "solid"};
+        fprintf(f, "graph=%s\n", graphs[graph_style < 0 || graph_style > 2 ? 1 : graph_style]);
+        return fclose(f) == 0;
+    }
 
     bool save_presets() {
         if (presets_file.empty()) return false;
@@ -1135,10 +1354,12 @@ struct TNCUIState {
 
     std::mutex log_mutex;
     std::deque<std::string> log_entries;
+    std::atomic<uint64_t> log_total{0};
     std::atomic<bool> log_unread_error{false};
 
     std::function<void(TNCUIState&)> on_settings_changed;
     std::function<void()> on_stop_requested;
+    std::function<void()> on_restart_requested;
     std::function<bool()> on_reconnect_audio;
     std::function<void()> on_refresh_audio_devices;
     std::function<float()> on_get_audio_level;  
@@ -1152,7 +1373,18 @@ struct TNCUIState {
         std::stringstream ss;
         ss << std::put_time(&tmv, "%H:%M:%S") << "  " << msg;
         log_entries.push_back(ss.str());
+        log_total++;
         if (msg.rfind("(!)", 0) == 0) log_unread_error = true;
+        if (log_entries.size() > MAX_LOG_ENTRIES) {
+            log_entries.pop_front();
+        }
+    }
+
+    void add_log_raw(const std::string& line) {
+        std::lock_guard<std::mutex> lock(log_mutex);
+        log_entries.push_back(line);
+        log_total++;
+        if (line.find("  (!)") != std::string::npos) log_unread_error = true;
         if (log_entries.size() > MAX_LOG_ENTRIES) {
             log_entries.pop_front();
         }
@@ -1174,6 +1406,7 @@ struct TNCUIState {
     };
     std::mutex messages_mutex;
     std::deque<TextMessage> messages;
+    std::atomic<uint64_t> message_total{0};
     std::atomic<int> unread_messages{0};
 
     void add_message(const std::string& from, const std::string& text, bool outgoing) {
@@ -1181,8 +1414,14 @@ struct TNCUIState {
         auto time = std::chrono::system_clock::to_time_t(now);
         std::stringstream ss;
         ss << std::put_time(std::localtime(&time), "%H:%M:%S");
+        add_message_raw(ss.str(), from, text, outgoing);
+    }
+
+    void add_message_raw(const std::string& time, const std::string& from,
+                         const std::string& text, bool outgoing) {
         std::lock_guard<std::mutex> lock(messages_mutex);
-        messages.push_back({ss.str(), from, text, outgoing});
+        messages.push_back({time, from, text, outgoing});
+        message_total++;
         while (messages.size() > MAX_MESSAGES)
             messages.pop_front();
         if (!outgoing)
