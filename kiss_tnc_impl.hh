@@ -16,6 +16,7 @@
 #include <deque>
 #include <set>
 #include <mutex>
+#include <future>
 #include <memory>
 #include <random>
 #include <algorithm>
@@ -764,6 +765,11 @@ private:
                     }
                     if (config_.ptt_type == PTTType::VOX) csma_burst = 1;
                 }
+                PreparedFrame prepared = prepare_frame(pkt);
+                if (!pkt.beacon && prepared.samples.empty()) {
+                    transmit(pkt, prepared, true, true);
+                    continue;
+                }
                 if (csma_enabled) {
                     // Wait for TX lockout to clear
                     if (!is_tx_allowed()) {
@@ -888,9 +894,13 @@ private:
                             beacon_yield = true;
                             break;
                         }
+                        if (!frame_is_current(pkt, prepared)) {
+                            prepared = prepare_frame(pkt);
+                        }
                         bool alive = audio_->capture_alive();
                         float level_db = audio_->instant_level_db(carrier_sense_ms);
-                        bool allowed = is_tx_allowed();
+                        bool tuning = alc_tune_active_.load();
+                        bool allowed = is_tx_allowed() && !tuning;
                         if (csma_ranked && csma_sync_only) {
                             if (boot_rank >= 0) {
                                 int known = known_others();
@@ -937,7 +947,9 @@ private:
                             (!csma_sync_only && level_db > carrier_threshold_db));
                         if (busy && !was_busy) {
                             busy_episodes++;
-                            if (!allowed) {
+                            if (tuning) {
+                                std::cerr << "CSMA: ALC tune in progress, deferring" << std::endl;
+                            } else if (!allowed) {
                                 std::cerr << "CSMA: receiving, deferring" << std::endl;
                             } else {
                                 std::cerr << "CSMA: Channel busy (" << level_db << " dB > "
@@ -991,6 +1003,7 @@ private:
                 if (g_ui_state) g_ui_state->csma_phase = 0;
 #endif
                 TxPacket cur = std::move(pkt);
+                PreparedFrame cur_frame = std::move(prepared);
                 bool first = true;
                 int remaining = cur.beacon ? 0 : csma_burst - 1;
                 while (true) {
@@ -1001,8 +1014,19 @@ private:
                         g_ui_state->tx_queue_size = tx_queue_.size();
                     }
 #endif
-                    bool sent = transmit(cur.data, cur.oper_mode, first, !have_next,
-                                         cur.beacon);
+                    if (!frame_is_current(cur, cur_frame)) {
+                        cur_frame = prepare_frame(cur);
+                    }
+                    std::future<PreparedFrame> next_frame;
+                    std::function<void()> encode_next;
+                    if (have_next) {
+                        encode_next = [this, &next, &next_frame]() {
+                            next_frame = std::async(std::launch::async, [this, &next]() {
+                                return prepare_frame(next);
+                            });
+                        };
+                    }
+                    bool sent = transmit(cur, cur_frame, first, !have_next, encode_next);
                     if (!have_next) {
                         if (!cur.beacon)
                             last_burst_end = steady_now_ms();
@@ -1017,6 +1041,7 @@ private:
                     }
                     std::cerr << "CSMA: burst continuation ("
                               << remaining << " left)" << std::endl;
+                    cur_frame = next_frame.valid() ? next_frame.get() : prepare_frame(next);
                     cur = std::move(next);
                     if (sent)
                         first = false;
@@ -1110,15 +1135,77 @@ private:
         return config_.tx_delay_ms;
     }
 
-    bool transmit(const std::vector<uint8_t>& data, int oper_mode_override = -1,
-                  bool first = true, bool last = true, bool beacon = false) {
+    TxEncodeKey encode_key_for(const TxPacket& packet) const {
+        std::lock_guard<std::mutex> lock(config_mutex_);
+        TxEncodeKey key;
+        key.modem_type = config_.modem_type;
+        if (key.modem_type == 1) {
+            key.mode = config_.mfsk_mode;
+        } else if (key.modem_type == 2) {
+            bool valid_override = packet.oper_mode >= 0 &&
+                                  packet.oper_mode < ROBUST_MODE_COUNT;
+            key.mode = valid_override ? packet.oper_mode : config_.robust_mode;
+        } else {
+            key.mode = packet.oper_mode >= 0 ? packet.oper_mode : modem_config_.oper_mode;
+        }
+        key.center_freq = modem_config_.center_freq;
+        key.call_sign = modem_config_.call_sign;
+        key.postamble = config_.postamble;
+        return key;
+    }
+
+    bool frame_is_current(const TxPacket& packet, const PreparedFrame& prepared) const {
+        return packet.beacon || encode_key_for(packet) == prepared.key;
+    }
+
+    PreparedFrame prepare_frame(const TxPacket& packet) {
+        PreparedFrame prepared;
+        prepared.key = encode_key_for(packet);
+        if (packet.beacon) {
+            return prepared;
+        }
+        prepared.capacity = mode_capacity(prepared.key.modem_type, packet.oper_mode);
+        if (prepared.capacity < 2 || packet.data.size() > prepared.capacity - 2) {
+            prepared.oversize = true;
+            return prepared;
+        }
+        auto framed_data = frame_with_length(packet.data);
+        if (prepared.key.modem_type == 1) {
+            prepared.samples = mfsk_encoder_->encode(
+                framed_data.data(), framed_data.size(),
+                prepared.key.center_freq,
+                (MFSKMode)prepared.key.mode
+            );
+        } else if (prepared.key.modem_type == 2) {
+            prepared.samples = robust_encoder_->encode(
+                framed_data.data(), framed_data.size(),
+                prepared.key.center_freq,
+                (RobustMode)prepared.key.mode
+            );
+        } else {
+            prepared.samples = encoder_->encode(
+                framed_data.data(), framed_data.size(),
+                prepared.key.center_freq,
+                prepared.key.call_sign,
+                prepared.key.mode,
+                prepared.key.postamble
+            );
+        }
+        return prepared;
+    }
+
+    bool transmit(const TxPacket& packet, const PreparedFrame& prepared,
+                  bool first = true, bool last = true,
+                  const std::function<void()>& on_keyed = nullptr) {
+        const std::vector<uint8_t>& data = packet.data;
+        const std::vector<float>& samples = prepared.samples;
+        bool beacon = packet.beacon;
         while (alc_tune_active_.load() && g_running)
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        int tx_mode = (oper_mode_override >= 0) ? oper_mode_override : modem_config_.oper_mode;
 
         if (beacon) {
             ui_log("TX: presence tone");
-        } else if (oper_mode_override >= 0) {
+        } else if (packet.oper_mode >= 0) {
             ui_log("TX: " + std::to_string(data.size()) + " bytes (mode override)");
         } else {
             ui_log("TX: " + std::to_string(data.size()) + " bytes");
@@ -1127,71 +1214,35 @@ private:
             std::cerr << packet_visualize(data.data(), data.size(), true, config_.fragmentation_enabled) << std::endl;
         }
 
-        tx_on_air_ = true;
-        if (config_.tx_blanking_enabled) {
-            tx_blanking_active_ = true;
+        bool sendable = beacon || !samples.empty();
+        if (sendable || !first) {
+            tx_on_air_ = true;
+            if (config_.tx_blanking_enabled) {
+                tx_blanking_active_ = true;
+            }
         }
 
 #ifdef WITH_UI
         if (g_ui_state && !beacon) {
             g_ui_state->transmitting = true;
             g_ui_state->tx_frame_count++;
-            std::string mname = config_.modem_type == 2
-                ? ROBUST_MODE_NAMES[(oper_mode_override >= 0 &&
-                                     oper_mode_override < ROBUST_MODE_COUNT)
-                                        ? oper_mode_override : config_.robust_mode]
-                : config_.modem_type == 1
-                    ? MFSK_MODE_NAMES[config_.mfsk_mode]
-                    : ofdm_mode_name(tx_mode);
+            std::string mname = prepared.key.modem_type == 2
+                ? ROBUST_MODE_NAMES[prepared.key.mode]
+                : prepared.key.modem_type == 1
+                    ? MFSK_MODE_NAMES[prepared.key.mode]
+                    : ofdm_mode_name(prepared.key.mode);
             g_ui_state->add_packet(true, data.size(), 0, -1.0f, mname);
         }
 #endif
 
-        // Add length prefix framing
-        bool data_oversize = false;
-        {
-            size_t cap = mode_capacity(config_.modem_type, oper_mode_override);
-            if (cap < 2 || data.size() > cap - 2) {
-                ui_log("(!) TX: " + std::to_string(data.size()) + " byte frame exceeds " +
-                       std::to_string(cap >= 2 ? cap - 2 : 0) + " byte capacity of current mode, dropped");
-                data_oversize = true;
-            }
+        if (prepared.oversize) {
+            ui_log("(!) TX: " + std::to_string(data.size()) + " byte frame exceeds " +
+                   std::to_string(prepared.capacity >= 2 ? prepared.capacity - 2 : 0) +
+                   " byte capacity of current mode, dropped");
         }
-        auto framed_data = frame_with_length(data);
 
-        // Encode to audio
-        std::vector<float> samples;
-        if (beacon) {
-            // tone only, no data frame
-        } else if (config_.modem_type == 1) {
-            samples = mfsk_encoder_->encode(
-                framed_data.data(), framed_data.size(),
-                modem_config_.center_freq,
-                (MFSKMode)config_.mfsk_mode
-            );
-        } else if (config_.modem_type == 2) {
-            RobustMode tx_rmode = (oper_mode_override >= 0 &&
-                                   oper_mode_override < ROBUST_MODE_COUNT)
-                ? (RobustMode)oper_mode_override
-                : (RobustMode)config_.robust_mode;
-            samples = robust_encoder_->encode(
-                framed_data.data(), framed_data.size(),
-                modem_config_.center_freq,
-                tx_rmode
-            );
-        } else {
-            samples = encoder_->encode(
-                framed_data.data(), framed_data.size(),
-                modem_config_.center_freq,
-                modem_config_.call_sign,
-                tx_mode,
-                config_.postamble
-            );
-        }
-        
-        if (data_oversize) samples.clear();
         if (samples.empty() && !beacon) {
-            if (!data_oversize) ui_log("TX: Encoding failed");
+            if (!prepared.oversize) ui_log("TX: Encoding failed");
             if (!first && last && config_.ptt_type != PTTType::VOX) {
                 audio_->write_silence(config_.ptt_tail_ms * config_.sample_rate / 1000);
                 audio_->drain_playback();
@@ -1205,8 +1256,10 @@ private:
                 }
             }
             if (last) {
-                tx_on_air_ = false;
-                tx_blanking_active_ = false;
+                if (!first) {
+                    tx_on_air_ = false;
+                    tx_blanking_active_ = false;
+                }
 #ifdef WITH_UI
                 if (g_ui_state) g_ui_state->transmitting = false;
 #endif
@@ -1268,6 +1321,8 @@ private:
 #ifdef WITH_UI
             if (g_ui_state) g_ui_state->ptt_on = true;
 #endif
+
+            if (on_keyed) on_keyed();
 
             // Transmit: lead tone -> OFDM data -> tail tone
             const int chunk_size = 1024;
@@ -1342,6 +1397,8 @@ private:
             } else {
                 audio_->write_silence(BURST_GAP_MS * config_.sample_rate / 1000);
             }
+
+            if (on_keyed) on_keyed();
 
             // Transmit audio
             const int chunk_size = 1024;

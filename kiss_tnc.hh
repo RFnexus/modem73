@@ -481,6 +481,29 @@ struct TxPacket {
         : data(std::move(d)), oper_mode(mode), enqueue_ms(steady_now_ms()) {}
 };
 
+struct TxEncodeKey {
+    int modem_type = -1;
+    int mode = -1;
+    int center_freq = 0;
+    int64_t call_sign = 0;
+    bool postamble = false;
+
+    bool operator==(const TxEncodeKey& other) const {
+        return modem_type == other.modem_type &&
+               mode == other.mode &&
+               center_freq == other.center_freq &&
+               call_sign == other.call_sign &&
+               postamble == other.postamble;
+    }
+};
+
+struct PreparedFrame {
+    TxEncodeKey key;
+    std::vector<float> samples;
+    size_t capacity = 0;
+    bool oversize = false;
+};
+
 namespace Frag {
     constexpr uint8_t MAGIC = 0xF3;
     constexpr size_t HEADER_SIZE = 5;
